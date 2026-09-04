@@ -14,6 +14,24 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
+_VISION_KEYWORDS = ("vision", "multimodal", "llava", "bakllava", "moondream", "pixtral", "minicpm", "vl", "phi-4-multimodal")
+
+def _model_supports_vision(model_name: str) -> bool:
+    if not model_name:
+        return False
+    name = model_name.lower()
+    for kw in _VISION_KEYWORDS:
+        if kw in name:
+            return True
+    return False
+
+def _strip_multimodal_messages(messages: list) -> None:
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            text_parts = [item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"]
+            msg["content"] = "\n".join(text_parts).strip() if text_parts else ""
+
 class LLMConfig:
     """Configuration constants for LLM operations."""
     DEFAULT_TIMEOUT = 30
@@ -1006,6 +1024,10 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
     else:
         messages_copy = non_sys
 
+    # Strip multimodal content for text-only models
+    if not _model_supports_vision(model):
+        _strip_multimodal_messages(messages_copy)
+
     provider = _detect_provider(url)
     cache_key = _get_cache_key(url, model, messages_copy, temperature, max_tokens)
     cached_response = _get_cached_response(cache_key)
@@ -1153,6 +1175,10 @@ async def llm_call_async(
     else:
         messages_copy = non_sys
 
+    # Strip multimodal content for text-only models
+    if not _model_supports_vision(model):
+        _strip_multimodal_messages(messages_copy)
+
     cache_key = _get_cache_key(url, model, messages_copy, temperature, max_tokens)
     cached_response = _get_cached_response(cache_key)
     if cached_response:
@@ -1270,6 +1296,10 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
         messages_copy = [{"role": "system", "content": "\n\n".join(sys_parts)}] + non_sys
     else:
         messages_copy = non_sys
+
+    # Strip multimodal content for text-only models
+    if not _model_supports_vision(model):
+        _strip_multimodal_messages(messages_copy)
 
     if provider == "anthropic":
         target_url = _normalize_anthropic_url(url)
