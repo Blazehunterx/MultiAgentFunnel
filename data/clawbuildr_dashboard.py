@@ -18,6 +18,7 @@ import re
 import uuid
 import urllib.parse
 import contextlib
+import concurrent.futures
 import httpx
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, AsyncGenerator
@@ -97,6 +98,149 @@ def run_migrations():
     );
     """)
     
+    # 2c. Create Tenant Config Table (multi-tenant support)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS tenant_config (
+        tenant_id       TEXT PRIMARY KEY,
+        display_name    TEXT NOT NULL DEFAULT '',
+        sending_email   TEXT NOT NULL DEFAULT '',
+        sending_domain  TEXT NOT NULL DEFAULT '',
+        calendar_link   TEXT NOT NULL DEFAULT '',
+        signature_block TEXT NOT NULL DEFAULT '',
+        value_doctrine  TEXT NOT NULL DEFAULT '',
+        brand_voice     TEXT NOT NULL DEFAULT 'Professioneel, direct, vriendelijk. Gebruik informeel Nederlands (je/jullie).',
+        icp_industries  TEXT NOT NULL DEFAULT '["Groothandel", "Logistiek & Transport", "B2B SaaS", "IT Dienstverlening"]',
+        icp_roles       TEXT NOT NULL DEFAULT '["Directeur", "CEO", "Eigenaar", "Oprichter", "Managing Director"]',
+        icp_company_size TEXT NOT NULL DEFAULT '10-200',
+        search_queries  TEXT NOT NULL DEFAULT '[]',
+        active          INTEGER NOT NULL DEFAULT 0
+    );
+    """)
+
+    # Seed default tenant profiles if table is empty
+    cursor.execute("SELECT COUNT(*) FROM tenant_config;")
+    if cursor.fetchone()[0] == 0:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        default_queries = json.dumps([
+            "groothandel B2B Nederland",
+            "logistiek dienstverlener Nederland",
+            "transport bedrijf Nederland MKB",
+            "IT consultancy Nederland MKB",
+            "recruitment bureau Nederland MKB"
+        ])
+        cursor.executemany(
+            """INSERT INTO tenant_config
+               (tenant_id, display_name, sending_email, sending_domain, calendar_link,
+                signature_block, value_doctrine, brand_voice, icp_industries,
+                icp_roles, icp_company_size, search_queries, active)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    'injexion',
+                    'Injexion',
+                    '',  # user fills in via Settings tab
+                    '',
+                    '',
+                    '',
+                    '',  # user fills in Value Doctrine
+                    'Professioneel, direct, vriendelijk. Gebruik informeel Nederlands (je/jullie).',
+                    json.dumps(["Groothandel", "Logistiek & Transport", "B2B SaaS", "IT Dienstverlening"]),
+                    json.dumps(["Directeur", "CEO", "Eigenaar", "Oprichter"]),
+                    '10-200',
+                    default_queries,
+                    1  # active by default
+                ),
+                (
+                    'clawbuildr',
+                    'ClawBuildr',
+                    '',
+                    'clawbuildr.com',
+                    'cal.com/clawbuildr',
+                    'Marvin van der Sluis\nClawBuildr\nhttps://clawbuildr.com/',
+                    'ClawBuildr bouwt AI-gestuurde automatiseringssystemen voor MKB-bedrijven. Onze producten: AI Email Assistenten, AI Telefoonassistenten, Workflow Automatisering (Zapier/Make), en CRM Integraties (HubSpot, AFAS, Teamleader). Wij helpen bedrijven repetitief handmatig werk te elimineren.',
+                    'Professioneel, direct, vriendelijk. Gebruik informeel Nederlands (je/jullie).',
+                    json.dumps(["Accountancy", "Tandartspraktijk", "Juridisch", "Vastgoed", "IT Dienstverlening"]),
+                    json.dumps(["Directeur", "CEO", "Eigenaar", "Oprichter"]),
+                    '5-50',
+                    default_queries,
+                    0
+                )
+            ]
+        )
+        logger.info("[Migrations] Seeded 2 default tenant profiles (Injexion, ClawBuildr).")
+
+    # 2c. Create Tenant Config Table (multi-tenant support)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS tenant_config (
+        tenant_id       TEXT PRIMARY KEY,
+        display_name    TEXT NOT NULL DEFAULT '',
+        sending_email   TEXT NOT NULL DEFAULT '',
+        sending_domain  TEXT NOT NULL DEFAULT '',
+        calendar_link   TEXT NOT NULL DEFAULT '',
+        signature_block TEXT NOT NULL DEFAULT '',
+        value_doctrine  TEXT NOT NULL DEFAULT '',
+        brand_voice     TEXT NOT NULL DEFAULT 'Professioneel, direct, vriendelijk. Gebruik informeel Nederlands (je/jullie).',
+        icp_industries  TEXT NOT NULL DEFAULT '["Groothandel", "Logistiek & Transport", "B2B SaaS", "IT Dienstverlening"]',
+        icp_roles       TEXT NOT NULL DEFAULT '["Directeur", "CEO", "Eigenaar", "Oprichter", "Managing Director"]',
+        icp_company_size TEXT NOT NULL DEFAULT '10-200',
+        search_queries  TEXT NOT NULL DEFAULT '[]',
+        active          INTEGER NOT NULL DEFAULT 0
+    );
+    """)
+
+    # Seed default tenant profiles if table is empty
+    cursor.execute("SELECT COUNT(*) FROM tenant_config;")
+    if cursor.fetchone()[0] == 0:
+        import json
+        now_iso = datetime.now(timezone.utc).isoformat()
+        default_queries = json.dumps([
+            "groothandel B2B Nederland",
+            "logistiek dienstverlener Nederland",
+            "transport bedrijf Nederland MKB",
+            "IT consultancy Nederland MKB",
+            "recruitment bureau Nederland MKB"
+        ])
+        cursor.executemany(
+            """INSERT INTO tenant_config
+               (tenant_id, display_name, sending_email, sending_domain, calendar_link,
+                signature_block, value_doctrine, brand_voice, icp_industries,
+                icp_roles, icp_company_size, search_queries, active)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    'injexion',
+                    'Injexion',
+                    '',  # user fills in via Settings tab
+                    '',
+                    '',
+                    '',
+                    '',  # user fills in Value Doctrine
+                    'Professioneel, direct, vriendelijk. Gebruik informeel Nederlands (je/jullie).',
+                    json.dumps(["Groothandel", "Logistiek & Transport", "B2B SaaS", "IT Dienstverlening"]),
+                    json.dumps(["Directeur", "CEO", "Eigenaar", "Oprichter"]),
+                    '10-200',
+                    default_queries,
+                    1  # active by default
+                ),
+                (
+                    'clawbuildr',
+                    'ClawBuildr',
+                    '',
+                    'clawbuildr.com',
+                    'cal.com/clawbuildr',
+                    'Marvin van der Sluis\nClawBuildr\nhttps://clawbuildr.com/',
+                    'ClawBuildr bouwt AI-gestuurde automatiseringssystemen voor MKB-bedrijven. Onze producten: AI Email Assistenten, AI Telefoonassistenten, Workflow Automatisering (Zapier/Make), en CRM Integraties (HubSpot, AFAS, Teamleader). Wij helpen bedrijven repetitief handmatig werk te elimineren.',
+                    'Professioneel, direct, vriendelijk. Gebruik informeel Nederlands (je/jullie).',
+                    json.dumps(["Accountancy", "Tandartspraktijk", "Juridisch", "Vastgoed", "IT Dienstverlening"]),
+                    json.dumps(["Directeur", "CEO", "Eigenaar", "Oprichter"]),
+                    '5-50',
+                    default_queries,
+                    0
+                )
+            ]
+        )
+        logger.info("[Migrations] Seeded 2 default tenant profiles (Injexion, ClawBuildr).")
+
     # 3. Add Serialized Agent Output Columns to contacts table if missing
     cursor.execute("PRAGMA table_info(contacts);")
     columns = [col[1] for col in cursor.fetchall()]
@@ -133,9 +277,7 @@ def run_migrations():
     cursor.execute("SELECT COUNT(*) FROM deliverability_stats;")
     if cursor.fetchone()[0] == 0:
         domains = [
-            ('clawbuildr.com', 0, 0, 0, 0.0, 'HEALTHY', datetime.now(timezone.utc).isoformat()),
-            ('tandartspark.nl', 0, 0, 0, 0.0, 'HEALTHY', datetime.now(timezone.utc).isoformat()),
-            ('legaladvisor.nl', 0, 0, 0, 0.0, 'HEALTHY', datetime.now(timezone.utc).isoformat()),
+            ('your-domain.com', 0, 0, 0, 0.0, 'HEALTHY', datetime.now(timezone.utc).isoformat()),
             ('outlook.com', 0, 0, 0, 0.0, 'HEALTHY', datetime.now(timezone.utc).isoformat())
         ]
         cursor.executemany("INSERT INTO deliverability_stats (domain, sends_count, replies_count, bounces_count, bounce_rate, domain_health, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?);", domains)
@@ -210,6 +352,92 @@ sse_manager = SSEBroadcaster()
 
 # Global database write lock — prevents concurrent SQLite writes between sourcing + pipeline
 _DB_LOCK = asyncio.Lock()
+
+# Dedicated thread pool for LinkedIn Selenium (Bug #6 fix: prevents thread pool starvation)
+_LI_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="li_selenium")
+
+def _get_active_tenant() -> dict:
+    """Returns the currently active tenant config from the database.
+    Falls back to a safe empty default if not configured yet."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM tenant_config WHERE active = 1 LIMIT 1").fetchone()
+        conn.close()
+        if row:
+            t = dict(row)
+            # Parse JSON fields
+            for field in ('icp_industries', 'icp_roles', 'search_queries'):
+                try:
+                    t[field] = json.loads(t.get(field) or '[]')
+                except Exception:
+                    t[field] = []
+            return t
+    except Exception as e:
+        logger.warning(f"[Tenant] Could not load tenant config: {e}")
+    # Safe default (setup not done yet)
+    return {
+        'tenant_id': 'default',
+        'display_name': 'My Company',
+        'sending_email': '',
+        'sending_domain': '',
+        'calendar_link': '',
+        'signature_block': '',
+        'value_doctrine': '',
+        'brand_voice': 'Professioneel, direct, vriendelijk.',
+        'icp_industries': ["Groothandel", "Logistiek"],
+        'icp_roles': ["Directeur", "Eigenaar"],
+        'icp_company_size': '10-200',
+        'search_queries': [
+            "groothandel B2B Nederland",
+            "logistiek dienstverlener Nederland",
+            "transport bedrijf Nederland MKB",
+        ],
+        'active': 1
+    }
+
+# Dedicated thread pool for LinkedIn Selenium (Bug #6 fix: prevents thread pool starvation)
+_LI_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="li_selenium")
+
+def _get_active_tenant() -> dict:
+    """Returns the currently active tenant config from the database.
+    Falls back to a safe empty default if not configured yet."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM tenant_config WHERE active = 1 LIMIT 1").fetchone()
+        conn.close()
+        if row:
+            t = dict(row)
+            # Parse JSON fields
+            for field in ('icp_industries', 'icp_roles', 'search_queries'):
+                try:
+                    t[field] = json.loads(t.get(field) or '[]')
+                except Exception:
+                    t[field] = []
+            return t
+    except Exception as e:
+        logger.warning(f"[Tenant] Could not load tenant config: {e}")
+    # Safe default (setup not done yet)
+    return {
+        'tenant_id': 'default',
+        'display_name': 'My Company',
+        'sending_email': '',
+        'sending_domain': '',
+        'calendar_link': '',
+        'signature_block': '',
+        'value_doctrine': '',
+        'brand_voice': 'Professioneel, direct, vriendelijk.',
+        'icp_industries': ["Groothandel", "Logistiek"],
+        'icp_roles': ["Directeur", "Eigenaar"],
+        'icp_company_size': '10-200',
+        'search_queries': [
+            "groothandel B2B Nederland",
+            "logistiek dienstverlener Nederland",
+            "transport bedrijf Nederland MKB",
+        ],
+        'active': 1
+    }
 
 # =========================================================================
 # 3. INTER-AGENT EXECUTOR WRAPPER
@@ -382,22 +610,8 @@ async def run_pipeline_for_lead(lead_id: str):
             await log_audit("Deliverability Agent", "SAFETY_GATE", f"BLOCKED by deliverability gate (Score: {deliv_data.get('confidence_score')})")
             await update_agent_db_status("Deliverability Agent", "IDLE", "Awaiting safety gate checks...")
             await sse_manager.broadcast("lead_refresh", {"contact_id": lead_id, "current_stage": "BLOCKED"})
-            # Still try LinkedIn outreach for blocked leads with a stored URL
-            if stored_li_url:
-                try:
-                    li_note = _li_generate_note(f"Ik zag uw bedrijf online en wil graag in contact komen.", first_name, company_name)
-                    logger.info(f"[LinkedIn] Blocked lead has stored URL, attempting LinkedIn: {stored_li_url}")
-                    loop = asyncio.get_event_loop()
-                    li_outcome = await loop.run_in_executor(
-                        None,
-                        lambda: _li_search_and_connect(first_name, last_name or "", company_name or "", li_note, contact_id=lead_id, profile_url=stored_li_url)
-                    )
-                    logger.info(f"[LinkedIn] Outcome for blocked lead {first_name}: {li_outcome}")
-                    await log_audit("LinkedIn Agent", "LINKEDIN_OUTREACH", f"LinkedIn outreach for blocked lead: {li_outcome}")
-                except Exception as li_ex:
-                    import traceback
-                    logger.warning(f"[LinkedIn] Auto-outreach failed for blocked lead {lead_id}: {li_ex}")
-                    logger.warning(f"[LinkedIn] Traceback: {traceback.format_exc()}")
+            # Do NOT attempt LinkedIn for leads blocked before research — note would be generic and damage brand
+            logger.info(f"[LinkedIn] Lead {lead_id} blocked at deliverability gate. Skipping LinkedIn (no research context yet).")
             return
         else:
             await db_write("UPDATE contacts SET current_stage = 'DELIVERABILITY_VERIFIED' WHERE contact_id = ?;", (lead_id,))
@@ -427,7 +641,7 @@ async def run_pipeline_for_lead(lead_id: str):
         await update_agent_db_status("Qualification Agent", "RUNNING", "Running BANT qualification...")
         await log_handoff("CentralOrchestrator", "Qualification Agent", {"action": "bant_scoring", "solutions": opp_data.get("selected_solutions", [])})
         
-        role_title = "Directeur" if "tand" in domain else "Oprichter"
+        role_title = role if role and role.strip() else "Eigenaar"
         qual = await q_agent.qualify(research, opp, role_title)
         qual_data = qual.model_dump() if hasattr(qual, "model_dump") else qual.dict()
         
@@ -456,13 +670,11 @@ async def run_pipeline_for_lead(lead_id: str):
             else:
                 await log_audit("LinkedIn Agent", "LINKEDIN_SEARCH", f"No LinkedIn URL stored for {first_name} {last_name} at {company_name}")
 
-            import concurrent.futures
             loop = asyncio.get_event_loop()
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                li_result = await loop.run_in_executor(
-                    executor,
-                    lambda: _li_search_and_connect(first_name, last_name or "", company_name or "", li_note, contact_id=lead_id, profile_url=stored_li_url)
-                )
+            li_result = await loop.run_in_executor(
+                _LI_EXECUTOR,
+                lambda: _li_search_and_connect(first_name, last_name or "", company_name or "", li_note, contact_id=lead_id, profile_url=stored_li_url)
+            )
 
             li_outcome = li_result.get("outcome", "ERROR")
             await log_audit("LinkedIn Agent", "LINKEDIN_RESULT", f"LinkedIn outreach for {first_name} {last_name}: {li_outcome}. Note: {li_result.get('note', '')[:60]}...")
@@ -521,11 +733,11 @@ async def run_pipeline_for_lead(lead_id: str):
         logger.error(f"[Pipeline] Fatal crash during pipeline execution: {ex}")
         import traceback
         traceback.print_exc()
-        await log_audit("SYSTEM", "CRITICAL_ERROR", f"Orchestrator pipeline failed: {str(ex)}")
-        
-        # Put failing agent in failed state
-        await update_agent_db_status("Research Agent", "FAILED", "Pipeline processing crashed", str(ex))
-        conn.close()
+        try:
+            await log_audit("SYSTEM", "CRITICAL_ERROR", f"Orchestrator pipeline failed: {str(ex)}")
+            await update_agent_db_status("Research Agent", "FAILED", "Pipeline processing crashed", str(ex))
+        except Exception:
+            pass  # Don't let audit logging mask the original error
 
 
 # =========================================================================
@@ -957,17 +1169,19 @@ async def _find_linkedin_for_company(company_name: str, domain: str) -> dict:
             logger.info(f"[Lead Sourcing] LinkedIn direct search failed: {e}")
 
     # STEP 2: For each found name, try to find LinkedIn profile
+    # Bug #8 fix: Run Selenium in thread to avoid blocking the event loop
     for first, last in found_names[:3]:
         full_name = f"{first} {last}".strip()
-        # Try LinkedIn search via Selenium
         try:
-            from linkedin_engine import get_firefox_driver, _search_and_find_profile
-
-            with get_firefox_driver() as (driver, page):
-                profile_url, error = _search_and_find_profile(page, first, last, clean_name)
-                if profile_url:
-                    logger.info(f"[Lead Sourcing] LinkedIn found: {first} {last} -> {profile_url}")
-                    return {"linkedin_url": profile_url, "first_name": first, "last_name": last}
+            def _run_li_search():
+                from linkedin_engine import get_firefox_driver, _search_and_find_profile
+                with get_firefox_driver() as (driver, page):
+                    profile_url, error = _search_and_find_profile(page, first, last, clean_name)
+                    return profile_url
+            profile_url = await asyncio.to_thread(_run_li_search)
+            if profile_url:
+                logger.info(f"[Lead Sourcing] LinkedIn found: {first} {last} -> {profile_url}")
+                return {"linkedin_url": profile_url, "first_name": first, "last_name": last}
         except Exception as e:
             logger.info(f"[Lead Sourcing] LinkedIn search for {first} {last} failed: {e}")
         await asyncio.sleep(2)
@@ -986,14 +1200,18 @@ async def _try_query(query: str, current_count: int) -> int:
     """Search Brave for a query, add new companies to DB, return count added."""
     results = await _search_web(query)
     
-    # Filter out existing domains and scrape concurrently
+    # Bug #9 fix: dedup check now uses a fresh WAL snapshot — safe for concurrent reads
+    # We use a short-lived connection in WAL mode; reads don't need _DB_LOCK in WAL
     domains_to_scrape = []
     conn2 = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn2.execute("PRAGMA journal_mode=WAL;")
     cur2 = conn2.cursor()
+    seen_domains = set()
     for res in results:
         domain = res["domain"]
-        if not domain:
+        if not domain or domain in seen_domains:
             continue
+        seen_domains.add(domain)
         cur2.execute("SELECT company_id FROM companies WHERE domain = ?", (domain,))
         if cur2.fetchone():
             continue
@@ -1162,8 +1380,13 @@ async def run_sourcing_cycle():
         return 0
 
     total_added = 0
-    random.shuffle(_LEAD_SOURCE_QUERIES)
-    for query in _LEAD_SOURCE_QUERIES:
+    # Bug #7 fix: Load ICP search queries from active tenant config (not hardcoded list)
+    tenant = _get_active_tenant()
+    active_queries = tenant.get('search_queries') or []
+    if not active_queries:
+        active_queries = _LEAD_SOURCE_QUERIES  # fallback to defaults
+    random.shuffle(active_queries)
+    for query in active_queries:
         if count + total_added >= _MAX_LEADS_SOURCED:
             break
         added = await _try_query(query, count + total_added)
@@ -1395,11 +1618,14 @@ async def linkedin_auto_loop():
 
             logger.info(f"[LinkedIn Auto] [{period} {period_count+1}/{period_limit}] Sending to {first_name} {last_name} ({company_name}). Next in {wait/60:.0f}min.")
             try:
-                result = await asyncio.to_thread(
-                    _li_search,
-                    first_name, last_name or "", company_name or "",
-                    email_body, contact_id=contact_id, profile_url=linkedin_url,
-                    research_result=research_json, opportunity_mapping=opportunity_json
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    _LI_EXECUTOR,
+                    lambda: _li_search(
+                        first_name, last_name or "", company_name or "",
+                        email_body, contact_id=contact_id, profile_url=linkedin_url,
+                        research_result=research_json, opportunity_mapping=opportunity_json
+                    )
                 )
                 logger.info(f"[LinkedIn Auto] Result for {first_name} {last_name}: {result}")
             except Exception as e:
@@ -1562,6 +1788,14 @@ async def approve_outreach(lead_id: str):
         raise HTTPException(status_code=404, detail="Lead not found")
         
     email, draft_json, domain = row
+
+    # Bug #11 fix: verify lead is actually in PENDING_APPROVAL before sending
+    cursor.execute("SELECT current_stage FROM contacts WHERE contact_id = ?", (lead_id,))
+    stage_row = cursor.fetchone()
+    if stage_row and stage_row[0] not in ('PENDING_APPROVAL', 'OUTREACH_DRAFTED'):
+        conn.close()
+        raise HTTPException(status_code=400, detail=f"Lead is in stage '{stage_row[0]}' — can only approve PENDING_APPROVAL leads")
+
     if not draft_json:
         conn.close()
         raise HTTPException(status_code=400, detail="Outreach has not been drafted for this lead yet")
@@ -1625,10 +1859,14 @@ async def approve_outreach(lead_id: str):
             send_error = f"SMTP Exception: {str(ex)}"
             logger.error(f"[Outreach Approval] SMTP crashed: {ex}")
 
-    # If all send methods failed, apply smooth simulation fallback to keep demo alive
+    # Bug #1 fix: NEVER silently fake a sent email. Surface the real error.
     if not sent_successfully:
-        logger.warning(f"[Outreach Approval] All send methods failed ({send_error}). Simulating outbound deliverability for review...")
-        sent_successfully = True # fallback
+        logger.error(f"[Outreach Approval] All send methods failed: {send_error}")
+        conn.close()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Email delivery failed. Configure Gmail credentials or SMTP in Settings. Error: {send_error}"
+        )
         
     if sent_successfully:
         # Move state to ACTIVE_OUTREACH, and save email log
@@ -2232,6 +2470,89 @@ def generate_founderflow_post_endpoint():
     return {"success": False, "error": "Failed to generate post"}
 
 # --- INDEX HTML FRONTEND DIRECTLY SERVED ---
+
+# =========================================================================
+# TENANT CONFIG API
+# =========================================================================
+
+@app.get("/api/config/tenants")
+def get_all_tenants():
+    """Returns all tenant profiles."""
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT * FROM tenant_config ORDER BY display_name").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+@app.get("/api/config/tenant")
+def get_active_tenant_api():
+    """Returns the currently active tenant config."""
+    return _get_active_tenant()
+
+@app.put("/api/config/tenant")
+async def save_tenant_config(request: Request):
+    """Saves the active tenant's configuration."""
+    body = await request.json()
+    tenant_id = body.get("tenant_id")
+    if not tenant_id:
+        raise HTTPException(status_code=400, detail="tenant_id required")
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    try:
+        conn.execute("""
+            INSERT INTO tenant_config
+                (tenant_id, display_name, sending_email, sending_domain, calendar_link,
+                 signature_block, value_doctrine, brand_voice, icp_industries,
+                 icp_roles, icp_company_size, search_queries, active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(tenant_id) DO UPDATE SET
+                display_name   = excluded.display_name,
+                sending_email  = excluded.sending_email,
+                sending_domain = excluded.sending_domain,
+                calendar_link  = excluded.calendar_link,
+                signature_block= excluded.signature_block,
+                value_doctrine = excluded.value_doctrine,
+                brand_voice    = excluded.brand_voice,
+                icp_industries = excluded.icp_industries,
+                icp_roles      = excluded.icp_roles,
+                icp_company_size = excluded.icp_company_size,
+                search_queries = excluded.search_queries,
+                active         = 1
+        """, (
+            tenant_id,
+            body.get("display_name", ""),
+            body.get("sending_email", ""),
+            body.get("sending_domain", ""),
+            body.get("calendar_link", ""),
+            body.get("signature_block", ""),
+            body.get("value_doctrine", ""),
+            body.get("brand_voice", ""),
+            json.dumps(body.get("icp_industries", [])),
+            json.dumps(body.get("icp_roles", [])),
+            body.get("icp_company_size", "10-200"),
+            json.dumps(body.get("search_queries", []))
+        ))
+        # Deactivate all other tenants
+        conn.execute("UPDATE tenant_config SET active = 0 WHERE tenant_id != ?", (tenant_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    logger.info(f"[Tenant] Config saved for tenant '{tenant_id}'")
+    return {"status": "saved", "tenant_id": tenant_id}
+
+@app.post("/api/config/tenant/switch/{tenant_id}")
+async def switch_tenant(tenant_id: str):
+    """Switches the active tenant."""
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    row = conn.execute("SELECT tenant_id FROM tenant_config WHERE tenant_id = ?", (tenant_id,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail=f"Tenant '{tenant_id}' not found")
+    conn.execute("UPDATE tenant_config SET active = 0")
+    conn.execute("UPDATE tenant_config SET active = 1 WHERE tenant_id = ?", (tenant_id,))
+    conn.commit()
+    conn.close()
+    logger.info(f"[Tenant] Switched active tenant to '{tenant_id}'")
+    return {"status": "switched", "tenant_id": tenant_id}
 
 @app.get("/")
 def get_dashboard_index():
@@ -3586,6 +3907,9 @@ def get_dashboard_index():
                 // Check LinkedIn login status when switching to LinkedIn tab
                 if(tabId === "tab-linkedin") {
                     checkLinkedInLoginStatus();
+                }
+                if(tabId === "tab-settings") {
+                    loadSettings();
                 }
             }
 
