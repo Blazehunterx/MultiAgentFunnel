@@ -27,9 +27,17 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 
 # Add clawbuildr pipeline to import path FIRST
-CLAWBUILDR_DIR = r"C:\Users\marvi\clawbuildr"
+import os
+# Use relative paths so it works on any machine
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CLAWBUILDR_DIR = os.path.join(BASE_DIR, "clawbuildr")
 if CLAWBUILDR_DIR not in sys.path:
     sys.path.insert(0, CLAWBUILDR_DIR)
+
+# Add local data dir to path so we can import clawbuildr_multi_agent directly
+DATA_DIR = os.path.join(BASE_DIR, "data")
+if DATA_DIR not in sys.path:
+    sys.path.insert(0, DATA_DIR)
 
 from models import LeadInput
 from pipeline import research_company, assess_trust, map_opportunity, qualify, generate_email
@@ -44,7 +52,7 @@ logging.basicConfig(
 logger = logging.getLogger("ClawBuildrDashboard")
 
 # Database Path
-DB_PATH = r"C:\Users\marvi\odysseus\data\clawbuildr.db"
+DB_PATH = os.path.join(BASE_DIR, "data", "clawbuildr.db")
 
 # =========================================================================
 # 1. DATABASE MIGRATIONS & SEED DATA ENGINE
@@ -1820,8 +1828,16 @@ async def approve_outreach(lead_id: str):
     # Check if we have clawbuildr_gmail in directory to execute live
     try:
         from clawbuildr_gmail import ClawBuildrGmailConnector
-        creds_path = r"C:\Users\marvi\odysseus\data\client_secret.json"
-        token_path = r"C:\Users\marvi\odysseus\data\token_gmail.json"
+        DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+        creds_path = os.path.join(DATA_DIR, "client_secret.json")
+        # Determine which tenant is active to use correct token
+        tenant = _get_active_tenant()
+        active_tenant_id = tenant.get("tenant_id", "default")
+        token_path = os.path.join(DATA_DIR, f"token_gmail_{active_tenant_id}.json")
+        
+        # Fallback to default token if tenant token doesn't exist yet
+        if not os.path.exists(token_path) and os.path.exists(os.path.join(DATA_DIR, "token_gmail.json")):
+            token_path = os.path.join(DATA_DIR, "token_gmail.json")
         
         if os.path.exists(creds_path) and os.path.exists(token_path):
             connector = ClawBuildrGmailConnector(credentials_path=creds_path, token_path=token_path)
@@ -2553,6 +2569,33 @@ async def switch_tenant(tenant_id: str):
     conn.close()
     logger.info(f"[Tenant] Switched active tenant to '{tenant_id}'")
     return {"status": "switched", "tenant_id": tenant_id}
+
+
+@app.post("/api/config/tenant/{tenant_id}/connect-gmail")
+def connect_gmail_tenant(tenant_id: str, background_tasks: BackgroundTasks):
+    """Triggers the Google OAuth flow on the local machine for this tenant."""
+    def _run_oauth():
+        try:
+            from clawbuildr_gmail import ClawBuildrGmailConnector
+            creds_path = os.path.join(DATA_DIR, "client_secret.json")
+            # Multi-tenant token path
+            token_path = os.path.join(DATA_DIR, f"token_gmail_{tenant_id}.json")
+            
+            # Delete old token if exists to force re-auth
+            if os.path.exists(token_path):
+                os.remove(token_path)
+                
+            connector = ClawBuildrGmailConnector(credentials_path=creds_path, token_path=token_path)
+            success = connector.authenticate(run_local_server=True)
+            if success:
+                logger.info(f"[Gmail] Successfully connected Gmail for tenant {tenant_id}")
+            else:
+                logger.error(f"[Gmail] Failed to connect Gmail for tenant {tenant_id}")
+        except Exception as e:
+            logger.error(f"[Gmail] Error during OAuth: {e}")
+            
+    background_tasks.add_task(_run_oauth)
+    return {"status": "started", "message": "Check your browser to complete Google Authentication"}
 
 @app.get("/")
 def get_dashboard_index():
