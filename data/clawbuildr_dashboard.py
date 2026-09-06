@@ -2723,6 +2723,10 @@ def get_dashboard_index():
                         <i class="fa-solid fa-pen-to-square text-base w-5"></i>
                         <span>LinkedIn Posts</span>
                     </button>
+                    <button onclick="switchTab('tab-settings')" id="btn-tab-settings" class="tab-button w-full flex items-center space-x-3.5 px-4 py-3 rounded-xl text-sm font-semibold text-slate-400 hover:bg-slate-800 hover:text-slate-100 transition">
+                        <i class="fa-solid fa-gear text-base w-5"></i>
+                        <span>Settings & ICP</span>
+                    </button>
                 </div>
                 
                 <!-- Quick stats summary widget -->
@@ -3154,6 +3158,126 @@ def get_dashboard_index():
                                 </tbody>
                             </table>
                         </div>
+                    </div>
+                </div>
+            <!-- SETTINGS & ICP TAB -->
+                <div id="tab-settings" class="tab-content space-y-8 hidden">
+                    
+                    <!-- Tenant Switcher -->
+                    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6">
+                        <div class="flex items-center gap-3 mb-6">
+                            <i class="fa-solid fa-building text-brand-400 text-lg"></i>
+                            <div>
+                                <h2 class="text-base font-extrabold text-white">Active Company Profile</h2>
+                                <p class="text-xs text-slate-500 mt-0.5">Switch between company profiles. All agents will use the active profile's ICP and value doctrine.</p>
+                            </div>
+                        </div>
+                        <div id="tenant-switcher" class="flex gap-3 flex-wrap mb-4"></div>
+                        <div class="text-xs text-amber-400 flex items-center gap-2 mt-2">
+                            <i class="fa-solid fa-triangle-exclamation"></i>
+                            <span>Switching profiles immediately affects all new leads and outreach. Currently running leads are not affected.</span>
+                        </div>
+                    </div>
+
+                    <!-- ICP & Brand Settings Form -->
+                    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6">
+                        <div class="flex items-center justify-between mb-6">
+                            <div class="flex items-center gap-3">
+                                <i class="fa-solid fa-sliders text-brand-400 text-lg"></i>
+                                <div>
+                                    <h2 class="text-base font-extrabold text-white">ICP & Outreach Configuration</h2>
+                                    <p class="text-xs text-slate-500 mt-0.5">Fill these in to activate all 7 agents for your company.</p>
+                                </div>
+                            </div>
+                            <button onclick="saveSettings()" class="bg-brand-600 hover:bg-brand-500 text-white font-bold text-sm px-5 py-2.5 rounded-xl transition flex items-center gap-2">
+                                <i class="fa-solid fa-floppy-disk"></i> Save Configuration
+                            </button>
+                        </div>
+
+                        <input type="hidden" id="settings-tenant-id" value="">
+                        
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            
+                            <!-- Company Name -->
+                            <div>
+                                <label class="text-[11px] text-slate-400 font-bold uppercase tracking-wider block mb-1.5">Company / Profile Name</label>
+                                <input id="settings-display-name" type="text" placeholder="e.g. Injexion" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-brand-500/80">
+                            </div>
+
+                            <!-- Sending Email -->
+                            <div>
+                                <label class="text-[11px] text-slate-400 font-bold uppercase tracking-wider block mb-1.5">Sending Email Address <span class="text-red-400">*</span></label>
+                                <input id="settings-sending-email" type="email" placeholder="e.g. marvin@injexion.io" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-brand-500/80">
+                                <p class="text-[10px] text-slate-500 mt-1">The email address that will send outreach. Must be set up with Gmail OAuth or SMTP.</p>
+                            </div>
+
+                            <!-- Calendar Link -->
+                            <div>
+                                <label class="text-[11px] text-slate-400 font-bold uppercase tracking-wider block mb-1.5">Calendar / Booking Link <span class="text-red-400">*</span></label>
+                                <input id="settings-calendar-link" type="url" placeholder="e.g. cal.com/injexion" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-brand-500/80">
+                            </div>
+
+                            <!-- ICP Company Size -->
+                            <div>
+                                <label class="text-[11px] text-slate-400 font-bold uppercase tracking-wider block mb-1.5">Target Company Size (employees)</label>
+                                <input id="settings-company-size" type="text" placeholder="e.g. 10-200" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-brand-500/80">
+                            </div>
+
+                            <!-- Gmail Authentication -->
+                            <div class="col-span-1 md:col-span-2 bg-slate-800/50 rounded-xl p-4 border border-slate-700/50 mt-2">
+                                <div class="flex items-center justify-between">
+                                    <div>
+                                        <h3 class="text-sm font-bold text-white mb-1"><i class="fa-brands fa-google text-brand-400 mr-2"></i>Gmail OAuth Connection</h3>
+                                        <p class="text-xs text-slate-400">Connect the Google Workspace account for this profile to enable live sending.</p>
+                                    </div>
+                                    <button onclick="connectGmail()" type="button" class="bg-white hover:bg-slate-100 text-slate-900 font-bold text-xs px-4 py-2 rounded-lg transition flex items-center gap-2">
+                                        <i class="fa-solid fa-link"></i> Authenticate Gmail
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Value Doctrine -->
+                        <div class="mt-6">
+                            <label class="text-[11px] text-slate-400 font-bold uppercase tracking-wider block mb-1.5">Value Doctrine — What do you sell? <span class="text-red-400">*</span></label>
+                            <textarea id="settings-value-doctrine" rows="4" placeholder="Describe your product/service in 3-5 sentences. The AI uses this to write every email and map pain points. Example: 'Injexion builds autonomous B2B lead generation systems for Dutch SMEs. We combine AI research agents, LinkedIn automation, and personalized email outreach into a single pipeline...'" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-brand-500/80 resize-y"></textarea>
+                            <p class="text-[10px] text-slate-500 mt-1">This is the most important field. The better you describe your offer, the more relevant every outbound email will be.</p>
+                        </div>
+                        
+                        <!-- Email Signature Block -->
+                        <div class="mt-6">
+                            <label class="text-[11px] text-slate-400 font-bold uppercase tracking-wider block mb-1.5">Email Signature Block <span class="text-red-400">*</span></label>
+                            <textarea id="settings-signature" rows="4" placeholder="Your Name\nCompany Name\nhttps://yourwebsite.com\n+31 6 12345678" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-3 text-sm text-white font-mono focus:outline-none focus:border-brand-500/80 resize-y"></textarea>
+                        </div>
+
+                        <!-- ICP Target Industries -->
+                        <div class="mt-6">
+                            <label class="text-[11px] text-slate-400 font-bold uppercase tracking-wider block mb-1.5">Target Industries (one per line)</label>
+                            <textarea id="settings-industries" rows="4" placeholder="Groothandel\nLogistiek & Transport\nB2B SaaS\nIT Dienstverlening" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-brand-500/80 resize-y"></textarea>
+                        </div>
+
+                        <!-- ICP Decision Maker Titles -->
+                        <div class="mt-6">
+                            <label class="text-[11px] text-slate-400 font-bold uppercase tracking-wider block mb-1.5">Target Decision-Maker Titles (one per line)</label>
+                            <textarea id="settings-roles" rows="3" placeholder="Directeur\nCEO\nEigenaar\nOprichter" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-brand-500/80 resize-y"></textarea>
+                        </div>
+
+                        <!-- Lead Sourcing Queries -->
+                        <div class="mt-6">
+                            <label class="text-[11px] text-slate-400 font-bold uppercase tracking-wider block mb-1.5">Lead Sourcing Queries — Agent Zero searches (one per line)</label>
+                            <textarea id="settings-queries" rows="6" placeholder="groothandel B2B Nederland\nlogistiek dienstverlener Nederland\ntransport bedrijf Nederland MKB\nIT consultancy Nederland MKB" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-3 text-sm text-white font-mono focus:outline-none focus:border-brand-500/80 resize-y"></textarea>
+                            <p class="text-[10px] text-slate-500 mt-1">These are the exact search queries Agent Zero uses to discover leads. Be specific: include industry + country + size signal (e.g. "MKB").</p>
+                        </div>
+
+                        <!-- Brand Voice -->
+                        <div class="mt-6">
+                            <label class="text-[11px] text-slate-400 font-bold uppercase tracking-wider block mb-1.5">Brand Voice Instructions</label>
+                            <textarea id="settings-brand-voice" rows="2" placeholder="Professioneel, direct, vriendelijk. Gebruik informeel Nederlands (je/jullie). Max 120 woorden per email." class="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-3 text-sm text-white focus:outline-none focus:border-brand-500/80 resize-y"></textarea>
+                        </div>
+
+                        <!-- Setup Status Check -->
+                        <div id="settings-status" class="mt-6 hidden"></div>
+
                     </div>
                 </div>
             </section>
@@ -4409,6 +4533,134 @@ def get_dashboard_index():
                 }, 5000);
             }
 
+            // ========================
+            // SETTINGS & ICP FUNCTIONS
+            // ========================
+            let _allTenants = [];
+
+            async function loadSettings() {
+                try {
+                    const [tenants, active] = await Promise.all([
+                        fetch('/api/config/tenants').then(r => r.json()),
+                        fetch('/api/config/tenant').then(r => r.json())
+                    ]);
+                    _allTenants = tenants;
+                    renderTenantSwitcher(tenants, active.tenant_id);
+                    populateSettingsForm(active);
+                } catch(e) {
+                    console.error('Failed to load settings', e);
+                }
+            }
+
+            function renderTenantSwitcher(tenants, activeTenantId) {
+                const el = document.getElementById('tenant-switcher');
+                el.innerHTML = tenants.map(t => `
+                    <button onclick="switchTenant('${t.tenant_id}')" class="px-4 py-2 rounded-xl text-sm font-bold transition border ${
+                        t.tenant_id === activeTenantId
+                            ? 'bg-brand-600 border-brand-500 text-white'
+                            : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
+                    }">
+                        ${t.display_name || t.tenant_id}
+                    </button>
+                `).join('');
+            }
+
+            async function switchTenant(tenantId) {
+                await fetch(`/api/config/tenant/switch/${tenantId}`, {method: 'POST'});
+                showToast('success', `Switched to ${tenantId}`);
+                loadSettings();
+            }
+
+            function populateSettingsForm(config) {
+                document.getElementById('settings-tenant-id').value = config.tenant_id || '';
+                document.getElementById('settings-display-name').value = config.display_name || '';
+                document.getElementById('settings-sending-email').value = config.sending_email || '';
+                document.getElementById('settings-calendar-link').value = config.calendar_link || '';
+                document.getElementById('settings-company-size').value = config.icp_company_size || '';
+                document.getElementById('settings-value-doctrine').value = config.value_doctrine || '';
+                document.getElementById('settings-signature').value = config.signature_block || '';
+                document.getElementById('settings-brand-voice').value = config.brand_voice || '';
+                // Arrays -> one per line
+                const industries = Array.isArray(config.icp_industries) ? config.icp_industries : [];
+                const roles = Array.isArray(config.icp_roles) ? config.icp_roles : [];
+                const queries = Array.isArray(config.search_queries) ? config.search_queries : [];
+                document.getElementById('settings-industries').value = industries.join('\\n');
+                document.getElementById('settings-roles').value = roles.join('\\n');
+                document.getElementById('settings-queries').value = queries.join('\\n');
+                // Show setup status
+                checkSetupStatus(config);
+            }
+
+            function checkSetupStatus(config) {
+                const el = document.getElementById('settings-status');
+                const missing = [];
+                if (!config.value_doctrine) missing.push('Value Doctrine');
+                if (!config.sending_email) missing.push('Sending Email');
+                if (!config.calendar_link) missing.push('Calendar Link');
+                if (!config.signature_block) missing.push('Email Signature');
+                const queries = Array.isArray(config.search_queries) ? config.search_queries : [];
+                if (!queries.length) missing.push('Lead Sourcing Queries');
+                if (missing.length > 0) {
+                    el.className = 'mt-6 bg-amber-500/10 border border-amber-500/30 rounded-xl p-4';
+                    el.innerHTML = `<div class="flex items-start gap-3"><i class="fa-solid fa-triangle-exclamation text-amber-400 mt-0.5"></i><div><p class="text-sm font-bold text-amber-300">Setup Incomplete — Agents running in limited mode</p><p class="text-xs text-amber-400/70 mt-1">Missing: ${missing.join(', ')}. Fill these in and save to unlock full personalized outreach.</p></div></div>`;
+                    el.classList.remove('hidden');
+                } else {
+                    el.className = 'mt-6 bg-emerald-500/10 border border-emerald-500/30 rounded-xl p-4';
+                    el.innerHTML = '<div class="flex items-center gap-3"><i class="fa-solid fa-circle-check text-emerald-400"></i><p class="text-sm font-bold text-emerald-300">All systems configured — Agents running at full capacity</p></div>';
+                    el.classList.remove('hidden');
+                }
+            }
+
+            async function saveSettings() {
+                const tenantId = document.getElementById('settings-tenant-id').value || 'injexion';
+                const industries = document.getElementById('settings-industries').value.split('\\n').map(s=>s.trim()).filter(Boolean);
+                const roles = document.getElementById('settings-roles').value.split('\\n').map(s=>s.trim()).filter(Boolean);
+                const queries = document.getElementById('settings-queries').value.split('\\n').map(s=>s.trim()).filter(Boolean);
+                const payload = {
+                    tenant_id: tenantId,
+                    display_name: document.getElementById('settings-display-name').value.trim(),
+                    sending_email: document.getElementById('settings-sending-email').value.trim(),
+                    sending_domain: document.getElementById('settings-sending-email').value.trim().split('@')[1] || '',
+                    calendar_link: document.getElementById('settings-calendar-link').value.trim(),
+                    signature_block: document.getElementById('settings-signature').value.trim(),
+                    value_doctrine: document.getElementById('settings-value-doctrine').value.trim(),
+                    brand_voice: document.getElementById('settings-brand-voice').value.trim(),
+                    icp_industries: industries,
+                    icp_roles: roles,
+                    icp_company_size: document.getElementById('settings-company-size').value.trim(),
+                    search_queries: queries
+                };
+                try {
+                    const res = await fetch('/api/config/tenant', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+                    if (res.ok) {
+                        showToast('success', 'Configuration saved! Agents will use new settings on next cycle.');
+                        loadSettings();
+                    } else {
+                        const err = await res.json();
+                        showToast('error', `Save failed: ${err.detail || 'Unknown error'}`);
+                    }
+                } catch(e) {
+                    showToast('error', 'Network error saving settings.');
+                }
+            }
+            
+            async function connectGmail() {
+                const tenantId = document.getElementById('settings-tenant-id').value;
+                if(!tenantId) {
+                    showToast('error', 'No active profile selected.');
+                    return;
+                }
+                showToast('info', 'Opening Google Authentication in a new tab/window...');
+                try {
+                    const res = await fetch(`/api/config/tenant/${tenantId}/connect-gmail`, {method: 'POST'});
+                    const data = await res.json();
+                    if(res.ok) {
+                        showToast('success', 'Follow the prompts in your browser window to connect.');
+                    }
+                } catch (e) {
+                    showToast('error', 'Failed to trigger Gmail auth.');
+                }
+            }
 
             // On Document Bootstrap
             window.onload = () => {
