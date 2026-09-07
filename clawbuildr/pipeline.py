@@ -413,6 +413,40 @@ async def regenerate_email_with_data(
         f"Je bent de Outreach Agent. Je schrijft persoonlijke cold outreach e-mails in het Nederlands "
         f"gericht op beslissers van MKB-bedrijven. Geef alleen geldige JSON terug."
     )
+    template_instruction = ""
+    try:
+        import sqlite3
+        import os
+        db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "clawbuildr.db")
+        c = sqlite3.connect(db_path, timeout=5.0)
+        c.row_factory = sqlite3.Row
+        # Get active tenant to find their active strategy
+        tenant = c.execute("SELECT tenant_id, value_doctrine, email_signature FROM tenant_config WHERE active = 1").fetchone()
+        t_id = tenant["tenant_id"] if tenant else "default"
+        sig = tenant["email_signature"] if tenant and tenant["email_signature"] else "Met vriendelijke groet,"
+        # Check active strategy step 1 template
+        step1 = c.execute("""
+            SELECT pm.body, pm.subject_line FROM strategies s
+            JOIN strategy_steps ss ON s.strategy_id = ss.strategy_id
+            JOIN prefab_messages pm ON ss.template_id = pm.template_id
+            WHERE s.tenant_id = ? AND s.active = 1 AND ss.step_number = 1
+        """, (t_id,)).fetchone()
+        c.close()
+        
+        if step1 and step1["body"]:
+            template_instruction = f"""
+UITGANGSPUNT TEMPLATE:
+Gebruik onderstaande structuur en vul de variabelen en personalisatie op een natuurlijke manier in.
+Onderwerp: {step1['subject_line']}
+Body Structuur:
+{step1['body']}
+
+Sluit altijd af met deze handtekening:
+{sig}
+"""
+    except Exception as e:
+        pass
+
     user_prompt = f"""
 Schrijf een koude outreach e-mail met deze details:
 - Naam: {lead.contact_name}
@@ -421,13 +455,15 @@ Schrijf een koude outreach e-mail met deze details:
 - Kansen: {opp_data}
 - Hook: {opportunity.strongest_hook}
 
+{template_instruction}
+
 STRIKTE REGELS:
 1. Woordenaantal: STRENG onder 120 woorden.
 2. Toon: Vriendelijk, direct, professioneel Nederlands (gebruik 'je' of 'jullie'). Geen pushy sales pitches.
 3. GEEN INTERNE NOTITIES: Nooit interne kwalificaties, budget, of autoriteit vermelden. Je hebt nog niet met ze gesproken!
 4. GEEN ROBOT TAAL: Geen "Gedetecteerd via deep scrape:" of tech jargon. Open natuurlijk als een mens.
 5. Call to Action: Lage drempel (bijv. 'Zullen we volgende week kort 10 minuten bellen?').
-6. Geen template houders als [Bedrijfsnaam] of [Naam] in de e-mail.
+6. Geen template houders als [Bedrijfsnaam] of [Naam] in de uiteindelijke e-mail (vervang deze met de echte waarden).
 7. Gebruik de voornaam van de persoon in de aanhef (bijv. 'Beste {lead.contact_name}').
 8. Nooit Engelse zinnen of woorden in een Nederlandse e-mail.
 9. Maak de e-mail specifiek voor dit bedrijf — geen generieke tekst.

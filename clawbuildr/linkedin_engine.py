@@ -1438,6 +1438,11 @@ _FIREFOX_PROFILES = [
     r"C:\Users\marvi\AppData\Roaming\Mozilla\Firefox\Profiles\h1vl3oun.default-release",
 ]
 _GECKODRIVER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "geckodriver", "geckodriver.exe")
+# Also check original clawbuildr location for backwards compat
+if not os.path.exists(_GECKODRIVER_PATH):
+    _GECKODRIVER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "geckodriver", "geckodriver.exe")
+if not os.path.exists(_GECKODRIVER_PATH):
+    _GECKODRIVER_PATH = r"C:\Users\marvi\clawbuildr\data\geckodriver\geckodriver.exe"
 
 
 class SeleniumPage:

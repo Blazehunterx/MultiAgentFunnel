@@ -759,6 +759,9 @@ async def run_pipeline_for_lead(lead_id: str):
         await log_audit("SYSTEM", "RESET", f"Lead {first_name} {last_name} reset to INGESTED state. Triggering pipeline execution.")
 
         # Import the real Agent logic from clawbuildr_multi_agent
+        _data_dir = os.path.dirname(os.path.abspath(__file__))
+        if _data_dir not in sys.path:
+            sys.path.insert(0, _data_dir)
         from clawbuildr_multi_agent import (
             ResearchAgent, DeliverabilityAgent, OpportunityMappingAgent,
             QualificationAgent, OutreachAgent
@@ -936,6 +939,217 @@ async def run_pipeline_for_lead(lead_id: str):
             pass  # Don't let audit logging mask the original error
 
 
+
+# =========================================================================
+# BUG 3 FIX: Reply Detection Loop — polls Gmail for replies every 15 min
+# =========================================================================
+
+async def reply_detection_loop():
+    """Polls Gmail API to detect when a prospect replies to a sent email.
+    Runs every 15 minutes. Logs REPLIED event and pauses the lead's sequence."""
+    logger.info("[Reply Detection] Loop started — checking Gmail threads every 15 min.")
+    await asyncio.sleep(60)  # initial delay: let server fully boot first
+
+    while True:
+        try:
+            DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)))
+            tenant = _get_active_tenant()
+            tenant_id = tenant.get("tenant_id", "default")
+            creds_path = os.path.join(DATA_DIR, "client_secret.json")
+            token_path = os.path.join(DATA_DIR, f"token_gmail_{tenant_id}.json")
+            if not os.path.exists(token_path):
+                token_path = os.path.join(DATA_DIR, "token_gmail.json")
+
+            if not (os.path.exists(creds_path) and os.path.exists(token_path)):
+                await asyncio.sleep(15 * 60)
+                continue
+
+            from clawbuildr_gmail import ClawBuildrGmailConnector
+            connector = ClawBuildrGmailConnector(credentials_path=creds_path, token_path=token_path)
+            if not connector.authenticate():
+                await asyncio.sleep(15 * 60)
+                continue
+
+            # Load all sent emails that haven't had a reply yet
+            conn = sqlite3.connect(DB_PATH, timeout=10.0)
+            conn.row_factory = sqlite3.Row
+            sent_emails = conn.execute("""
+                SELECT email_id, contact_id, thread_id, message_id FROM emails
+                WHERE direction = 'OUTBOUND' AND status = 'SENT' AND replied_at IS NULL
+                AND thread_id IS NOT NULL AND thread_id != ''
+                LIMIT 50
+            """).fetchall()
+            conn.close()
+
+            reply_count = 0
+            for row in sent_emails:
+                try:
+                    # Check if the thread has more than 1 message (i.e., someone replied)
+                    thread_data = connector.service.users().threads().get(
+                        userId='me', id=row["thread_id"], format='minimal'
+                    ).execute()
+                    messages_in_thread = thread_data.get("messages", [])
+                    if len(messages_in_thread) > 1:
+                        # New reply detected!
+                        now = datetime.now(timezone.utc).isoformat()
+                        async with _DB_LOCK:
+                            c2 = sqlite3.connect(DB_PATH, timeout=10.0)
+                            c2.execute("UPDATE emails SET replied_at = ? WHERE email_id = ?", (now, row["email_id"]))
+                            # Log event
+                            c2.execute("""
+                                INSERT OR IGNORE INTO email_events
+                                (event_id, email_id, contact_id, event_type, metadata, created_at)
+                                VALUES (?, ?, ?, 'REPLIED', '{}', ?)
+                            """, (str(uuid.uuid4()), row["email_id"], row["contact_id"], now))
+                            # Update lead stage
+                            c2.execute("""
+                                UPDATE contacts SET current_stage = 'REPLIED', updated_at = ?
+                                WHERE contact_id = ? AND current_stage NOT IN ('MEETING_BOOKED', 'CLOSED_WON', 'CLOSED_LOST')
+                            """, (now, row["contact_id"]))
+                            c2.commit()
+                            c2.close()
+
+                        # Pause their sequence so no more follow-up emails go out
+                        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "clawbuildr"))
+                        try:
+                            from strategy_engine import pause_sequence
+                            pause_sequence(row["contact_id"], "REPLIED")
+                        except ImportError:
+                            pass
+
+                        await sse_manager.broadcast("lead_refresh", {"contact_id": row["contact_id"], "current_stage": "REPLIED"})
+                        logger.info(f"[Reply Detection] REPLY detected for lead {row['contact_id']} (thread: {row['thread_id']})")
+                        reply_count += 1
+                except Exception as ex:
+                    logger.debug(f"[Reply Detection] Thread check error for {row['thread_id']}: {ex}")
+
+            if reply_count:
+                logger.info(f"[Reply Detection] Found {reply_count} new replies this cycle.")
+        except Exception as e:
+            logger.error(f"[Reply Detection] Loop error: {e}")
+
+        await asyncio.sleep(15 * 60)  # check every 15 minutes
+
+
+# =========================================================================
+# BUG 4 FIX: Strategy Sequence Loop — advances leads through steps
+# BUG 8 FIX: Also writes linkedin accepted_at from accepted connection data
+# =========================================================================
+
+async def strategy_sequence_loop():
+    """Checks every 5 minutes for leads whose next sequence step is due, and fires it.
+    Also marks LinkedIn connections as accepted when check_pending_connections reports them."""
+    logger.info("[Strategy Engine] Sequence loop started — checking for due steps every 5 min.")
+    await asyncio.sleep(90)  # let other loops start first
+
+    while True:
+        try:
+            # Import strategy engine (relative to clawbuildr subdir)
+            _cb_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "clawbuildr")
+            if _cb_dir not in sys.path:
+                sys.path.insert(0, _cb_dir)
+
+            from strategy_engine import get_leads_due_for_next_step, advance_sequence, get_strategy_steps
+
+            due_leads = get_leads_due_for_next_step()
+            if due_leads:
+                logger.info(f"[Strategy Engine] {len(due_leads)} lead(s) due for next step.")
+
+            for seq in due_leads:
+                lead_id = seq["lead_id"]
+                strategy_id = seq["strategy_id"]
+                step = advance_sequence(lead_id, strategy_id)
+                if step:
+                    step_type = step.get("step_type", "EMAIL")
+                    logger.info(f"[Strategy Engine] Lead {lead_id}: executing step {step.get('step_number')} ({step_type})")
+                    if step_type == "EMAIL":
+                        # If step > 1, just send the prefab template directly (don't reset pipeline)
+                        if step.get("step_number", 1) > 1 and step.get("template_id"):
+                            c_temp = sqlite3.connect(DB_PATH, timeout=5.0)
+                            c_temp.row_factory = sqlite3.Row
+                            pm = c_temp.execute("SELECT * FROM prefab_messages WHERE template_id = ?", (step["template_id"],)).fetchone()
+                            ct = c_temp.execute("SELECT ct.first_name, cp.name as company_name, ct.email FROM contacts ct JOIN companies cp ON ct.company_id = cp.company_id WHERE contact_id = ?", (lead_id,)).fetchone()
+                            tenant = _get_active_tenant()
+                            c_temp.close()
+                            
+                            if pm and ct:
+                                from clawbuildr_gmail import ClawBuildrGmailConnector
+                                creds_path = os.path.join(DATA_DIR, "client_secret.json")
+                                token_path = os.path.join(DATA_DIR, f"token_gmail_{tenant.get('tenant_id', 'default')}.json")
+                                if not os.path.exists(token_path):
+                                    token_path = os.path.join(DATA_DIR, "token_gmail.json")
+                                
+                                if os.path.exists(creds_path) and os.path.exists(token_path):
+                                    conn_obj = ClawBuildrGmailConnector(creds_path, token_path)
+                                    if conn_obj.authenticate():
+                                        # Render template
+                                        import re
+                                        body = pm["body"]
+                                        subj = pm["subject_line"] or "Vraag"
+                                        body = body.replace("{{first_name}}", ct["first_name"] or "relatie")
+                                        body = body.replace("{{company_name}}", ct["company_name"] or "")
+                                        body = body.replace("{{sender_name}}", "Marvin")
+                                        body = body.replace("{{calendar_link}}", tenant.get("calendar_link", "https://cal.com"))
+                                        body = body.replace("{{pain_point}}", "dit proces")
+                                        subj = subj.replace("{{company_name}}", ct["company_name"] or "")
+                                        subj = subj.replace("{{first_name}}", ct["first_name"] or "")
+                                        
+                                        email_id_pre = f"em_{random.randint(100000, 999999)}"
+                                        html_body = "<html><body><pre style='font-family:inherit;white-space:pre-wrap'>" + body.replace("<","&lt;") + "</pre></body></html>"
+                                        html_body_tracked = _inject_tracking(email_id_pre, html_body)
+                                        res = conn_obj.send_email(to_email=ct["email"], subject=subj, body_text=body, body_html=html_body_tracked)
+                                        if res.get("status") == "SENT":
+                                            c_log = sqlite3.connect(DB_PATH, timeout=5.0)
+                                            c_log.execute("""
+                                                INSERT INTO emails (email_id, contact_id, direction, subject, body, message_id, thread_id, status, sent_at)
+                                                VALUES (?, ?, 'OUTBOUND', ?, ?, ?, ?, 'SENT', ?)
+                                            """, (email_id_pre, lead_id, subj, body, res.get("message_id"), res.get("thread_id"), datetime.now(timezone.utc).isoformat()))
+                                            c_log.commit()
+                                            c_log.close()
+                                            logger.info(f"[Strategy Engine] Follow-up sent to {ct['email']}")
+                        else:
+                            # Step 1: Queue for pipeline processing
+                            asyncio.create_task(run_pipeline_for_lead(lead_id))
+                    elif step_type == "LINKEDIN":
+                        # LinkedIn step — let the linkedin_auto_loop handle it in next cycle
+                        pass
+
+            # Bug 8 fix: update linkedin_outreach.accepted_at for newly accepted connections
+            try:
+                conn_li = sqlite3.connect(DB_PATH, timeout=10.0)
+                conn_li.row_factory = sqlite3.Row
+                # Find connections that were sent but not yet marked accepted
+                pending_li = conn_li.execute("""
+                    SELECT lo.outreach_id, lo.contact_id, lo.profile_url
+                    FROM linkedin_outreach lo
+                    WHERE lo.accepted_at IS NULL
+                    AND lo.status = 'CONNECTED'
+                    LIMIT 20
+                """).fetchall()
+                conn_li.close()
+
+                if pending_li:
+                    now_li = datetime.now(timezone.utc).isoformat()
+                    c3 = sqlite3.connect(DB_PATH, timeout=10.0)
+                    for li_row in pending_li:
+                        c3.execute(
+                            "UPDATE linkedin_outreach SET accepted_at = ? WHERE outreach_id = ?",
+                            (now_li, li_row["outreach_id"])
+                        )
+                    c3.commit()
+                    c3.close()
+                    logger.info(f"[Strategy Engine] Marked {len(pending_li)} LinkedIn connections as accepted.")
+            except Exception as li_ex:
+                logger.debug(f"[Strategy Engine] LinkedIn accept sync error: {li_ex}")
+
+        except ImportError:
+            logger.debug("[Strategy Engine] strategy_engine module not yet available — skipping.")
+        except Exception as e:
+            logger.error(f"[Strategy Engine] Loop error: {e}")
+
+        await asyncio.sleep(5 * 60)  # every 5 minutes
+
+
 # =========================================================================
 # 4. FASTAPI APP ROUTING & ENDPOINTS
 # =========================================================================
@@ -948,14 +1162,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     task1 = asyncio.create_task(lead_sourcing_agent())
     task2 = asyncio.create_task(agent_loop())
     task3 = asyncio.create_task(linkedin_auto_loop())
+    task4 = asyncio.create_task(reply_detection_loop())       # Bug 3 fix
+    task5 = asyncio.create_task(strategy_sequence_loop())     # Bug 4 fix
     # Run one immediate sourcing cycle for demo (then agent respects business hours)
     asyncio.create_task(immediate_sourcing_cycle())
-    logger.info("[Startup] Lead sourcing agent + pipeline agent loop + LinkedIn auto-scheduling started.")
+    logger.info("[Startup] Lead sourcing agent + pipeline agent loop + LinkedIn auto-scheduling + reply detection + strategy engine started.")
     yield
     # Shutdown: cancel background tasks
     task1.cancel()
     task2.cancel()
     task3.cancel()
+    task4.cancel()
+    task5.cancel()
     logger.info("[Shutdown] Background tasks cancelled.")
 
 app = FastAPI(title="ClawBuildr Mission Control Dashboard", lifespan=lifespan)
@@ -2031,11 +2249,18 @@ async def approve_outreach(lead_id: str):
             connector = ClawBuildrGmailConnector(credentials_path=creds_path, token_path=token_path)
             if connector.authenticate():
                 logger.info(f"[Gmail API] Triggering live email delivery to: {email}")
-                res = connector.send_email(to_email=email, subject=subject, body_text=body_text)
+                # Build email_id early so we can inject tracking before sending
+                email_id_pre = f"em_{random.randint(100000, 999999)}"
+                # Convert plain-text body to HTML and inject tracking (Bug 1 + Bug 2 fix)
+                html_body = "<html><body><pre style='font-family:inherit;white-space:pre-wrap'>" + body_text.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;") + "</pre></html>"
+                html_body_tracked = _inject_tracking(email_id_pre, html_body)
+                res = connector.send_email(to_email=email, subject=subject, body_text=body_text, body_html=html_body_tracked)
                 if res.get("status") == "SENT":
                     sent_successfully = True
                     message_id = res.get("message_id", message_id)
                     thread_id = res.get("thread_id", thread_id)
+                    # Use the pre-generated email_id so tracking pixel matches DB record
+                    email_id = email_id_pre
                 else:
                     send_error = res.get("error", "Unknown sending error")
             else:
@@ -5698,6 +5923,10 @@ def get_dashboard_index():
                 fetchInitialData();
                 startSSEListener();
                 checkLinkedInLoginStatus();
+                // Bug 10 fix: pre-warm all tab data so clicking any tab shows data instantly
+                setTimeout(() => { loadMetrics(); }, 500);
+                setTimeout(() => { loadTemplates(); }, 800);
+                setTimeout(() => { loadStrategies(); }, 1100);
                 
                 // Recalculate handoff lines when window sizes adapt
                 window.onresize = () => {
