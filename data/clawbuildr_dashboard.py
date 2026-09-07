@@ -20,7 +20,7 @@ import urllib.parse
 import contextlib
 import concurrent.futures
 import httpx
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional, AsyncGenerator
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Request, Response, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -248,6 +248,194 @@ def run_migrations():
             ]
         )
         logger.info("[Migrations] Seeded 2 default tenant profiles (Injexion, ClawBuildr).")
+
+    # NEW: email_events table for tracking
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS email_events (
+        event_id   TEXT PRIMARY KEY,
+        email_id   TEXT NOT NULL,
+        contact_id TEXT,
+        event_type TEXT NOT NULL,
+        metadata   TEXT DEFAULT '{}',
+        created_at TEXT NOT NULL
+    );
+    """)
+
+    # NEW: tracking columns on emails table
+    for col, typedef in [
+        ("opened_at", "TEXT"),
+        ("opened_count", "INTEGER DEFAULT 0"),
+        ("clicked_at", "TEXT"),
+        ("clicked_links", "TEXT DEFAULT '[]'"),
+        ("replied_at", "TEXT"),
+        ("bounced_at", "TEXT"),
+        ("bounce_reason", "TEXT"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE emails ADD COLUMN {col} {typedef}")
+        except Exception:
+            pass
+
+    # NEW: LinkedIn tracking columns
+    for col, typedef in [
+        ("accepted_at", "TEXT"),
+        ("replied_at", "TEXT"),
+        ("reply_body", "TEXT"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE linkedin_outreach ADD COLUMN {col} {typedef}")
+        except Exception:
+            pass
+
+    # NEW: strategies table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS strategies (
+        strategy_id  TEXT PRIMARY KEY,
+        tenant_id    TEXT NOT NULL,
+        name         TEXT NOT NULL,
+        description  TEXT,
+        active       INTEGER DEFAULT 0,
+        created_at   TEXT
+    );
+    """)
+
+    # NEW: strategy_steps table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS strategy_steps (
+        step_id      TEXT PRIMARY KEY,
+        strategy_id  TEXT NOT NULL,
+        step_number  INTEGER NOT NULL,
+        step_type    TEXT NOT NULL,
+        delay_days   INTEGER DEFAULT 0,
+        template_id  TEXT,
+        subject_line TEXT,
+        stop_if      TEXT DEFAULT '["REPLIED","MEETING_BOOKED","OPT_OUT","BOUNCED","PENDING_APPROVAL"]'
+    );
+    """)
+
+    # NEW: lead_sequences table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS lead_sequences (
+        lead_id        TEXT NOT NULL,
+        strategy_id    TEXT NOT NULL,
+        current_step   INTEGER DEFAULT 1,
+        next_action_at TEXT,
+        last_step_at   TEXT,
+        status         TEXT DEFAULT 'ACTIVE',
+        pause_reason   TEXT,
+        enrolled_at    TEXT,
+        PRIMARY KEY (lead_id, strategy_id)
+    );
+    """)
+
+    # NEW: prefab_messages table with starter templates
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS prefab_messages (
+        template_id              TEXT PRIMARY KEY,
+        tenant_id                TEXT,
+        name                     TEXT NOT NULL,
+        category                 TEXT,
+        subject_line             TEXT,
+        body                     TEXT NOT NULL,
+        variables                TEXT DEFAULT '[]',
+        language                 TEXT DEFAULT 'NL',
+        performance_open_rate    REAL DEFAULT 0.0,
+        performance_reply_rate   REAL DEFAULT 0.0,
+        created_at               TEXT,
+        updated_at               TEXT
+    );
+    """)
+
+    # Seed starter Dutch templates
+    cursor.execute("SELECT COUNT(*) FROM prefab_messages")
+    if cursor.fetchone()[0] == 0:
+        import uuid as _uuid
+        now_iso = datetime.now(timezone.utc).isoformat()
+        starter_templates = [
+            (
+                str(_uuid.uuid4()), None,
+                "Directe Opening",
+                "COLD",
+                "{{company_name}} — korte vraag",
+                """Hoi {{first_name}},
+
+Ik zag dat {{company_name}} actief groeit in {{industry}}.
+
+Wij helpen bedrijven zoals jullie met {{pain_point}} via {{value_prop}}.
+
+Zou je open staan voor een korte call van 20 minuten?
+
+👉 {{calendar_link}}
+
+{{sender_name}}""",
+                '["first_name","company_name","industry","pain_point","value_prop","calendar_link","sender_name"]',
+                "NL", 0.0, 0.0, now_iso, now_iso
+            ),
+            (
+                str(_uuid.uuid4()), None,
+                "Follow-up: Oppakken",
+                "FOLLOWUP",
+                "Re: {{company_name}} — even oppakken?",
+                """Hoi {{first_name}},
+
+Ik had vorige week een bericht gestuurd — misschien ben je het vergeten.
+
+Wij helpen {{industry}}-bedrijven zoals {{company_name}} specifiek met {{pain_point}}.
+
+Heb je 20 minuten volgende week?
+👉 {{calendar_link}}
+
+{{sender_name}}""",
+                '["first_name","company_name","industry","pain_point","calendar_link","sender_name"]',
+                "NL", 0.0, 0.0, now_iso, now_iso
+            ),
+            (
+                str(_uuid.uuid4()), None,
+                "Finale Poging",
+                "FOLLOWUP",
+                "Laatste berichtje — {{first_name}}",
+                """Hoi {{first_name}},
+
+Ik wil je niet lastigvallen, maar dit is mijn laatste berichtje.
+
+Als {{company_name}} ooit hulp nodig heeft met {{pain_point}}, weet je ons te vinden.
+
+{{sender_name}}
+{{value_prop}}""",
+                '["first_name","company_name","pain_point","sender_name","value_prop"]',
+                "NL", 0.0, 0.0, now_iso, now_iso
+            ),
+            (
+                str(_uuid.uuid4()), None,
+                "LinkedIn Connectie Note",
+                "LINKEDIN_NOTE",
+                None,
+                """Hoi {{first_name}}, ik zag jullie werk bij {{company_name}} en wil graag in contact komen. Wij helpen {{industry}}-bedrijven met {{pain_point}}. — {{sender_name}}""",
+                '["first_name","company_name","industry","pain_point","sender_name"]',
+                "NL", 0.0, 0.0, now_iso, now_iso
+            ),
+        ]
+        cursor.executemany("""
+            INSERT INTO prefab_messages
+            (template_id, tenant_id, name, category, subject_line, body, variables, language,
+             performance_open_rate, performance_reply_rate, created_at, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        """, starter_templates)
+        logger.info("[Migrations] Seeded 4 starter Dutch prefab templates.")
+
+    # NEW: metric_targets table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS metric_targets (
+        tenant_id          TEXT PRIMARY KEY,
+        target_open_rate   REAL DEFAULT 0.30,
+        target_reply_rate  REAL DEFAULT 0.05,
+        target_meeting_rate REAL DEFAULT 0.01,
+        target_bounce_rate REAL DEFAULT 0.02,
+        target_li_accept_rate REAL DEFAULT 0.25,
+        target_li_reply_rate  REAL DEFAULT 0.08,
+        updated_at         TEXT
+    );
+    """)
 
     # 3. Add Serialized Agent Output Columns to contacts table if missing
     cursor.execute("PRAGMA table_info(contacts);")
@@ -2597,6 +2785,393 @@ def connect_gmail_tenant(tenant_id: str, background_tasks: BackgroundTasks):
     background_tasks.add_task(_run_oauth)
     return {"status": "started", "message": "Check your browser to complete Google Authentication"}
 
+
+# ===========================================================
+# TRACKING ENDPOINTS (open pixel, click redirect, reply poll)
+# ===========================================================
+import base64 as _b64
+
+_TRACKING_PIXEL = _b64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
+
+@app.get("/track/open/{email_id}")
+async def track_email_open(email_id: str, request: Request):
+    """Serves a 1x1 tracking pixel and logs the OPENED event."""
+    from fastapi.responses import Response
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        async with _DB_LOCK:
+            conn = sqlite3.connect(DB_PATH, timeout=10.0)
+            # Update email record
+            conn.execute("""
+                UPDATE emails SET opened_at = COALESCE(opened_at, ?),
+                opened_count = COALESCE(opened_count, 0) + 1
+                WHERE email_id = ?
+            """, (now, email_id))
+            # Log event
+            contact_id = conn.execute(
+                "SELECT contact_id FROM emails WHERE email_id = ?", (email_id,)
+            ).fetchone()
+            contact_id = contact_id[0] if contact_id else None
+            conn.execute("""
+                INSERT OR IGNORE INTO email_events (event_id, email_id, contact_id, event_type, metadata, created_at)
+                VALUES (?, ?, ?, 'OPENED', ?, ?)
+            """, (str(uuid.uuid4()), email_id, contact_id, '{}', now))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.warning(f"[Tracking] Open pixel error: {e}")
+    return Response(content=_TRACKING_PIXEL, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/track/click/{email_id}/{link_hash}")
+async def track_email_click(email_id: str, link_hash: str, request: Request):
+    """Logs click event and redirects to the original URL."""
+    from fastapi.responses import RedirectResponse
+    now = datetime.now(timezone.utc).isoformat()
+    original_url = "https://injexion.io"  # fallback
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10.0)
+        # Look up original URL from clicked_links JSON
+        email_row = conn.execute("SELECT clicked_links, contact_id FROM emails WHERE email_id = ?", (email_id,)).fetchone()
+        if email_row:
+            try:
+                links = json.loads(email_row[0] or "[]")
+                for link in links:
+                    if isinstance(link, dict) and link.get("hash") == link_hash:
+                        original_url = link.get("url", original_url)
+                        break
+            except Exception:
+                pass
+            contact_id = email_row[1]
+        else:
+            contact_id = None
+        async with _DB_LOCK:
+            conn.execute("""
+                UPDATE emails SET clicked_at = COALESCE(clicked_at, ?) WHERE email_id = ?
+            """, (now, email_id))
+            conn.execute("""
+                INSERT OR IGNORE INTO email_events (event_id, email_id, contact_id, event_type, metadata, created_at)
+                VALUES (?, ?, ?, 'CLICKED', ?, ?)
+            """, (str(uuid.uuid4()), email_id, contact_id, json.dumps({"link_hash": link_hash}), now))
+            conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"[Tracking] Click error: {e}")
+    return RedirectResponse(url=original_url)
+
+
+def _inject_tracking(email_id: str, html_body: str, base_url: str = "http://localhost:8000") -> str:
+    """Injects tracking pixel and wraps links in a given HTML email body."""
+    import hashlib
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    
+    # Wrap all http/https links
+    links = []
+    def replace_link(m):
+        url = m.group(1)
+        h = hashlib.md5(url.encode()).hexdigest()[:12]
+        links.append({"url": url, "hash": h})
+        return f'href="{base_url}/track/click/{email_id}/{h}"'
+    
+    wrapped = re.sub(r'href="(https?://[^"]+)"', replace_link, html_body)
+    
+    # Save links list to DB
+    conn.execute("UPDATE emails SET clicked_links = ? WHERE email_id = ?", (json.dumps(links), email_id))
+    conn.commit()
+    conn.close()
+    
+    # Append tracking pixel
+    pixel = f'<img src="{base_url}/track/open/{email_id}" width="1" height="1" alt="" style="display:none">'
+    if "</body>" in wrapped:
+        wrapped = wrapped.replace("</body>", f"{pixel}</body>")
+    else:
+        wrapped = wrapped + pixel
+    return wrapped
+
+
+# ====================================================
+# METRICS API
+# ====================================================
+
+@app.get("/api/metrics")
+def get_metrics():
+    """Returns aggregated outreach KPIs for the active tenant."""
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    
+    total_sent = conn.execute("SELECT COUNT(*) FROM emails WHERE direction = 'outbound' AND status = 'SENT'").fetchone()[0]
+    total_opened = conn.execute("SELECT COUNT(DISTINCT email_id) FROM email_events WHERE event_type = 'OPENED'").fetchone()[0]
+    total_clicked = conn.execute("SELECT COUNT(DISTINCT email_id) FROM email_events WHERE event_type = 'CLICKED'").fetchone()[0]
+    total_replied = conn.execute("SELECT COUNT(DISTINCT email_id) FROM email_events WHERE event_type = 'REPLIED'").fetchone()[0]
+    total_bounced = conn.execute("SELECT COUNT(DISTINCT email_id) FROM email_events WHERE event_type = 'BOUNCED'").fetchone()[0]
+    total_meetings = conn.execute("SELECT COUNT(*) FROM meetings").fetchone()[0]
+    
+    # LinkedIn stats
+    li_sent = conn.execute("SELECT COUNT(*) FROM linkedin_outreach").fetchone()[0]
+    li_accepted = conn.execute("SELECT COUNT(*) FROM linkedin_outreach WHERE accepted_at IS NOT NULL").fetchone()[0]
+    li_replied = conn.execute("SELECT COUNT(*) FROM linkedin_outreach WHERE replied_at IS NOT NULL").fetchone()[0]
+    
+    # Pipeline stats
+    pipeline_stages = conn.execute("""
+        SELECT current_stage, COUNT(*) as count
+        FROM contacts GROUP BY current_stage
+    """).fetchall()
+    pipeline_breakdown = {r["current_stage"]: r["count"] for r in pipeline_stages}
+    
+    # Avg pipeline velocity (days from INGESTED to MEETING_BOOKED)
+    velocity_rows = conn.execute("""
+        SELECT created_at, updated_at FROM contacts WHERE current_stage = 'MEETING_BOOKED'
+    """).fetchall()
+    velocity_days = []
+    for row in velocity_rows:
+        try:
+            created = datetime.fromisoformat(row["created_at"])
+            updated = datetime.fromisoformat(row["updated_at"])
+            velocity_days.append((updated - created).days)
+        except Exception:
+            pass
+    avg_velocity = round(sum(velocity_days) / len(velocity_days), 1) if velocity_days else None
+    
+    # Load targets for this tenant
+    tenant = conn.execute("SELECT * FROM metric_targets WHERE tenant_id = 'injexion'").fetchone()
+    targets = dict(tenant) if tenant else {
+        "target_open_rate": 0.30, "target_reply_rate": 0.05,
+        "target_meeting_rate": 0.01, "target_bounce_rate": 0.02,
+        "target_li_accept_rate": 0.25, "target_li_reply_rate": 0.08
+    }
+    
+    # Recent emails (last 30 days)
+    from_30d = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    sent_30d = conn.execute("SELECT COUNT(*) FROM emails WHERE direction='outbound' AND status='SENT' AND sent_at >= ?", (from_30d,)).fetchone()[0]
+    replied_30d = conn.execute("SELECT COUNT(DISTINCT email_id) FROM email_events WHERE event_type='REPLIED' AND created_at >= ?", (from_30d,)).fetchone()[0]
+
+    conn.close()
+    
+    def rate(num, den): return round(num / den, 4) if den > 0 else 0.0
+
+    return {
+        "email": {
+            "sent": total_sent,
+            "opened": total_opened,
+            "clicked": total_clicked,
+            "replied": total_replied,
+            "bounced": total_bounced,
+            "open_rate": rate(total_opened, total_sent),
+            "click_rate": rate(total_clicked, total_sent),
+            "reply_rate": rate(total_replied, total_sent),
+            "bounce_rate": rate(total_bounced, total_sent),
+        },
+        "meetings": total_meetings,
+        "meeting_rate": rate(total_meetings, total_sent),
+        "linkedin": {
+            "sent": li_sent,
+            "accepted": li_accepted,
+            "replied": li_replied,
+            "accept_rate": rate(li_accepted, li_sent),
+            "reply_rate": rate(li_replied, li_sent),
+        },
+        "pipeline": {
+            "breakdown": pipeline_breakdown,
+            "avg_velocity_days": avg_velocity,
+        },
+        "last_30_days": {
+            "sent": sent_30d,
+            "replied": replied_30d,
+            "reply_rate": rate(replied_30d, sent_30d),
+        },
+        "targets": targets,
+    }
+
+
+@app.put("/api/metrics/targets")
+async def save_metric_targets(request: Request):
+    """Saves user-defined KPI benchmark targets."""
+    body = await request.json()
+    tenant_id = body.get("tenant_id", "injexion")
+    now = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn.execute("""
+        INSERT INTO metric_targets
+        (tenant_id, target_open_rate, target_reply_rate, target_meeting_rate,
+         target_bounce_rate, target_li_accept_rate, target_li_reply_rate, updated_at)
+        VALUES (?,?,?,?,?,?,?,?)
+        ON CONFLICT(tenant_id) DO UPDATE SET
+            target_open_rate = excluded.target_open_rate,
+            target_reply_rate = excluded.target_reply_rate,
+            target_meeting_rate = excluded.target_meeting_rate,
+            target_bounce_rate = excluded.target_bounce_rate,
+            target_li_accept_rate = excluded.target_li_accept_rate,
+            target_li_reply_rate = excluded.target_li_reply_rate,
+            updated_at = excluded.updated_at
+    """, (
+        tenant_id,
+        body.get("target_open_rate", 0.30),
+        body.get("target_reply_rate", 0.05),
+        body.get("target_meeting_rate", 0.01),
+        body.get("target_bounce_rate", 0.02),
+        body.get("target_li_accept_rate", 0.25),
+        body.get("target_li_reply_rate", 0.08),
+        now
+    ))
+    conn.commit()
+    conn.close()
+    return {"status": "saved"}
+
+
+# ====================================================
+# PREFAB TEMPLATES API
+# ====================================================
+
+@app.get("/api/templates")
+def get_templates(tenant_id: str = None):
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    if tenant_id:
+        rows = conn.execute(
+            "SELECT * FROM prefab_messages WHERE tenant_id = ? OR tenant_id IS NULL ORDER BY category, name",
+            (tenant_id,)
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM prefab_messages ORDER BY category, name").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/templates")
+async def create_template(request: Request):
+    body = await request.json()
+    template_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn.execute("""
+        INSERT INTO prefab_messages
+        (template_id, tenant_id, name, category, subject_line, body, variables, language, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+    """, (
+        template_id, body.get("tenant_id"), body.get("name", "New Template"),
+        body.get("category", "COLD"), body.get("subject_line"),
+        body.get("body", ""), json.dumps(body.get("variables", [])),
+        body.get("language", "NL"), now, now
+    ))
+    conn.commit()
+    conn.close()
+    return {"template_id": template_id, "status": "created"}
+
+
+@app.put("/api/templates/{template_id}")
+async def update_template(template_id: str, request: Request):
+    body = await request.json()
+    now = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn.execute("""
+        UPDATE prefab_messages SET
+            name = ?, category = ?, subject_line = ?, body = ?,
+            variables = ?, language = ?, updated_at = ?
+        WHERE template_id = ?
+    """, (
+        body.get("name"), body.get("category"), body.get("subject_line"),
+        body.get("body"), json.dumps(body.get("variables", [])),
+        body.get("language", "NL"), now, template_id
+    ))
+    conn.commit()
+    conn.close()
+    return {"status": "updated"}
+
+
+@app.delete("/api/templates/{template_id}")
+def delete_template(template_id: str):
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn.execute("DELETE FROM prefab_messages WHERE template_id = ?", (template_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "deleted"}
+
+
+# ====================================================
+# STRATEGIES API
+# ====================================================
+
+@app.get("/api/strategies")
+def get_strategies(tenant_id: str = None):
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    if tenant_id:
+        rows = conn.execute("SELECT * FROM strategies WHERE tenant_id = ? ORDER BY created_at DESC", (tenant_id,)).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM strategies ORDER BY created_at DESC").fetchall()
+    result = []
+    for r in rows:
+        s = dict(r)
+        steps = conn.execute("SELECT * FROM strategy_steps WHERE strategy_id = ? ORDER BY step_number", (s["strategy_id"],)).fetchall()
+        s["steps"] = [dict(st) for st in steps]
+        result.append(s)
+    conn.close()
+    return result
+
+
+@app.post("/api/strategies")
+async def create_strategy(request: Request):
+    body = await request.json()
+    strategy_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    tenant_id = body.get("tenant_id", "injexion")
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    # Deactivate other strategies for this tenant first
+    conn.execute("UPDATE strategies SET active = 0 WHERE tenant_id = ?", (tenant_id,))
+    conn.execute("""
+        INSERT INTO strategies (strategy_id, tenant_id, name, description, active, created_at)
+        VALUES (?,?,?,?,1,?)
+    """, (strategy_id, tenant_id, body.get("name", "New Strategy"), body.get("description", ""), now))
+    # Insert steps
+    for i, step in enumerate(body.get("steps", []), start=1):
+        conn.execute("""
+            INSERT INTO strategy_steps (step_id, strategy_id, step_number, step_type, delay_days, template_id, subject_line, stop_if)
+            VALUES (?,?,?,?,?,?,?,?)
+        """, (
+            str(uuid.uuid4()), strategy_id, i,
+            step.get("step_type", "EMAIL"),
+            step.get("delay_days", 0),
+            step.get("template_id"),
+            step.get("subject_line"),
+            step.get("stop_if", '["REPLIED","MEETING_BOOKED","OPT_OUT","BOUNCED"]')
+        ))
+    conn.commit()
+    conn.close()
+    return {"strategy_id": strategy_id, "status": "created"}
+
+
+@app.post("/api/strategies/{strategy_id}/activate")
+def activate_strategy(strategy_id: str):
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    s = conn.execute("SELECT tenant_id FROM strategies WHERE strategy_id = ?", (strategy_id,)).fetchone()
+    if not s:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    conn.execute("UPDATE strategies SET active = 0 WHERE tenant_id = ?", (s[0],))
+    conn.execute("UPDATE strategies SET active = 1 WHERE strategy_id = ?", (strategy_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "activated"}
+
+
+@app.get("/api/tracking/events")
+def get_tracking_events(email_id: str = None, limit: int = 50):
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    if email_id:
+        rows = conn.execute(
+            "SELECT * FROM email_events WHERE email_id = ? ORDER BY created_at DESC LIMIT ?",
+            (email_id, limit)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM email_events ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
 @app.get("/")
 def get_dashboard_index():
     html_content = """
@@ -3280,6 +3855,210 @@ def get_dashboard_index():
 
                     </div>
                 </div>
+
+                <!-- SUCCESS METRICS TAB -->
+                <div id="tab-metrics" class="tab-content space-y-6 hidden">
+                    <div class="flex items-center justify-between mb-2">
+                        <div>
+                            <h2 class="text-base font-extrabold text-white">Success Metrics</h2>
+                            <p class="text-xs text-slate-500 mt-0.5">Live performance vs. your defined targets. Green = beating target. Red = below target.</p>
+                        </div>
+                        <button onclick="loadMetrics()" class="bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-xs px-4 py-2 rounded-xl transition flex items-center gap-2">
+                            <i class="fa-solid fa-rotate-right"></i> Refresh
+                        </button>
+                    </div>
+
+                    <!-- Email KPI cards -->
+                    <div class="grid grid-cols-2 md:grid-cols-4 gap-4" id="metrics-cards">
+                        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 text-center">
+                            <p class="text-[10px] text-slate-500 font-bold uppercase tracking-wider mb-1">Open Rate</p>
+                            <p id="m-open-rate" class="text-3xl font-black text-white">—</p>
+                            <p id="m-open-target" class="text-[10px] text-slate-500 mt-1">Target: —</p>
+                        </div>
+                        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 text-center">
+                            <p class="text-[10px] text-slate-500 font-bold uppercase tracking-wider mb-1">Reply Rate</p>
+                            <p id="m-reply-rate" class="text-3xl font-black text-white">—</p>
+                            <p id="m-reply-target" class="text-[10px] text-slate-500 mt-1">Target: —</p>
+                        </div>
+                        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 text-center">
+                            <p class="text-[10px] text-slate-500 font-bold uppercase tracking-wider mb-1">Meeting Rate</p>
+                            <p id="m-meeting-rate" class="text-3xl font-black text-white">—</p>
+                            <p id="m-meeting-target" class="text-[10px] text-slate-500 mt-1">Target: —</p>
+                        </div>
+                        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 text-center">
+                            <p class="text-[10px] text-slate-500 font-bold uppercase tracking-wider mb-1">Bounce Rate</p>
+                            <p id="m-bounce-rate" class="text-3xl font-black text-white">—</p>
+                            <p id="m-bounce-target" class="text-[10px] text-slate-500 mt-1">Target: —</p>
+                        </div>
+                    </div>
+
+                    <!-- LinkedIn KPI cards -->
+                    <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 text-center">
+                            <p class="text-[10px] text-slate-500 font-bold uppercase tracking-wider mb-1">Emails Sent</p>
+                            <p id="m-total-sent" class="text-3xl font-black text-cyan-400">—</p>
+                        </div>
+                        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 text-center">
+                            <p class="text-[10px] text-slate-500 font-bold uppercase tracking-wider mb-1">LI Accept Rate</p>
+                            <p id="m-li-accept" class="text-3xl font-black text-white">—</p>
+                            <p id="m-li-accept-target" class="text-[10px] text-slate-500 mt-1">Target: —</p>
+                        </div>
+                        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 text-center">
+                            <p class="text-[10px] text-slate-500 font-bold uppercase tracking-wider mb-1">LI Reply Rate</p>
+                            <p id="m-li-reply" class="text-3xl font-black text-white">—</p>
+                            <p id="m-li-reply-target" class="text-[10px] text-slate-500 mt-1">Target: —</p>
+                        </div>
+                        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5 text-center">
+                            <p class="text-[10px] text-slate-500 font-bold uppercase tracking-wider mb-1">Avg Velocity</p>
+                            <p id="m-velocity" class="text-3xl font-black text-white">—</p>
+                            <p class="text-[10px] text-slate-500 mt-1">days to meeting</p>
+                        </div>
+                    </div>
+
+                    <!-- Target Editor -->
+                    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6">
+                        <h3 class="text-sm font-extrabold text-white mb-4"><i class="fa-solid fa-bullseye text-brand-400 mr-2"></i>Define Your Targets</h3>
+                        <div class="grid grid-cols-2 md:grid-cols-3 gap-4">
+                            <div>
+                                <label class="text-[10px] text-slate-400 font-bold uppercase tracking-wider block mb-1">Open Rate Target</label>
+                                <div class="flex items-center gap-2">
+                                    <input id="t-open" type="number" step="1" min="0" max="100" value="30" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white">
+                                    <span class="text-slate-400 text-sm">%</span>
+                                </div>
+                            </div>
+                            <div>
+                                <label class="text-[10px] text-slate-400 font-bold uppercase tracking-wider block mb-1">Reply Rate Target</label>
+                                <div class="flex items-center gap-2">
+                                    <input id="t-reply" type="number" step="1" min="0" max="100" value="5" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white">
+                                    <span class="text-slate-400 text-sm">%</span>
+                                </div>
+                            </div>
+                            <div>
+                                <label class="text-[10px] text-slate-400 font-bold uppercase tracking-wider block mb-1">Meeting Rate Target</label>
+                                <div class="flex items-center gap-2">
+                                    <input id="t-meeting" type="number" step="0.5" min="0" max="100" value="1" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white">
+                                    <span class="text-slate-400 text-sm">%</span>
+                                </div>
+                            </div>
+                            <div>
+                                <label class="text-[10px] text-slate-400 font-bold uppercase tracking-wider block mb-1">Max Bounce Rate</label>
+                                <div class="flex items-center gap-2">
+                                    <input id="t-bounce" type="number" step="0.5" min="0" max="100" value="2" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white">
+                                    <span class="text-slate-400 text-sm">%</span>
+                                </div>
+                            </div>
+                            <div>
+                                <label class="text-[10px] text-slate-400 font-bold uppercase tracking-wider block mb-1">LI Accept Rate Target</label>
+                                <div class="flex items-center gap-2">
+                                    <input id="t-li-accept" type="number" step="1" min="0" max="100" value="25" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white">
+                                    <span class="text-slate-400 text-sm">%</span>
+                                </div>
+                            </div>
+                            <div>
+                                <label class="text-[10px] text-slate-400 font-bold uppercase tracking-wider block mb-1">LI Reply Rate Target</label>
+                                <div class="flex items-center gap-2">
+                                    <input id="t-li-reply" type="number" step="1" min="0" max="100" value="8" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white">
+                                    <span class="text-slate-400 text-sm">%</span>
+                                </div>
+                            </div>
+                        </div>
+                        <button onclick="saveTargets()" class="mt-4 bg-brand-600 hover:bg-brand-500 text-white font-bold text-sm px-5 py-2.5 rounded-xl transition flex items-center gap-2">
+                            <i class="fa-solid fa-floppy-disk"></i> Save Targets
+                        </button>
+                    </div>
+                </div>
+
+                <!-- PREFAB BERICHTEN TAB -->
+                <div id="tab-templates" class="tab-content space-y-6 hidden">
+                    <div class="flex items-center justify-between mb-2">
+                        <div>
+                            <h2 class="text-base font-extrabold text-white">Prefab Berichten</h2>
+                            <p class="text-xs text-slate-500 mt-0.5">Pre-written Dutch outreach templates. The AI uses these as a structure and personalizes with research.</p>
+                        </div>
+                        <button onclick="showNewTemplateForm()" class="bg-brand-600 hover:bg-brand-500 text-white font-bold text-sm px-4 py-2.5 rounded-xl transition flex items-center gap-2">
+                            <i class="fa-solid fa-plus"></i> New Template
+                        </button>
+                    </div>
+
+                    <!-- Template Editor (hidden by default) -->
+                    <div id="template-editor" class="hidden bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4">
+                        <input type="hidden" id="edit-template-id">
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <div>
+                                <label class="text-[10px] text-slate-400 font-bold uppercase tracking-wider block mb-1">Template Name</label>
+                                <input id="edit-tmpl-name" type="text" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white">
+                            </div>
+                            <div>
+                                <label class="text-[10px] text-slate-400 font-bold uppercase tracking-wider block mb-1">Category</label>
+                                <select id="edit-tmpl-category" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white">
+                                    <option value="COLD">Cold Email</option>
+                                    <option value="FOLLOWUP">Follow-up</option>
+                                    <option value="SOCIAL_PROOF">Social Proof</option>
+                                    <option value="LINKEDIN_NOTE">LinkedIn Note</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="text-[10px] text-slate-400 font-bold uppercase tracking-wider block mb-1">Subject Line</label>
+                                <input id="edit-tmpl-subject" type="text" placeholder="{{company_name}} — korte vraag" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white">
+                            </div>
+                        </div>
+                        <div>
+                            <label class="text-[10px] text-slate-400 font-bold uppercase tracking-wider block mb-1">Body — use {{variable_name}} for placeholders</label>
+                            <textarea id="edit-tmpl-body" rows="10" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-3 text-sm text-white font-mono resize-y focus:outline-none focus:border-brand-500/80"></textarea>
+                        </div>
+                        <div class="flex gap-3">
+                            <button onclick="saveTemplate()" class="bg-brand-600 hover:bg-brand-500 text-white font-bold text-sm px-5 py-2.5 rounded-xl transition"><i class="fa-solid fa-floppy-disk mr-1"></i> Save</button>
+                            <button onclick="document.getElementById('template-editor').classList.add('hidden')" class="bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-sm px-5 py-2.5 rounded-xl transition">Cancel</button>
+                        </div>
+                    </div>
+
+                    <!-- Template cards -->
+                    <div id="templates-grid" class="grid grid-cols-1 md:grid-cols-2 gap-4"></div>
+                </div>
+
+                <!-- STRATEGY BUILDER TAB -->
+                <div id="tab-strategy" class="tab-content space-y-6 hidden">
+                    <div class="flex items-center justify-between mb-2">
+                        <div>
+                            <h2 class="text-base font-extrabold text-white">Strategy Builder</h2>
+                            <p class="text-xs text-slate-500 mt-0.5">Define multi-step outreach sequences. Leads automatically move through steps unless they reply, opt out, or book a meeting.</p>
+                        </div>
+                        <button onclick="showNewStrategyForm()" class="bg-brand-600 hover:bg-brand-500 text-white font-bold text-sm px-4 py-2.5 rounded-xl transition flex items-center gap-2">
+                            <i class="fa-solid fa-plus"></i> New Strategy
+                        </button>
+                    </div>
+
+                    <!-- Strategy Creator Form -->
+                    <div id="strategy-editor" class="hidden bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-6">
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
+                                <label class="text-[10px] text-slate-400 font-bold uppercase tracking-wider block mb-1">Strategy Name</label>
+                                <input id="strat-name" type="text" placeholder="e.g. Standard 4-Step NL" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white">
+                            </div>
+                            <div>
+                                <label class="text-[10px] text-slate-400 font-bold uppercase tracking-wider block mb-1">Description</label>
+                                <input id="strat-desc" type="text" placeholder="What is this strategy for?" class="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white">
+                            </div>
+                        </div>
+
+                        <div>
+                            <div class="flex items-center justify-between mb-3">
+                                <h3 class="text-sm font-bold text-white">Steps</h3>
+                                <button onclick="addStrategyStep()" class="text-xs text-brand-400 hover:text-brand-300 font-bold"><i class="fa-solid fa-plus mr-1"></i>Add Step</button>
+                            </div>
+                            <div id="strategy-steps-list" class="space-y-3"></div>
+                        </div>
+
+                        <div class="flex gap-3">
+                            <button onclick="saveStrategy()" class="bg-brand-600 hover:bg-brand-500 text-white font-bold text-sm px-5 py-2.5 rounded-xl transition"><i class="fa-solid fa-floppy-disk mr-1"></i> Save & Activate</button>
+                            <button onclick="document.getElementById('strategy-editor').classList.add('hidden')" class="bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold text-sm px-5 py-2.5 rounded-xl transition">Cancel</button>
+                        </div>
+                    </div>
+
+                    <!-- Existing Strategies -->
+                    <div id="strategies-list" class="space-y-4"></div>
+                </div>
+
             </section>
         </main>
 
@@ -4078,6 +4857,15 @@ def get_dashboard_index():
                 if(tabId === "tab-settings") {
                     loadSettings();
                 }
+                if(tabId === "tab-metrics") {
+                    loadMetrics();
+                }
+                if(tabId === "tab-templates") {
+                    loadTemplates();
+                }
+                if(tabId === "tab-strategy") {
+                    loadStrategies();
+                }
             }
 
             // Lead Drawer modal open
@@ -4660,6 +5448,249 @@ def get_dashboard_index():
                 } catch (e) {
                     showToast('error', 'Failed to trigger Gmail auth.');
                 }
+            }
+
+
+            // ========================
+            // METRICS TAB
+            // ========================
+            function pct(val) { return (val * 100).toFixed(1) + '%'; }
+            function metricColor(actual, target, higherIsBetter=true) {
+                if (!target) return 'text-white';
+                return (higherIsBetter ? actual >= target : actual <= target) ? 'text-emerald-400' : 'text-red-400';
+            }
+
+            async function loadMetrics() {
+                try {
+                    const d = await fetch('/api/metrics').then(r => r.json());
+                    const t = d.targets;
+
+                    function setKPI(elId, val, targetEl, targetVal, higherIsBetter=true) {
+                        const el = document.getElementById(elId);
+                        el.textContent = pct(val);
+                        el.className = `text-3xl font-black ${metricColor(val, targetVal, higherIsBetter)}`;
+                        if (targetEl) document.getElementById(targetEl).textContent = `Target: ${pct(targetVal)}`;
+                    }
+
+                    setKPI('m-open-rate', d.email.open_rate, 'm-open-target', t.target_open_rate);
+                    setKPI('m-reply-rate', d.email.reply_rate, 'm-reply-target', t.target_reply_rate);
+                    setKPI('m-meeting-rate', d.meeting_rate, 'm-meeting-target', t.target_meeting_rate);
+                    setKPI('m-bounce-rate', d.email.bounce_rate, 'm-bounce-target', t.target_bounce_rate, false);
+                    setKPI('m-li-accept', d.linkedin.accept_rate, 'm-li-accept-target', t.target_li_accept_rate);
+                    setKPI('m-li-reply', d.linkedin.reply_rate, 'm-li-reply-target', t.target_li_reply_rate);
+
+                    document.getElementById('m-total-sent').textContent = d.email.sent;
+                    document.getElementById('m-velocity').textContent = d.pipeline.avg_velocity_days ? `${d.pipeline.avg_velocity_days}d` : '—';
+
+                    // Load targets into inputs
+                    document.getElementById('t-open').value = Math.round(t.target_open_rate * 100);
+                    document.getElementById('t-reply').value = Math.round(t.target_reply_rate * 100);
+                    document.getElementById('t-meeting').value = (t.target_meeting_rate * 100).toFixed(1);
+                    document.getElementById('t-bounce').value = (t.target_bounce_rate * 100).toFixed(1);
+                    document.getElementById('t-li-accept').value = Math.round(t.target_li_accept_rate * 100);
+                    document.getElementById('t-li-reply').value = Math.round(t.target_li_reply_rate * 100);
+                } catch(e) { console.error('Metrics load failed', e); }
+            }
+
+            async function saveTargets() {
+                const payload = {
+                    tenant_id: 'injexion',
+                    target_open_rate: parseFloat(document.getElementById('t-open').value) / 100,
+                    target_reply_rate: parseFloat(document.getElementById('t-reply').value) / 100,
+                    target_meeting_rate: parseFloat(document.getElementById('t-meeting').value) / 100,
+                    target_bounce_rate: parseFloat(document.getElementById('t-bounce').value) / 100,
+                    target_li_accept_rate: parseFloat(document.getElementById('t-li-accept').value) / 100,
+                    target_li_reply_rate: parseFloat(document.getElementById('t-li-reply').value) / 100,
+                };
+                await fetch('/api/metrics/targets', {method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+                showToast('success', 'Targets saved! Metrics will now compare against your goals.');
+                loadMetrics();
+            }
+
+            // ========================
+            // PREFAB BERICHTEN
+            // ========================
+            let _templates = [];
+            const CATEGORY_LABELS = {COLD:'Cold Email', FOLLOWUP:'Follow-up', SOCIAL_PROOF:'Social Proof', LINKEDIN_NOTE:'LinkedIn Note'};
+            const CATEGORY_COLORS = {COLD:'bg-blue-500/10 text-blue-300 border-blue-500/20', FOLLOWUP:'bg-amber-500/10 text-amber-300 border-amber-500/20', SOCIAL_PROOF:'bg-emerald-500/10 text-emerald-300 border-emerald-500/20', LINKEDIN_NOTE:'bg-purple-500/10 text-purple-300 border-purple-500/20'};
+
+            async function loadTemplates() {
+                _templates = await fetch('/api/templates').then(r => r.json());
+                renderTemplates();
+            }
+
+            function renderTemplates() {
+                const grid = document.getElementById('templates-grid');
+                if (!_templates.length) { grid.innerHTML = '<p class="text-slate-500 text-sm col-span-2">No templates yet. Click New Template to add one.</p>'; return; }
+                grid.innerHTML = _templates.map(t => `
+                    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-5">
+                        <div class="flex items-start justify-between mb-3">
+                            <div>
+                                <span class="inline-block text-[10px] font-bold px-2 py-0.5 rounded-full border mb-2 ${CATEGORY_COLORS[t.category] || 'bg-slate-700 text-slate-300 border-slate-600'}">${CATEGORY_LABELS[t.category] || t.category}</span>
+                                <h3 class="text-sm font-bold text-white">${t.name}</h3>
+                                ${t.subject_line ? `<p class="text-xs text-slate-400 mt-0.5">Onderwerp: ${t.subject_line}</p>` : ''}
+                            </div>
+                            <div class="flex gap-2">
+                                <button onclick="editTemplate('${t.template_id}')" class="text-slate-400 hover:text-white transition text-xs"><i class="fa-solid fa-pen"></i></button>
+                                <button onclick="deleteTemplate('${t.template_id}')" class="text-slate-600 hover:text-red-400 transition text-xs"><i class="fa-solid fa-trash"></i></button>
+                            </div>
+                        </div>
+                        <pre class="text-xs text-slate-400 whitespace-pre-wrap bg-slate-950 rounded-xl p-3 max-h-48 overflow-y-auto font-mono">${t.body}</pre>
+                        <div class="flex gap-2 mt-3 flex-wrap">
+                            ${(JSON.parse(t.variables || '[]')).map(v => `<span class="text-[10px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded-full">{{${v}}}</span>`).join('')}
+                        </div>
+                    </div>
+                `).join('');
+            }
+
+            function showNewTemplateForm() {
+                document.getElementById('edit-template-id').value = '';
+                document.getElementById('edit-tmpl-name').value = '';
+                document.getElementById('edit-tmpl-subject').value = '';
+                document.getElementById('edit-tmpl-body').value = '';
+                document.getElementById('edit-tmpl-category').value = 'COLD';
+                document.getElementById('template-editor').classList.remove('hidden');
+            }
+
+            function editTemplate(id) {
+                const t = _templates.find(t => t.template_id === id);
+                if (!t) return;
+                document.getElementById('edit-template-id').value = t.template_id;
+                document.getElementById('edit-tmpl-name').value = t.name;
+                document.getElementById('edit-tmpl-subject').value = t.subject_line || '';
+                document.getElementById('edit-tmpl-body').value = t.body;
+                document.getElementById('edit-tmpl-category').value = t.category;
+                document.getElementById('template-editor').classList.remove('hidden');
+            }
+
+            async function saveTemplate() {
+                const id = document.getElementById('edit-template-id').value;
+                const body = document.getElementById('edit-tmpl-body').value;
+                const vars = [...new Set([...body.matchAll(/\{\{(\w+)\}\}/g)].map(m => m[1]))];
+                const payload = {
+                    name: document.getElementById('edit-tmpl-name').value,
+                    category: document.getElementById('edit-tmpl-category').value,
+                    subject_line: document.getElementById('edit-tmpl-subject').value,
+                    body, variables: vars
+                };
+                if (id) {
+                    await fetch(`/api/templates/${id}`, {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+                } else {
+                    await fetch('/api/templates', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+                }
+                document.getElementById('template-editor').classList.add('hidden');
+                showToast('success', 'Template saved!');
+                loadTemplates();
+            }
+
+            async function deleteTemplate(id) {
+                if (!confirm('Delete this template?')) return;
+                await fetch(`/api/templates/${id}`, {method:'DELETE'});
+                showToast('info', 'Template deleted.');
+                loadTemplates();
+            }
+
+            // ========================
+            // STRATEGY BUILDER
+            // ========================
+            let _strategyStepCount = 0;
+            let _strategies = [];
+
+            async function loadStrategies() {
+                _strategies = await fetch('/api/strategies').then(r => r.json());
+                const container = document.getElementById('strategies-list');
+                if (!_strategies.length) { container.innerHTML = '<p class="text-slate-500 text-sm">No strategies yet. Click New Strategy to create one.</p>'; return; }
+                container.innerHTML = _strategies.map(s => `
+                    <div class="bg-slate-900 border ${s.active ? 'border-brand-500/50' : 'border-slate-800'} rounded-2xl p-5">
+                        <div class="flex items-center justify-between mb-4">
+                            <div>
+                                <div class="flex items-center gap-3">
+                                    <h3 class="text-sm font-bold text-white">${s.name}</h3>
+                                    ${s.active ? '<span class="text-[10px] font-bold px-2 py-0.5 rounded-full bg-brand-500/10 text-brand-400 border border-brand-500/20">ACTIVE</span>' : ''}
+                                </div>
+                                ${s.description ? `<p class="text-xs text-slate-400 mt-0.5">${s.description}</p>` : ''}
+                            </div>
+                            ${!s.active ? `<button onclick="activateStrategy('${s.strategy_id}')" class="text-xs bg-brand-600 hover:bg-brand-500 text-white font-bold px-3 py-1.5 rounded-lg transition">Activate</button>` : ''}
+                        </div>
+                        <div class="flex items-center gap-2 overflow-x-auto pb-2">
+                            ${(s.steps || []).map((step, i) => `
+                                <div class="flex items-center gap-2 shrink-0">
+                                    <div class="bg-slate-800 rounded-xl px-3 py-2 text-center min-w-[90px]">
+                                        <p class="text-[10px] text-slate-500 font-bold uppercase">${step.step_type}</p>
+                                        <p class="text-xs text-white font-bold mt-0.5">Day ${step.delay_days}</p>
+                                    </div>
+                                    ${i < (s.steps.length - 1) ? '<i class="fa-solid fa-arrow-right text-slate-600"></i>' : ''}
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                `).join('');
+            }
+
+            function showNewStrategyForm() {
+                _strategyStepCount = 0;
+                document.getElementById('strat-name').value = '';
+                document.getElementById('strat-desc').value = '';
+                document.getElementById('strategy-steps-list').innerHTML = '';
+                // Add 4 default steps
+                addStrategyStep('EMAIL', 0, 'Day 0: Cold Email');
+                addStrategyStep('LINKEDIN', 3, 'Day 3: LinkedIn Connect');
+                addStrategyStep('EMAIL', 7, 'Day 7: Follow-up Email');
+                addStrategyStep('EMAIL', 14, 'Day 14: Final Email');
+                document.getElementById('strategy-editor').classList.remove('hidden');
+            }
+
+            function addStrategyStep(type='EMAIL', delay=0, label='') {
+                _strategyStepCount++;
+                const n = _strategyStepCount;
+                const container = document.getElementById('strategy-steps-list');
+                const el = document.createElement('div');
+                el.id = `step-${n}`;
+                el.className = 'bg-slate-800 border border-slate-700 rounded-xl p-4 grid grid-cols-4 gap-3 items-end';
+                el.innerHTML = `
+                    <div>
+                        <label class="text-[10px] text-slate-400 font-bold uppercase tracking-wider block mb-1">Step ${n}</label>
+                        <select name="type" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-2 text-sm text-white">
+                            <option value="EMAIL" ${type==='EMAIL'?'selected':''}>Email</option>
+                            <option value="LINKEDIN" ${type==='LINKEDIN'?'selected':''}>LinkedIn</option>
+                            <option value="WAIT" ${type==='WAIT'?'selected':''}>Wait</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="text-[10px] text-slate-400 font-bold uppercase tracking-wider block mb-1">Delay (days)</label>
+                        <input name="delay" type="number" min="0" value="${delay}" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-2 text-sm text-white">
+                    </div>
+                    <div>
+                        <label class="text-[10px] text-slate-400 font-bold uppercase tracking-wider block mb-1">Label</label>
+                        <input name="label" type="text" placeholder="e.g. Follow-up #1" value="${label}" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-2 text-sm text-white">
+                    </div>
+                    <div>
+                        <button onclick="this.closest('div[id]').remove()" class="w-full bg-red-500/10 hover:bg-red-500/20 text-red-400 text-xs font-bold rounded-lg px-2 py-2 transition">Remove</button>
+                    </div>
+                `;
+                container.appendChild(el);
+            }
+
+            async function saveStrategy() {
+                const name = document.getElementById('strat-name').value.trim();
+                if (!name) { showToast('error', 'Strategy needs a name.'); return; }
+                const stepEls = document.querySelectorAll('#strategy-steps-list > div[id]');
+                const steps = Array.from(stepEls).map((el, i) => ({
+                    step_type: el.querySelector('[name=type]').value,
+                    delay_days: parseInt(el.querySelector('[name=delay]').value) || 0,
+                    subject_line: el.querySelector('[name=label]').value
+                }));
+                const payload = { name, description: document.getElementById('strat-desc').value, tenant_id: 'injexion', steps };
+                await fetch('/api/strategies', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+                document.getElementById('strategy-editor').classList.add('hidden');
+                showToast('success', 'Strategy saved and activated!');
+                loadStrategies();
+            }
+
+            async function activateStrategy(id) {
+                await fetch(`/api/strategies/${id}/activate`, {method:'POST'});
+                showToast('success', 'Strategy activated!');
+                loadStrategies();
             }
 
             // On Document Bootstrap
