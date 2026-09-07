@@ -3527,6 +3527,18 @@ def get_dashboard_index():
                         <i class="fa-solid fa-gear text-base w-5"></i>
                         <span>Settings & ICP</span>
                     </button>
+                    <button onclick="switchTab('tab-metrics')" id="btn-tab-metrics" class="tab-button w-full flex items-center space-x-3.5 px-4 py-3 rounded-xl text-sm font-semibold text-slate-400 hover:bg-slate-800 hover:text-slate-100 transition">
+                        <i class="fa-solid fa-chart-line text-base w-5"></i>
+                        <span>Success Metrics</span>
+                    </button>
+                    <button onclick="switchTab('tab-templates')" id="btn-tab-templates" class="tab-button w-full flex items-center space-x-3.5 px-4 py-3 rounded-xl text-sm font-semibold text-slate-400 hover:bg-slate-800 hover:text-slate-100 transition">
+                        <i class="fa-solid fa-layer-group text-base w-5"></i>
+                        <span>Prefab Berichten</span>
+                    </button>
+                    <button onclick="switchTab('tab-strategy')" id="btn-tab-strategy" class="tab-button w-full flex items-center space-x-3.5 px-4 py-3 rounded-xl text-sm font-semibold text-slate-400 hover:bg-slate-800 hover:text-slate-100 transition">
+                        <i class="fa-solid fa-chess-knight text-base w-5"></i>
+                        <span>Strategy Builder</span>
+                    </button>
                 </div>
                 
                 <!-- Quick stats summary widget -->

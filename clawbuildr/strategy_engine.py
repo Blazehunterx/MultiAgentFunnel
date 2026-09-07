@@ -1,5 +1,5 @@
 """
-Strategy Engine — Multi-step outreach sequence management.
+Strategy Engine â€” Multi-step outreach sequence management.
 Handles advancing leads through strategy steps (email -> LinkedIn -> follow-up -> final).
 """
 import sqlite3
@@ -156,4 +156,4 @@ def render_template(template_body: str, variables: Dict[str, str]) -> str:
 
 def get_template_variables(template_body: str) -> list:
     import re
-    return list(set(re.findall(r'\{\{(\w+)\}\}', template_body)))
+    return list(set(re.findall(r'\{\{(\w+)\}\}', template_body)))
