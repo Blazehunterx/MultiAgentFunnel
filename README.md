@@ -4,16 +4,18 @@ An autonomous, multi-agent outbound intelligence and B2B lead generation system 
 
 Uses AI agents to autonomously discover leads, qualify them, perform deep web research, and execute personalized multi-channel outreach (Email + LinkedIn).
 
-**Live Demo:** https://palace-dining-aviation-emotional.trycloudflare.com
+**Live Demo:** https://deutsche-match-billing-strategy.trycloudflare.com
 
 ## Key Features
 
+- **Simple Onboarding**: Skylead-style setup wizard — company, ICP, message, search terms, launch
+- **Simple Dashboard**: Clean, calm UI focused on campaigns, leads, and results (no noise)
 - **Lead Generation**: Scrapes Dutch business directories, team pages, and hunter.io for decision-maker emails
 - **AI Email Generation**: Gemini-powered hyper-personalized cold emails with tone/length targets
 - **LinkedIn Automation**: Browser-based connection requests, follow-ups, and InMail sequences
 - **Email Tracking**: Open/reply/bounce detection via Gmail IMAP
 - **Follow-up Engine**: 48h/96h/168h automated follow-up sequences
-- **Dashboard**: Real-time Mission Control — pipeline, agents, campaigns, LinkedIn stats
+- **Classic Dashboard**: Full Mission Control still available at `/classic`
 
 ## Quick Start (3 steps)
 
@@ -55,7 +57,9 @@ python -m uvicorn clawbuildr_dashboard:app --host 0.0.0.0 --port 8000
 python clawbuildr/pipeline_runner.py
 ```
 
-Open **http://localhost:8000** in your browser.
+Open **http://localhost:8000** in your browser. First time you land on the onboarding wizard; after that on the simple dashboard.
+
+The classic dashboard is still available at `/classic`.
 
 ## What the Pipeline Does
 

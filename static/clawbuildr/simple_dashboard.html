@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ClawBuildr — Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: { sans: ['Inter', 'sans-serif'] },
+          colors: { brand: { 50: '#eef2ff', 100: '#e0e7ff', 500: '#6366f1', 600: '#4f46e5', 700: '#4338ca' } }
+        }
+      }
+    }
+  </script>
+  <style>
+    body { background: #f8fafc; }
+    .nav-link.active { color: #4f46e5; background: #eef2ff; }
+    .card { background: white; border: 1px solid #e2e8f0; border-radius: 1rem; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
+    .fade-in { animation: fadeIn 0.3s ease; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+    input:focus, textarea:focus { box-shadow: 0 0 0 3px rgba(99,102,241,0.18); }
+  </style>
+</head>
+<body class="text-slate-700">
+  <div class="min-h-screen flex">
+    <!-- Sidebar -->
+    <aside class="w-64 bg-white border-r border-slate-200 flex flex-col fixed h-full z-10">
+      <div class="h-16 flex items-center px-6 border-b border-slate-100">
+        <div class="w-8 h-8 rounded-lg bg-brand-600 text-white flex items-center justify-center font-bold mr-3">CB</div>
+        <span class="font-semibold text-slate-900">ClawBuildr</span>
+      </div>
+      <nav class="flex-1 p-4 space-y-1">
+        <a href="#" onclick="setView('overview')" id="nav-overview" class="nav-link active flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-50 transition">
+          <i class="fa-solid fa-house w-5"></i> Overzicht
+        </a>
+        <a href="#" onclick="setView('campaigns')" id="nav-campaigns" class="nav-link flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-50 transition">
+          <i class="fa-solid fa-bullhorn w-5"></i> Campagnes
+        </a>
+        <a href="#" onclick="setView('leads')" id="nav-leads" class="nav-link flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-50 transition">
+          <i class="fa-solid fa-users w-5"></i> Leads
+        </a>
+        <a href="#" onclick="setView('activity')" id="nav-activity" class="nav-link flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-50 transition">
+          <i class="fa-solid fa-chart-line w-5"></i> Activiteit
+        </a>
+      </nav>
+      <div class="p-4 border-t border-slate-100">
+        <a href="/classic" class="flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-medium text-slate-500 hover:bg-slate-50 transition">
+          <i class="fa-solid fa-screwdriver-wrench w-5"></i> Geavanceerd
+        </a>
+      </div>
+    </aside>
+
+    <!-- Main -->
+    <main class="flex-1 ml-64">
+      <!-- Topbar -->
+      <header class="h-16 bg-white/80 backdrop-blur border-b border-slate-200 flex items-center justify-between px-8 sticky top-0 z-10">
+        <div id="status-pill" class="flex items-center gap-2 px-3 py-1.5 rounded-full bg-emerald-50 text-emerald-700 text-xs font-medium">
+          <span class="w-2 h-2 rounded-full bg-emerald-500"></span> Outreach draait
+        </div>
+        <div class="flex items-center gap-3">
+          <button onclick="openCampaignModal()" class="px-4 py-2 rounded-full bg-brand-600 hover:bg-brand-700 text-white text-sm font-semibold shadow-sm transition">+ Nieuwe campagne</button>
+        </div>
+      </header>
+
+      <!-- Content -->
+      <div id="content" class="p-8 max-w-6xl mx-auto fade-in">
+        <!-- dynamic -->
+      </div>
+    </main>
+  </div>
+
+  <!-- New Campaign Modal -->
+  <div id="campaignModal" class="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+    <div class="bg-white rounded-2xl shadow-xl w-full max-w-2xl max-h-[90vh] flex flex-col">
+      <div class="p-6 border-b border-slate-100 flex justify-between items-center">
+        <h3 class="text-lg font-semibold text-slate-900">Nieuwe campagne</h3>
+        <button onclick="closeCampaignModal()" class="text-slate-400 hover:text-slate-600"><i class="fa-solid fa-xmark text-xl"></i></button>
+      </div>
+      <div class="p-6 overflow-y-auto flex-1">
+        <div id="wizardStep1">
+          <label class="block text-sm font-medium text-slate-700 mb-2">Campagne naam</label>
+          <input id="newCampName" type="text" class="w-full px-4 py-3 rounded-xl border border-slate-200 mb-6" placeholder="bijv. Juni outreach">
+          <label class="block text-sm font-medium text-slate-700 mb-2">Openingshoek (optioneel)</label>
+          <textarea id="newCampAngle" rows="3" class="w-full px-4 py-3 rounded-xl border border-slate-200 mb-2" placeholder="Eén zin die de AI als rode draad gebruikt."></textarea>
+          <p class="text-xs text-slate-400 mb-6">Laat leeg om de AI volledig te laten schrijven.</p>
+          <div class="flex justify-end">
+            <button onclick="wizardStep2()" class="px-6 py-2.5 rounded-full bg-brand-600 hover:bg-brand-700 text-white text-sm font-semibold">Leads selecteren</button>
+          </div>
+        </div>
+        <div id="wizardStep2" class="hidden">
+          <p class="text-sm text-slate-500 mb-3">Selecteer leads die je wilt benaderen.</p>
+          <div class="bg-slate-50 rounded-xl p-2 mb-3 flex items-center gap-2">
+            <i class="fa-solid fa-search text-slate-400 ml-2"></i>
+            <input id="leadFilter" type="text" oninput="filterLeads()" class="bg-transparent flex-1 px-2 py-2 text-sm focus:outline-none" placeholder="Zoek op naam, bedrijf of functie...">
+          </div>
+          <div class="flex items-center justify-between mb-2">
+            <label class="flex items-center gap-2 text-sm text-slate-700"><input type="checkbox" id="selectAll" onchange="toggleSelectAll()" class="rounded border-slate-300 text-brand-600 focus:ring-brand-500"> Alles selecteren</label>
+            <span id="selectedCount" class="text-xs font-medium text-slate-500">0 geselecteerd</span>
+          </div>
+          <div id="leadList" class="space-y-2 max-h-80 overflow-y-auto pr-1">
+            <!-- leads -->
+          </div>
+          <div class="flex justify-between mt-6">
+            <button onclick="showWizardStep(1)" class="text-slate-500 hover:text-slate-800 font-medium text-sm px-4 py-2">← Terug</button>
+            <button onclick="wizardLaunch()" id="launchBtn" class="px-6 py-2.5 rounded-full bg-brand-600 hover:bg-brand-700 text-white text-sm font-semibold">Lanceer campagne</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let view = 'overview';
+    let stats = {};
+    let campaigns = [];
+    let leads = [];
+    let selectedLeads = new Set();
+    let selectableLeads = [];
+
+    async function init() {
+      loadView();
+      setInterval(refreshStats, 15000);
+    }
+
+    async function refreshStats() {
+      try {
+        const res = await fetch('/api/simple/stats');
+        stats = await res.json();
+        updateStatusPill();
+      } catch (e) {}
+    }
+
+    function updateStatusPill() {
+      const el = document.getElementById('status-pill');
+      if (stats.healthy) {
+        el.className = 'flex items-center gap-2 px-3 py-1.5 rounded-full bg-emerald-50 text-emerald-700 text-xs font-medium';
+        el.innerHTML = '<span class="w-2 h-2 rounded-full bg-emerald-500"></span> Outreach draait';
+      } else {
+        el.className = 'flex items-center gap-2 px-3 py-1.5 rounded-full bg-amber-50 text-amber-700 text-xs font-medium';
+        el.innerHTML = '<span class="w-2 h-2 rounded-full bg-amber-500"></span> Wacht op eerste activiteit';
+      }
+    }
+
+    function setView(v) {
+      view = v;
+      document.querySelectorAll('.nav-link').forEach(a => a.classList.remove('active'));
+      document.getElementById('nav-' + v).classList.add('active');
+      loadView();
+    }
+
+    async function loadView() {
+      const content = document.getElementById('content');
+      content.classList.remove('fade-in'); void content.offsetWidth; content.classList.add('fade-in');
+      if (view === 'overview') await loadOverview();
+      else if (view === 'campaigns') await loadCampaigns();
+      else if (view === 'leads') await loadLeads();
+      else if (view === 'activity') await loadActivity();
+    }
+
+    async function loadOverview() {
+      const [statsRes, campRes] = await Promise.all([fetch('/api/simple/stats'), fetch('/api/simple/campaigns')]);
+      stats = await statsRes.json();
+      campaigns = (await campRes.json()).campaigns || [];
+      updateStatusPill();
+      const c = campaigns[0] || {};
+      document.getElementById('content').innerHTML = `
+        <div class="mb-6">
+          <h1 class="text-2xl font-semibold text-slate-900">Goedemorgen</h1>
+          <p class="text-slate-500">Je outbound draait op de achtergrond. Hier is de stand van zaken.</p>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+          <div class="card p-5"><div class="text-sm text-slate-500 mb-1">Actieve leads</div><div class="text-3xl font-semibold text-slate-900">${stats.active_leads || 0}</div></div>
+          <div class="card p-5"><div class="text-sm text-slate-500 mb-1">E-mails verstuurd</div><div class="text-3xl font-semibold text-slate-900">${stats.emails_sent || 0}</div></div>
+          <div class="card p-5"><div class="text-sm text-slate-500 mb-1">Reacties</div><div class="text-3xl font-semibold text-slate-900">${stats.replies || 0}</div></div>
+          <div class="card p-5"><div class="text-sm text-slate-500 mb-1">Meetings</div><div class="text-3xl font-semibold text-slate-900">${stats.meetings || 0}</div></div>
+        </div>
+        <div class="card p-6 mb-6">
+          <h2 class="text-lg font-semibold text-slate-900 mb-4">Actieve campagne</h2>
+          ${campaigns.length ? renderCampaignCard(c) : '<p class="text-slate-500 text-sm">Geen campagnes. <button onclick="openCampaignModal()" class="text-brand-600 font-medium">Start je eerste campagne.</button></p>'}
+        </div>
+        <div class="card p-6">
+          <h2 class="text-lg font-semibold text-slate-900 mb-2">Wat gebeurt er nu?</h2>
+          <ul class="text-sm text-slate-600 space-y-2">
+            <li class="flex gap-3"><i class="fa-solid fa-magnifying-glass text-brand-600 mt-0.5"></i> We zoeken elke cyclus nieuwe leads op basis van je zoektermen.</li>
+            <li class="flex gap-3"><i class="fa-solid fa-wand-magic-sparkles text-brand-600 mt-0.5"></i> De AI schrijft een persoonlijke e-mail voor elk bedrijf.</li>
+            <li class="flex gap-3"><i class="fa-solid fa-paper-plane text-brand-600 mt-0.5"></i> E-mails worden verzonden tijdens kantooruren met slimme vertraging.</li>
+            <li class="flex gap-3"><i class="fa-solid fa-reply text-brand-600 mt-0.5"></i> Bij een reactie stoppen de follow-ups automatisch.</li>
+          </ul>
+        </div>`;
+    }
+
+    function renderCampaignCard(c) {
+      return `
+        <div class="flex items-center justify-between border border-slate-100 rounded-xl p-4 hover:border-brand-200 transition">
+          <div>
+            <div class="font-semibold text-slate-900">${esc(c.name)}</div>
+            <div class="text-xs text-slate-500 mt-1">${c.lead_count || 0} leads · ${c.sent_count || 0} verstuurd · ${c.reply_count || 0} reacties</div>
+          </div>
+          <span class="px-2.5 py-1 rounded-full text-xs font-medium ${c.status === 'active' ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-600'}">${c.status || 'draft'}</span>
+        </div>`;
+    }
+
+    async function loadCampaigns() {
+      const res = await fetch('/api/simple/campaigns');
+      campaigns = (await res.json()).campaigns || [];
+      document.getElementById('content').innerHTML = `
+        <div class="mb-6 flex items-center justify-between">
+          <h1 class="text-2xl font-semibold text-slate-900">Campagnes</h1>
+        </div>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          ${campaigns.length ? campaigns.map(c => renderCampaignCard(c)).join('') : '<div class="card p-8 text-center text-slate-500">Nog geen campagnes.</div>'}
+        </div>`;
+    }
+
+    async function loadLeads() {
+      const res = await fetch('/api/leads');
+      leads = await res.json();
+      const rows = leads.slice(0, 50).map(l => `
+        <tr class="border-b border-slate-100 hover:bg-slate-50">
+          <td class="py-3 px-4 text-sm font-medium text-slate-900">${esc(l.first_name || '')} ${esc(l.last_name || '')}</td>
+          <td class="py-3 px-4 text-sm text-slate-600">${esc(l.company_name || l.company_domain || '')}</td>
+          <td class="py-3 px-4 text-sm text-slate-600">${esc(l.role || '')}</td>
+          <td class="py-3 px-4"><span class="px-2 py-1 rounded-full text-xs font-medium bg-slate-100 text-slate-700">${esc(l.current_stage || '')}</span></td>
+        </tr>`).join('');
+      document.getElementById('content').innerHTML = `
+        <div class="mb-6"><h1 class="text-2xl font-semibold text-slate-900">Leads</h1><p class="text-slate-500 text-sm">Recent toegevoegde contacten.</p></div>
+        <div class="card overflow-hidden">
+          <table class="w-full text-left">
+            <thead class="bg-slate-50 text-xs font-semibold text-slate-500 uppercase"><tr><th class="py-3 px-4">Naam</th><th class="py-3 px-4">Bedrijf</th><th class="py-3 px-4">Rol</th><th class="py-3 px-4">Fase</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>`;
+    }
+
+    async function loadActivity() {
+      const res = await fetch('/api/activity_feed');
+      const items = await res.json();
+      const rows = items.slice(0, 30).map(a => `
+        <div class="flex gap-4 py-3 border-b border-slate-100 last:border-0">
+          <div class="w-8 h-8 rounded-full bg-brand-50 text-brand-600 flex items-center justify-center text-xs"><i class="fa-solid fa-bolt"></i></div>
+          <div class="flex-1">
+            <div class="text-sm text-slate-800">${esc(a.description || '')}</div>
+            <div class="text-xs text-slate-400 mt-0.5">${formatTime(a.created_at)}</div>
+          </div>
+        </div>`).join('');
+      document.getElementById('content').innerHTML = `
+        <div class="mb-6"><h1 class="text-2xl font-semibold text-slate-900">Activiteit</h1></div>
+        <div class="card p-6">${rows || '<p class="text-slate-500 text-sm">Nog geen activiteit.</p>'}</div>`;
+    }
+
+    function formatTime(iso) {
+      if (!iso) return '';
+      const d = new Date(iso);
+      return d.toLocaleString('nl-NL', {day:'numeric', month:'short', hour:'2-digit', minute:'2-digit'});
+    }
+
+    function esc(s) { const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; }
+
+    // Campaign wizard
+    function openCampaignModal() {
+      document.getElementById('campaignModal').classList.remove('hidden');
+      document.getElementById('newCampName').value = '';
+      document.getElementById('newCampAngle').value = '';
+      showWizardStep(1);
+      loadSelectableLeads();
+    }
+    function closeCampaignModal() { document.getElementById('campaignModal').classList.add('hidden'); }
+
+    async function loadSelectableLeads() {
+      const res = await fetch('/api/simple/contacts/selectable?limit=500');
+      const data = await res.json();
+      selectableLeads = data.contacts || [];
+      selectedLeads = new Set();
+      renderLeadList();
+    }
+
+    function renderLeadList() {
+      const filter = (document.getElementById('leadFilter').value || '').toLowerCase();
+      const list = selectableLeads.filter(l =>
+        `${l.first_name} ${l.last_name} ${l.company_name} ${l.role} ${l.email}`.toLowerCase().includes(filter)
+      );
+      const html = list.length ? list.map(l => `
+        <label class="flex items-center gap-3 p-3 rounded-xl border border-slate-100 hover:border-brand-200 hover:bg-slate-50 cursor-pointer transition">
+          <input type="checkbox" value="${l.contact_id}" onchange="toggleLead('${l.contact_id}')" ${selectedLeads.has(l.contact_id) ? 'checked' : ''} class="rounded border-slate-300 text-brand-600 focus:ring-brand-500">
+          <div class="flex-1 min-w-0">
+            <div class="text-sm font-medium text-slate-900 truncate">${esc(l.first_name || '')} ${esc(l.last_name || '')}</div>
+            <div class="text-xs text-slate-500 truncate">${esc(l.role || '')} · ${esc(l.company_name || l.company_domain || '')}</div>
+          </div>
+        </label>
+      `).join('') : '<p class="text-sm text-slate-500 p-2">Geen beschikbare leads. Wacht tot de pipeline nieuwe leads heeft toegevoegd.</p>';
+      document.getElementById('leadList').innerHTML = html;
+      document.getElementById('selectedCount').textContent = `${selectedLeads.size} geselecteerd`;
+      document.getElementById('selectAll').checked = list.length > 0 && list.every(l => selectedLeads.has(l.contact_id));
+    }
+
+    function filterLeads() { renderLeadList(); }
+
+    function toggleLead(id) {
+      if (selectedLeads.has(id)) selectedLeads.delete(id); else selectedLeads.add(id);
+      renderLeadList();
+    }
+
+    function toggleSelectAll() {
+      const checked = document.getElementById('selectAll').checked;
+      const filter = (document.getElementById('leadFilter').value || '').toLowerCase();
+      const visible = selectableLeads.filter(l => `${l.first_name} ${l.last_name} ${l.company_name} ${l.role} ${l.email}`.toLowerCase().includes(filter));
+      visible.forEach(l => { if (checked) selectedLeads.add(l.contact_id); else selectedLeads.delete(l.contact_id); });
+      renderLeadList();
+    }
+
+    function showWizardStep(n) {
+      document.getElementById('wizardStep1').classList.toggle('hidden', n !== 1);
+      document.getElementById('wizardStep2').classList.toggle('hidden', n !== 2);
+    }
+
+    function wizardStep2() {
+      const name = document.getElementById('newCampName').value.trim();
+      if (!name) { alert('Geef je campagne een naam.'); return; }
+      showWizardStep(2);
+      renderLeadList();
+    }
+
+    async function wizardLaunch() {
+      if (!selectedLeads.size) { alert('Selecteer minstens één lead.'); return; }
+      const btn = document.getElementById('launchBtn');
+      btn.disabled = true; btn.textContent = 'Lanceren...';
+      const payload = {
+        name: document.getElementById('newCampName').value.trim(),
+        activation_message: document.getElementById('newCampAngle').value.trim(),
+        contact_ids: Array.from(selectedLeads),
+      };
+      try {
+        await fetch('/api/simple/campaigns', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+        closeCampaignModal();
+        setView('campaigns');
+      } catch (e) {
+        alert('Lanceren mislukt.');
+        btn.disabled = false; btn.textContent = 'Lanceer campagne';
+      }
+    }
+
+    init();
+  </script>
+</body>
+</html>

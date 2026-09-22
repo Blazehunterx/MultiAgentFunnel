@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ClawBuildr — Setup</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: { sans: ['Inter', 'sans-serif'] },
+          colors: { brand: { 50: '#eef2ff', 100: '#e0e7ff', 500: '#6366f1', 600: '#4f46e5', 700: '#4338ca' } }
+        }
+      }
+    }
+  </script>
+  <style>
+    body { background: #f8fafc; }
+    .step-dot { transition: all 0.3s ease; }
+    .fade-in { animation: fadeIn 0.35s ease; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    input:focus, textarea:focus { box-shadow: 0 0 0 3px rgba(99,102,241,0.18); }
+  </style>
+</head>
+<body class="min-h-screen text-slate-700">
+  <div class="max-w-3xl mx-auto px-6 py-10">
+    <!-- Header -->
+    <div class="text-center mb-10">
+      <div class="inline-flex items-center justify-center w-12 h-12 rounded-xl bg-brand-600 text-white text-xl font-bold mb-4">CB</div>
+      <h1 class="text-2xl font-semibold text-slate-900">ClawBuildr instellen</h1>
+      <p class="text-slate-500 mt-1">In 2 minuten je outbound campagne live.</p>
+    </div>
+
+    <!-- Progress -->
+    <div class="mb-10">
+      <div class="flex items-center justify-between text-xs font-medium text-slate-400 mb-2">
+        <span id="progress-label">Stap 1 van 6</span>
+        <span id="progress-pct">0%</span>
+      </div>
+      <div class="h-2 bg-slate-200 rounded-full overflow-hidden">
+        <div id="progress-bar" class="h-full bg-brand-600 rounded-full transition-all duration-500" style="width: 0%"></div>
+      </div>
+    </div>
+
+    <!-- Card -->
+    <div id="card" class="bg-white rounded-2xl shadow-sm border border-slate-200 p-8 md:p-10 fade-in min-h-[420px] flex flex-col">
+      <!-- dynamic content -->
+    </div>
+  </div>
+
+  <script>
+    const STEPS = ['welcome','profile','icp','message','search','review','running'];
+    let current = 'welcome';
+    let form = {
+      display_name: '',
+      sending_email: '',
+      calendar_link: '',
+      signature_block: '',
+      value_doctrine: '',
+      brand_voice: 'Professioneel, direct, vriendelijk. Gebruik informeel Nederlands (je/jullie).',
+      icp_industries: '',
+      icp_roles: '',
+      icp_company_size: '10-200',
+      search_queries: '',
+      activation_message: '',
+    };
+
+    async function init() {
+      try {
+        const [statusRes, tenantRes] = await Promise.all([
+          fetch('/api/onboarding/status'),
+          fetch('/api/config/tenant')
+        ]);
+        const status = await statusRes.json();
+        const tenant = await tenantRes.json();
+        mergeTenant(tenant);
+        if (status && status.data && status.data.step_data) {
+          Object.values(status.data.step_data).forEach(stepData => mergeTenant(stepData));
+        }
+        if (status && status.current_step && STEPS.includes(status.current_step)) {
+          current = status.current_step;
+        }
+        if (status && status.completed) current = 'running';
+      } catch (e) {
+        console.warn('Could not load onboarding state', e);
+      }
+      render();
+    }
+
+    function mergeTenant(t) {
+      if (!t) return;
+      if (t.display_name) form.display_name = t.display_name;
+      if (t.sending_email) form.sending_email = t.sending_email;
+      if (t.calendar_link) form.calendar_link = t.calendar_link;
+      if (t.signature_block) form.signature_block = t.signature_block;
+      if (t.value_doctrine) form.value_doctrine = t.value_doctrine;
+      if (t.brand_voice) form.brand_voice = t.brand_voice;
+      if (Array.isArray(t.icp_industries)) form.icp_industries = t.icp_industries.join('\n');
+      if (Array.isArray(t.icp_roles)) form.icp_roles = t.icp_roles.join('\n');
+      if (t.icp_company_size) form.icp_company_size = t.icp_company_size;
+      if (Array.isArray(t.search_queries)) form.search_queries = t.search_queries.join('\n');
+    }
+
+    function field(label, id, placeholder, type='input', value='', extra='') {
+      const input = type === 'textarea'
+        ? `<textarea id="${id}" rows="4" placeholder="${placeholder}" class="w-full mt-2 px-4 py-3 rounded-xl border border-slate-200 text-slate-800 placeholder-slate-400 focus:outline-none focus:border-brand-500 transition">${value}</textarea>`
+        : `<input id="${id}" type="text" value="${value.replace(/"/g,'&quot;')}" placeholder="${placeholder}" class="w-full mt-2 px-4 py-3 rounded-xl border border-slate-200 text-slate-800 placeholder-slate-400 focus:outline-none focus:border-brand-500 transition">`;
+      return `<label class="block text-sm font-medium text-slate-700 mb-4">${label}${input}${extra ? `<p class="mt-1.5 text-xs text-slate-400">${extra}</p>` : ''}</label>`;
+    }
+
+    function navButtons(showBack=true, nextLabel='Volgende', nextAction='next', nextPrimary=true) {
+      return `
+        <div class="mt-auto pt-8 flex ${showBack ? 'justify-between' : 'justify-end'} items-center">
+          ${showBack ? `<button onclick="back()" class="text-slate-500 hover:text-slate-800 font-medium text-sm px-4 py-2">← Terug</button>` : '<div></div>'}
+          <button id="nextBtn" onclick="${nextAction}()" class="px-8 py-3 rounded-full text-sm font-semibold transition ${nextPrimary ? 'bg-brand-600 hover:bg-brand-700 text-white shadow-md hover:shadow-lg' : 'bg-slate-100 hover:bg-slate-200 text-slate-800'}">${nextLabel}</button>
+        </div>`;
+    }
+
+    function render() {
+      const idx = STEPS.indexOf(current);
+      const pct = Math.round((idx / (STEPS.length - 1)) * 100);
+      document.getElementById('progress-label').textContent = idx === 0 ? 'Start' : `Stap ${idx} van ${STEPS.length - 1}`;
+      document.getElementById('progress-pct').textContent = pct + '%';
+      document.getElementById('progress-bar').style.width = pct + '%';
+      const card = document.getElementById('card');
+      card.classList.remove('fade-in');
+      void card.offsetWidth;
+      card.classList.add('fade-in');
+
+      if (current === 'welcome') card.innerHTML = renderWelcome();
+      else if (current === 'profile') card.innerHTML = renderProfile();
+      else if (current === 'icp') card.innerHTML = renderIcp();
+      else if (current === 'message') card.innerHTML = renderMessage();
+      else if (current === 'search') card.innerHTML = renderSearch();
+      else if (current === 'review') card.innerHTML = renderReview();
+      else if (current === 'running') card.innerHTML = renderRunning();
+    }
+
+    function renderWelcome() {
+      return `
+        <div class="flex-1 flex flex-col justify-center">
+          <h2 class="text-3xl font-semibold text-slate-900 mb-4">Laten we je outreach automatiseren</h2>
+          <p class="text-slate-500 text-lg leading-relaxed mb-8">
+            ClawBuildr zoekt zelfstandig leads, schrijft persoonlijke e-mails en stuurt vervolgberichten.
+            Jij hoeft alleen aan te geven wie je zoekt en wat je aanbiedt.
+          </p>
+          <ul class="space-y-3 text-slate-600 mb-10">
+            <li class="flex items-center gap-3"><i class="fa-solid fa-check-circle text-brand-600"></i> Kies je ideale klantprofiel</li>
+            <li class="flex items-center gap-3"><i class="fa-solid fa-check-circle text-brand-600"></i> Beschrijf je aanbod in je eigen woorden</li>
+            <li class="flex items-center gap-3"><i class="fa-solid fa-check-circle text-brand-600"></i> Lanceer je eerste campagne</li>
+          </ul>
+          ${navButtons(false, 'Start setup', 'next')}
+        </div>`;
+    }
+
+    function renderProfile() {
+      return `
+        <div>
+          <h2 class="text-2xl font-semibold text-slate-900 mb-1">Jouw bedrijf</h2>
+          <p class="text-slate-500 mb-6">Deze gegevens gebruiken we in elke e-mail die we versturen.</p>
+          ${field('Bedrijfsnaam', 'display_name', 'bijv. Acme B.V.', 'input', form.display_name)}
+          ${field('E-mailadres waarvandaan we versturen', 'sending_email', 'bijv. marvin@acme.nl', 'input', form.sending_email, 'Dit moet hetzelfde adres zijn als in je .env bestand.')}
+          ${field('Agenda link (Calendly / Cal.com)', 'calendar_link', 'bijv. https://cal.com/acme', 'input', form.calendar_link)}
+          ${field('E-mailhandtekening', 'signature_block', 'Naam\nBedrijf\nWebsite\nTelefoon', 'textarea', form.signature_block)}
+        </div>
+        ${navButtons(true)}`;
+    }
+
+    function renderIcp() {
+      return `
+        <div>
+          <h2 class="text-2xl font-semibold text-slate-900 mb-1">Wie is je ideale klant?</h2>
+          <p class="text-slate-500 mb-6">Hoe specifieker, hoe beter de leads. Gebruik één term per regel.</p>
+          ${field('Branches', 'icp_industries', 'Accountancy\nIT-dienstverlening\nRecruitment', 'textarea', form.icp_industries)}
+          ${field('Functies / rollen', 'icp_roles', 'Directeur\nEigenaar\nCEO', 'textarea', form.icp_roles)}
+          ${field('Bedrijfsgrootte', 'icp_company_size', 'bijv. 10-200', 'input', form.icp_company_size)}
+        </div>
+        ${navButtons(true)}`;
+    }
+
+    function renderMessage() {
+      return `
+        <div>
+          <h2 class="text-2xl font-semibold text-slate-900 mb-1">Wat bied je aan?</h2>
+          <p class="text-slate-500 mb-6">De AI gebruikt dit om elke e-mail persoonlijk te maken.</p>
+          ${field('Jouw value proposition', 'value_doctrine', 'Beschrijf het probleem dat je oplost en hoe. 3-5 zinnen.', 'textarea', form.value_doctrine)}
+          ${field('Tone of voice', 'brand_voice', 'bijv. Professioneel, direct, vriendelijk. Gebruik je/jullie.', 'textarea', form.brand_voice)}
+          ${field('Optionele openingshoek', 'activation_message', 'Laat leeg als de AI het zelf moet bedenken.', 'textarea', form.activation_message, 'Eén zin die we als rode draad gebruiken in de eerste e-mail.')}
+        </div>
+        ${navButtons(true)}`;
+    }
+
+    function renderSearch() {
+      return `
+        <div>
+          <h2 class="text-2xl font-semibold text-slate-900 mb-1">Waar zoeken we leads?</h2>
+          <p class="text-slate-500 mb-6">De zoekwoorden die we gebruiken om nieuwe bedrijven te vinden.</p>
+          ${field('Zoektermen', 'search_queries', 'accountancy kantoor Nederland\nIT dienstverlener MKB\nrecruitment bureau Amsterdam', 'textarea', form.search_queries, 'Één zoekterm per regel.')}
+        </div>
+        ${navButtons(true, 'Doorgaan naar controle')}`;
+    }
+
+    function renderReview() {
+      const lines = s => (s || '').split('\n').filter(Boolean);
+      return `
+        <div class="flex-1">
+          <h2 class="text-2xl font-semibold text-slate-900 mb-1">Controleer en lanceer</h2>
+          <p class="text-slate-500 mb-6">We starten met de leads die al in je database staan. Nieuwe leads voegen we automatisch toe.</p>
+          <div class="bg-slate-50 rounded-xl p-6 space-y-4 text-sm">
+            <div class="flex justify-between"><span class="text-slate-500">Bedrijf</span><span class="font-medium text-slate-900">${esc(form.display_name) || '-'}</span></div>
+            <div class="flex justify-between"><span class="text-slate-500">E-mail</span><span class="font-medium text-slate-900">${esc(form.sending_email) || '-'}</span></div>
+            <div class="flex justify-between"><span class="text-slate-500">Branches</span><span class="font-medium text-slate-900">${lines(form.icp_industries).length} geselecteerd</span></div>
+            <div class="flex justify-between"><span class="text-slate-500">Rollen</span><span class="font-medium text-slate-900">${lines(form.icp_roles).length} geselecteerd</span></div>
+            <div class="flex justify-between"><span class="text-slate-500">Zoektermen</span><span class="font-medium text-slate-900">${lines(form.search_queries).length} ingesteld</span></div>
+            <div class="pt-4 border-t border-slate-200">
+              <span class="text-slate-500">Beschikbare leads nu:</span>
+              <span id="leadCount" class="ml-2 font-semibold text-brand-600"> laden...</span>
+            </div>
+          </div>
+        </div>
+        ${navButtons(true, 'Lanceer campagne', 'launch', true)}`;
+    }
+
+    function renderRunning() {
+      return `
+        <div class="flex-1 flex flex-col items-center justify-center text-center">
+          <div class="w-16 h-16 rounded-full bg-brand-50 flex items-center justify-center mb-6">
+            <i class="fa-solid fa-rocket text-2xl text-brand-600"></i>
+          </div>
+          <h2 class="text-2xl font-semibold text-slate-900 mb-2">Je campagne is live!</h2>
+          <p class="text-slate-500 mb-8 max-w-md">
+            De outreach-engine is gestart. ClawBuildr zoekt leads, genereert e-mails en volgt automatisch op.
+            Je ontvangt reacties gewoon in je inbox.
+          </p>
+          <a href="/dashboard" class="px-8 py-3 rounded-full bg-brand-600 hover:bg-brand-700 text-white text-sm font-semibold shadow-md transition">Naar dashboard</a>
+        </div>`;
+    }
+
+    function readForm() {
+      const ids = ['display_name','sending_email','calendar_link','signature_block','value_doctrine','brand_voice','icp_industries','icp_roles','icp_company_size','search_queries','activation_message'];
+      ids.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) form[id] = el.value;
+      });
+    }
+
+    function toArr(str) { return (str || '').split('\n').map(s => s.trim()).filter(Boolean); }
+
+    async function saveCurrentStep(step) {
+      readForm();
+      const payload = { step, data: {} };
+      if (step === 'profile') payload.data = {
+        display_name: form.display_name,
+        sending_email: form.sending_email,
+        calendar_link: form.calendar_link,
+        signature_block: form.signature_block,
+      };
+      if (step === 'icp') payload.data = {
+        icp_industries: toArr(form.icp_industries),
+        icp_roles: toArr(form.icp_roles),
+        icp_company_size: form.icp_company_size,
+      };
+      if (step === 'message') payload.data = {
+        value_doctrine: form.value_doctrine,
+        brand_voice: form.brand_voice,
+        activation_message: form.activation_message,
+      };
+      if (step === 'search') payload.data = {
+        search_queries: toArr(form.search_queries),
+      };
+      try {
+        await fetch('/api/onboarding/step', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+      } catch (e) { console.error('save step failed', e); }
+    }
+
+    async function next() {
+      const idx = STEPS.indexOf(current);
+      if (idx > 0 && idx < STEPS.length - 1) {
+        await saveCurrentStep(STEPS[idx]);
+      }
+      current = STEPS[Math.min(idx + 1, STEPS.length - 1)];
+      render();
+      if (current === 'review') loadLeadCount();
+      if (current === 'running') startEngine();
+    }
+
+    function back() {
+      const idx = STEPS.indexOf(current);
+      if (idx > 0) current = STEPS[idx - 1];
+      render();
+    }
+
+    async function launch() {
+      readForm();
+      if (!form.display_name || !form.sending_email) {
+        alert('Vul bedrijfsnaam en e-mailadres in.');
+        return;
+      }
+      const btn = document.getElementById('nextBtn');
+      if (btn) { btn.disabled = true; btn.textContent = 'Lanceren...'; }
+      const payload = {
+        display_name: form.display_name,
+        sending_email: form.sending_email,
+        sending_domain: form.sending_email.split('@')[1] || '',
+        calendar_link: form.calendar_link,
+        signature_block: form.signature_block,
+        value_doctrine: form.value_doctrine,
+        brand_voice: form.brand_voice,
+        icp_industries: toArr(form.icp_industries),
+        icp_roles: toArr(form.icp_roles),
+        icp_company_size: form.icp_company_size,
+        search_queries: toArr(form.search_queries),
+        campaign_name: `${form.display_name} campagne`,
+        create_campaign: true,
+      };
+      try {
+        await fetch('/api/onboarding/launch', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+        current = 'running';
+        render();
+        await startEngine();
+      } catch (e) {
+        alert('Lanceren mislukt. Controleer de logs.');
+        if (btn) { btn.disabled = false; btn.textContent = 'Lanceer campagne'; }
+      }
+    }
+
+    async function loadLeadCount() {
+      try {
+        const res = await fetch('/api/simple/contacts/selectable?limit=1000');
+        const data = await res.json();
+        const el = document.getElementById('leadCount');
+        if (el) el.textContent = `${data.contacts ? data.contacts.length : 0} leads`;
+      } catch (e) { console.error(e); }
+    }
+
+    async function startEngine() {
+      try {
+        await fetch('/api/pipeline/start', {method:'POST'});
+      } catch (e) { console.warn('Could not auto-start pipeline', e); }
+    }
+
+    function esc(s) {
+      const d = document.createElement('div');
+      d.textContent = s || '';
+      return d.innerHTML;
+    }
+
+    init();
+  </script>
+</body>
+</html>

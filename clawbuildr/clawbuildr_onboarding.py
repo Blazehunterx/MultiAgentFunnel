@@ -280,6 +280,156 @@ def verify_domain(workspace_id: int, domain: str) -> Dict[str, Any]:
     return results
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# NEW: tenant-based simple onboarding state (used by the Skylead-style wizard)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ONBOARDING_FLOW = [
+    "welcome",
+    "profile",
+    "icp",
+    "message",
+    "search",
+    "review",
+    "running",
+]
+
+
+def _ensure_onboarding_state_table():
+    db = _get_db()
+    try:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS onboarding_state (
+                tenant_id TEXT PRIMARY KEY,
+                completed INTEGER NOT NULL DEFAULT 0,
+                current_step TEXT NOT NULL DEFAULT 'welcome',
+                data TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        db.commit()
+    finally:
+        db.close()
+
+
+def _parse_state(row: sqlite3.Row) -> Dict[str, Any]:
+    data = {}
+    if row["data"]:
+        try:
+            data = json.loads(row["data"])
+        except Exception:
+            data = {}
+    completed_steps = set(data.get("completed_steps", []))
+    return {
+        "tenant_id": row["tenant_id"],
+        "completed": bool(row["completed"]),
+        "current_step": row["current_step"],
+        "data": data,
+        "steps": [
+            {"step": s, "completed": s in completed_steps}
+            for s in ONBOARDING_FLOW
+        ],
+        "progress_pct": round(len(completed_steps) / len(ONBOARDING_FLOW) * 100),
+    }
+
+
+def get_onboarding_state(tenant_id: str) -> Dict[str, Any]:
+    """Get current onboarding state for a tenant."""
+    _ensure_onboarding_state_table()
+    db = _get_db()
+    try:
+        row = db.execute(
+            "SELECT * FROM onboarding_state WHERE tenant_id = ?",
+            (tenant_id,),
+        ).fetchone()
+        if not row:
+            return _create_onboarding_state(tenant_id)
+        return _parse_state(row)
+    finally:
+        db.close()
+
+
+def _create_onboarding_state(tenant_id: str) -> Dict[str, Any]:
+    _ensure_onboarding_state_table()
+    db = _get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        db.execute(
+            """INSERT INTO onboarding_state (tenant_id, completed, current_step, data, updated_at)
+               VALUES (?, 0, 'welcome', '{}', ?)""",
+            (tenant_id, now),
+        )
+        db.commit()
+    finally:
+        db.close()
+    return get_onboarding_state(tenant_id)
+
+
+def save_onboarding_step(tenant_id: str, step: str, data: Dict[str, Any] = None) -> Dict[str, Any]:
+    """Save progress for one onboarding step and advance to the next."""
+    _ensure_onboarding_state_table()
+    db = _get_db()
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        state = get_onboarding_state(tenant_id)
+        merged = state["data"]
+        merged.setdefault("completed_steps", [])
+        if step not in merged["completed_steps"]:
+            merged["completed_steps"].append(step)
+        if data:
+            merged.setdefault("step_data", {})
+            merged["step_data"][step] = data
+
+        current_index = ONBOARDING_FLOW.index(step)
+        next_step = ONBOARDING_FLOW[min(current_index + 1, len(ONBOARDING_FLOW) - 1)]
+
+        db.execute(
+            """INSERT INTO onboarding_state (tenant_id, completed, current_step, data, updated_at)
+               VALUES (?, 0, ?, ?, ?)
+               ON CONFLICT(tenant_id) DO UPDATE SET
+                   current_step = excluded.current_step,
+                   data = excluded.data,
+                   updated_at = excluded.updated_at""",
+            (tenant_id, next_step, json.dumps(merged), now),
+        )
+        db.commit()
+        return get_onboarding_state(tenant_id)
+    finally:
+        db.close()
+
+
+def complete_onboarding(tenant_id: str) -> Dict[str, Any]:
+    """Mark onboarding as complete."""
+    _ensure_onboarding_state_table()
+    db = _get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        state = get_onboarding_state(tenant_id)
+        data = state["data"]
+        data.setdefault("completed_steps", [])
+        if "running" not in data["completed_steps"]:
+            data["completed_steps"].append("running")
+        db.execute(
+            """INSERT INTO onboarding_state (tenant_id, completed, current_step, data, updated_at)
+               VALUES (?, 1, 'running', ?, ?)
+               ON CONFLICT(tenant_id) DO UPDATE SET
+                   completed = excluded.completed,
+                   current_step = excluded.current_step,
+                   data = excluded.data,
+                   updated_at = excluded.updated_at""",
+            (tenant_id, json.dumps(data), now),
+        )
+        db.commit()
+        return get_onboarding_state(tenant_id)
+    finally:
+        db.close()
+
+
+def is_onboarding_complete(tenant_id: str) -> bool:
+    state = get_onboarding_state(tenant_id)
+    return bool(state.get("completed"))
+
+
 if __name__ == "__main__":
     _ensure_onboarding_tables()
     result = start_onboarding(1)

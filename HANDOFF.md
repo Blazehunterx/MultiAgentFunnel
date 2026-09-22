@@ -8,8 +8,10 @@ Multi-tenant outbound GTM engine (Clay-competitive): DM sender, AI auto-responde
 ## Key Architecture
 - **Single entry point**: `python clawbuildr/pipeline_runner.py` (24/7 background loop)
 - **Dashboard**: `python -m uvicorn clawbuildr_dashboard:app --host 0.0.0.0 --port 8000` (from `data/`)
-- **Cloudflare tunnel**: `https://antibody-importantly-sponsor-kodak.trycloudflare.com` (temporary)
-- **API prefix**: All new routes mounted at `/api/v2` in dashboard
+- **New simple UI**: `/` redirects to `/onboarding` first time, then `/dashboard`
+- **Classic dashboard**: still available at `/classic`
+- **Cloudflare tunnel**: `https://deutsche-match-billing-strategy.trycloudflare.com` (temporary)
+- **API prefix**: `/api/onboarding/*`, `/api/simple/*`, existing `/api/*`
 - **DB**: `MultiAgentFunnel/data/clawbuildr.db` — SQLite, 34 tables, 68 contacts
 
 ## Environment Setup
