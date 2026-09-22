@@ -11,6 +11,7 @@ LinkedIn Outreach Engine v3.0
 import json
 import os
 import sqlite3
+import sys
 import time
 import re
 import random
@@ -19,12 +20,47 @@ import threading
 from datetime import datetime, date
 from threading import Lock
 
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 COOKIES_PATH = os.path.join(DATA_DIR, "linkedin_cookies.json")
-FIREFOX_PROFILE_SRC = r"C:\Users\marvi\AppData\Roaming\Mozilla\Firefox\Profiles\h1vl3oun.default-release"
 FIREFOX_PROFILE_COPY = os.path.join(DATA_DIR, "firefox_profile_copy")
 
-CLAWBUILDR_DB = r"C:\Users\marvi\odysseus\data\clawbuildr.db"
+
+def _default_firefox_profile():
+    """Best-effort location of the default Firefox profile for this OS.
+
+    Returns "" when nothing is found. Callers already raise a clear error, and
+    FIREFOX_PROFILE_SRC can always be set explicitly in the environment.
+    """
+    if sys.platform.startswith("win"):
+        root = os.path.join(os.environ.get("APPDATA", ""), "Mozilla", "Firefox", "Profiles")
+    elif sys.platform == "darwin":
+        root = os.path.expanduser("~/Library/Application Support/Firefox/Profiles")
+    else:
+        root = os.path.expanduser("~/.mozilla/firefox")
+
+    if not os.path.isdir(root):
+        return ""
+
+    candidates = [
+        os.path.join(root, name)
+        for name in sorted(os.listdir(root))
+        if os.path.isdir(os.path.join(root, name))
+    ]
+    # Firefox names the default profile "<random>.default-release" (or
+    # ".default" on older installs); prefer those over any other profile.
+    for suffix in (".default-release", ".default"):
+        for path in candidates:
+            if path.endswith(suffix):
+                return path
+    return candidates[0] if candidates else ""
+
+
+# Both paths used to be hardcoded to one developer's Windows machine, which
+# meant the engine wrote to a database the dashboard never reads (the dashboard
+# uses <repo>/data/clawbuildr.db) and could not start at all on macOS/Linux.
+FIREFOX_PROFILE_SRC = os.environ.get("FIREFOX_PROFILE_SRC") or _default_firefox_profile()
+CLAWBUILDR_DB = os.environ.get("CLAWBUILDR_DB") or os.path.join(BASE_DIR, "data", "clawbuildr.db")
 
 DAILY_LIMIT = 20
 MIN_DELAY = 30
@@ -34,6 +70,10 @@ MAX_DELAY = 90
 MORNING_LIMIT = 7    # 8am-12pm
 AFTERNOON_LIMIT = 7  # 12pm-5pm
 EVENING_LIMIT = 6    # 5pm-9pm
+
+# Messages to existing 1st-degree connections are a separate quota from
+# connection requests, and were previously uncapped.
+DAILY_MESSAGE_LIMIT = 50
 
 _job_state = {
     "running": False,
@@ -73,6 +113,7 @@ def _log(entry):
 
 
 def _get_clawbuildr_db():
+    os.makedirs(os.path.dirname(os.path.abspath(CLAWBUILDR_DB)), exist_ok=True)
     db = sqlite3.connect(CLAWBUILDR_DB, timeout=60.0)
     db.execute("PRAGMA journal_mode=WAL;")
     db.execute("PRAGMA busy_timeout=5000;")
@@ -134,10 +175,14 @@ def _get_daily_count():
     return count
 
 
-def _get_period_count():
-    """Count connections sent in the current time period."""
+def _get_period_count(now=None):
+    """Count connections sent in the current time period.
+
+    `now` is injectable so the period boundaries can be tested without waiting
+    for the clock; it defaults to the real current time.
+    """
     from datetime import datetime
-    now = datetime.now()
+    now = now or datetime.now()
     hour = now.hour
     
     # Define periods
@@ -157,12 +202,15 @@ def _get_period_count():
     today = date.today().isoformat()
     
     # Count connections in current period
+    # NOTE: '%%H' is a literal percent sign to SQLite's strftime, so this used
+    # to compare CAST('%H' AS INTEGER) -> 0 against the period bounds and always
+    # counted 0. The single '%H' below is what actually yields the hour.
     count = db.execute(
         """SELECT COUNT(*) FROM linkedin_outreach 
            WHERE outcome = 'SUCCESS' 
            AND timestamp LIKE ? 
-           AND CAST(strftime('%%H', timestamp) AS INTEGER) >= ? 
-           AND CAST(strftime('%%H', timestamp) AS INTEGER) < ?""",
+           AND CAST(strftime('%H', timestamp) AS INTEGER) >= ? 
+           AND CAST(strftime('%H', timestamp) AS INTEGER) < ?""",
         (today + "%", 
          8 if period == "morning" else (12 if period == "afternoon" else 17),
          12 if period == "morning" else (17 if period == "afternoon" else 21))
@@ -172,17 +220,17 @@ def _get_period_count():
     return count, limit, period
 
 
-def can_send_connection():
+def can_send_connection(now=None):
     """Check if we can send a connection in the current time period."""
     from datetime import datetime
-    now = datetime.now()
+    now = now or datetime.now()
     hour = now.hour
     
     # No connections outside business hours
     if hour < 8 or hour >= 21:
         return False, "off_hours"
     
-    period_count, period_limit, period = _get_period_count()
+    period_count, period_limit, period = _get_period_count(now)
     
     if period_count >= period_limit:
         return False, f"{period}_limit_reached"
@@ -193,6 +241,37 @@ def can_send_connection():
         return False, "daily_limit_reached"
     
     return True, period
+
+
+def _get_daily_message_count():
+    """Count how many follow-up messages were sent today."""
+    db = _get_clawbuildr_db()
+    today = date.today().isoformat()
+    count = db.execute(
+        "SELECT COUNT(*) FROM linkedin_followups WHERE outcome = 'SUCCESS' AND timestamp LIKE ?",
+        (today + "%",),
+    ).fetchone()[0]
+    db.close()
+    return count
+
+
+def can_send_message(now=None):
+    """Check if we can send another message to a 1st-degree connection.
+
+    Messages have their own daily quota, separate from connection requests.
+    Without this the follow-up job could be triggered repeatedly and blow far
+    past a safe volume on an account whose network cannot be replaced.
+    """
+    from datetime import datetime
+    hour = (now or datetime.now()).hour
+
+    if hour < 8 or hour >= 21:
+        return False, "off_hours"
+
+    if _get_daily_message_count() >= DAILY_MESSAGE_LIMIT:
+        return False, "daily_message_limit_reached"
+
+    return True, "ok"
 
 
 def _is_already_contacted(first_name, last_name, company, profile_url=""):
@@ -2631,6 +2710,13 @@ def send_pending_followups():
         id, profile_url, first_name, last_name, company = row
         if not profile_url:
             continue
+
+        # Re-checked every iteration: the loop sleeps between sends, so the
+        # quota can run out (or business hours can end) part-way through.
+        allowed, reason = can_send_message()
+        if not allowed:
+            _log({"type": "warning", "message": f"Follow-ups paused ({reason}). Sent {sent_count} this run."})
+            break
 
         outcome = _send_followup_message(profile_url, first_name, company)
         now = datetime.now().isoformat()
