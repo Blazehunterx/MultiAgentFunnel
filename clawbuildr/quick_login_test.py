@@ -51,8 +51,8 @@ def quick_login_test():
             print("3. After login, run: python extract_linkedin_cookies.py")
             print("4. Then run this test again")
             return False
-            else:
-                print("\nCookies work! Testing full flow...")
+        else:
+            print("\nCookies work! Testing full flow...")
             
             # Test connection status
             from linkedin_engine import _check_if_connected
