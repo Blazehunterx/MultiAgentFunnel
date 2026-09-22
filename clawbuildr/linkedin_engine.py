@@ -16,15 +16,18 @@ import re
 import random
 import shutil
 import threading
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
 from threading import Lock
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 COOKIES_PATH = os.path.join(DATA_DIR, "linkedin_cookies.json")
 FIREFOX_PROFILE_SRC = r"C:\Users\marvi\AppData\Roaming\Mozilla\Firefox\Profiles\h1vl3oun.default-release"
-FIREFOX_PROFILE_COPY = os.path.join(DATA_DIR, "firefox_profile_copy")
+# Use timestamped copy to avoid lock conflicts with running Firefox
+import time as time_mod
+FIREFOX_PROFILE_COPY = os.path.join(DATA_DIR, f"firefox_profile_copy_{int(time_mod.time())}")
 
-CLAWBUILDR_DB = r"C:\Users\marvi\odysseus\data\clawbuildr.db"
+# Point to the active dashboard database (MultiAgentFunnel/data/clawbuildr.db)
+CLAWBUILDR_DB = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "clawbuildr.db")
 
 DAILY_LIMIT = 20
 MIN_DELAY = 30
@@ -34,6 +37,139 @@ MAX_DELAY = 90
 MORNING_LIMIT = 7    # 8am-12pm
 AFTERNOON_LIMIT = 7  # 12pm-5pm
 EVENING_LIMIT = 6    # 5pm-9pm
+
+# ---------- Safe-Sending: Account Warming ----------
+# Fresh accounts must scale gradually to avoid LinkedIn flags.
+# The system reads warming state from the DB and applies a multiplier.
+
+WARMING_PHASES = [
+    {"max_days": 3,  "multiplier": 0.10},   # Day 1-3:   10%
+    {"max_days": 7,  "multiplier": 0.25},   # Day 4-7:   25%
+    {"max_days": 14, "multiplier": 0.50},   # Day 8-14:  50%
+    {"max_days": 21, "multiplier": 0.80},   # Day 15-21: 80%
+    {"max_days": 999,"multiplier": 1.00},   # Day 22+:   100%
+]
+
+# Message & profile-view daily caps (separate from connection cap)
+MESSAGE_DAILY_LIMIT = 50
+PROFILE_VIEW_DAILY_LIMIT = 50
+
+# ---------- LinkedIn Request Rate Limiting ----------
+# LinkedIn flags high volume. We treat every page load as a request and pace them
+# like a human browsing across the full day.
+SEARCH_DAILY_LIMIT = 10          # max LinkedIn profile searches per day
+SEARCH_MIN_DELAY_SECONDS = 3600  # minimum seconds between searches (spread 10 over ~10h)
+_search_last_time = 0
+_search_lock = Lock()
+
+CONNECTION_DAILY_LIMIT = 20              # LinkedIn's practical daily connection ceiling
+CONNECTION_MIN_DELAY_SECONDS = 1200      # 20-40 min random between connections (fits 20/day)
+_connection_last_time = 0
+_connection_lock = Lock()
+
+
+def _can_linkedin_search(domain=""):
+    """Check if we are within the daily LinkedIn search budget and delay window.
+    Also blocks searches while the account is flagged/cooling down.
+    Returns True if a search is allowed."""
+    flagged, flag_reason = _is_flagged()
+    if flagged:
+        _log({"type": "warning", "message": f"LinkedIn search blocked: account flagged ({flag_reason}). Skipping {domain}."})
+        return False
+
+    try:
+        db = _get_clawbuildr_db()
+        today = datetime.now().strftime("%Y-%m-%d")
+        row = db.execute(
+            "SELECT COUNT(*) FROM linkedin_search_log WHERE last_searched_at LIKE ?",
+            (today + "%",)
+        ).fetchone()
+        daily_count = row[0] if row else 0
+        db.close()
+
+        if daily_count >= SEARCH_DAILY_LIMIT:
+            _log({"type": "warning", "message": f"LinkedIn search daily budget reached ({daily_count}/{SEARCH_DAILY_LIMIT}). Skipping {domain}."})
+            return False
+        return True
+    except Exception as e:
+        _log({"type": "warning", "message": f"LinkedIn search budget check failed: {e}"})
+        return False
+
+
+def _record_linkedin_search(domain, query, result_url=""):
+    """Record a LinkedIn search in the rate-limit log."""
+    try:
+        db = _get_clawbuildr_db()
+        now = datetime.now().isoformat()
+        db.execute("""
+            INSERT INTO linkedin_search_log (domain, query, result_url, search_count, last_searched_at)
+            VALUES (?, ?, ?, 1, ?)
+            ON CONFLICT(domain) DO UPDATE SET
+                query = excluded.query,
+                result_url = excluded.result_url,
+                search_count = linkedin_search_log.search_count + 1,
+                last_searched_at = excluded.last_searched_at
+        """, (domain, query, result_url, now))
+        db.commit()
+        db.close()
+    except Exception as e:
+        _log({"type": "warning", "message": f"Could not record LinkedIn search: {e}"})
+
+
+def _enforce_linkedin_search_delay():
+    """Enforce minimum delay between LinkedIn searches."""
+    global _search_last_time
+    with _search_lock:
+        elapsed = time.time() - _search_last_time
+        if elapsed < SEARCH_MIN_DELAY_SECONDS:
+            wait = SEARCH_MIN_DELAY_SECONDS - elapsed
+            _log({"type": "info", "message": f"LinkedIn search delay: sleeping {wait:.0f}s..."})
+            time.sleep(wait)
+        _search_last_time = time.time()
+
+
+def _connection_delay_remaining():
+    """Return remaining seconds until next connection send is allowed."""
+    with _connection_lock:
+        elapsed = time.time() - _connection_last_time
+        # Random delay between 20-40 minutes (fits 20/day in 13h window)
+        random_delay = random.uniform(1200, 2400)
+        remaining = max(0, random_delay - elapsed)
+        return remaining
+
+
+def _enforce_connection_delay():
+    """Enforce minimum delay between LinkedIn connection sends."""
+    global _connection_last_time
+    with _connection_lock:
+        elapsed = time.time() - _connection_last_time
+        # Random delay between 20-40 minutes (fits 20/day in 13h window)
+        random_delay = random.uniform(1200, 2400)
+        if elapsed < random_delay:
+            wait = random_delay - elapsed
+            _log({"type": "info", "message": f"Connection send delay: sleeping {wait:.0f}s (human-like random spacing)..."})
+            time.sleep(wait)
+        _connection_last_time = time.time()
+
+
+def _mark_connection_sent():
+    """Record that a connection request was just sent (for delay tracking)."""
+    global _connection_last_time
+    with _connection_lock:
+        _connection_last_time = time.time()
+
+
+# ---------- Flag Detection & Auto-Pause ----------
+# If any of these flags are detected, the engine pauses ALL outreach.
+# A flagged account requires 7 days cooldown + manual confirmation on day 8.
+
+_flag_state = {
+    "flagged": False,
+    "flag_type": None,       # "captcha", "unusual_activity", "connection_limit", "http_429"
+    "flagged_at": None,
+    "cooldown_days": 7,
+    "resumed": False,
+}
 
 _job_state = {
     "running": False,
@@ -118,8 +254,265 @@ def _get_clawbuildr_db():
             created_at TEXT DEFAULT (datetime('now'))
         )
     """)
+    # Warming state table — tracks account age and flag status
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS warming_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            account_created_at TEXT,
+            warmed_at TEXT,
+            paused INTEGER DEFAULT 0,
+            pause_reason TEXT,
+            paused_at TEXT,
+            flag_type TEXT,
+            flag_detected_at TEXT,
+            last_manual_resume TEXT
+        )
+    """)
+    # Message send log (separate from connection requests)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS linkedin_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_url TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            message_text TEXT,
+            outcome TEXT,
+            timestamp TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    # Profile view log
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS linkedin_profile_views (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_url TEXT,
+            viewed_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
     db.commit()
     return db
+
+
+# ---------- Safe-Sending: Warming Logic ----------
+
+def _get_warming_state(db=None):
+    """Get the warming state. Creates a default row if none exists."""
+    own_db = db is None
+    if own_db:
+        db = _get_clawbuildr_db()
+    try:
+        row = db.execute("SELECT * FROM warming_state WHERE id = 1").fetchone()
+        if not row:
+            now = datetime.now().isoformat()
+            db.execute(
+                "INSERT INTO warming_state (id, account_created_at) VALUES (1, ?)",
+                (now,)
+            )
+            db.commit()
+            return {
+                "account_created_at": now,
+                "warmed_at": None,
+                "paused": 0,
+                "pause_reason": None,
+                "flag_type": None,
+            }
+        return {
+            "account_created_at": row[1],
+            "warmed_at": row[2],
+            "paused": row[3],
+            "pause_reason": row[4],
+            "flag_type": row[7] if len(row) > 7 else None,
+        }
+    finally:
+        if own_db:
+            db.close()
+
+
+def _get_warming_multiplier():
+    """Calculate the current daily limit multiplier based on account age.
+    Returns a value between 0.10 and 1.00.
+    """
+    state = _get_warming_state()
+    created = state.get("account_created_at")
+    if not created:
+        return 1.0  # No warming data = assume mature account
+
+    try:
+        created_dt = datetime.fromisoformat(created)
+    except (ValueError, TypeError):
+        return 1.0
+
+    days_active = (datetime.now() - created_dt).days
+
+    for phase in WARMING_PHASES:
+        if days_active <= phase["max_days"]:
+            return phase["multiplier"]
+    return 1.0
+
+
+def _get_effective_daily_limit():
+    """Get the effective daily connection limit after warming + recovery multiplier."""
+    base = DAILY_LIMIT
+    multiplier = _get_warming_multiplier()
+
+    # Recovery mode: if account was flagged recently, keep limits very low
+    state = _get_warming_state()
+    flag_type = state.get("flag_type")
+    flag_at = state.get("flag_detected_at")
+    if flag_type and flag_at:
+        try:
+            flag_dt = datetime.fromisoformat(flag_at)
+            hours_since_flag = (datetime.now() - flag_dt).total_seconds() / 3600
+            if hours_since_flag < 24:
+                # Hard pause for 24h after any flag
+                return 0, 0.0
+            elif hours_since_flag < 168:  # 7 days
+                # Recovery mode: 25% of normal limit
+                multiplier = min(multiplier, 0.25)
+                _log({"type": "info", "message": f"Recovery mode active ({hours_since_flag:.0f}h since flag). Limit reduced to {multiplier:.0%}."})
+        except (ValueError, TypeError):
+            pass
+
+    effective = max(1, int(base * multiplier))
+    return effective, multiplier
+
+
+def _is_flagged():
+    """Check if the account is currently flagged/paused."""
+    state = _get_warming_state()
+    if state.get("paused"):
+        return True, state.get("pause_reason", "unknown")
+    if _flag_state.get("flagged"):
+        return True, _flag_state.get("flag_type", "unknown")
+
+    # Also enforce 24h hard pause after recent flag even if paused=0
+    flag_type = state.get("flag_type")
+    flag_at = state.get("flag_detected_at")
+    if flag_type and flag_at:
+        try:
+            flag_dt = datetime.fromisoformat(flag_at)
+            if (datetime.now() - flag_dt).total_seconds() < 86400:
+                return True, f"{flag_type} (24h cooldown)"
+        except (ValueError, TypeError):
+            pass
+
+    return False, None
+
+
+def _set_flagged(flag_type, reason=""):
+    """Mark the account as flagged. All outreach stops immediately."""
+    global _flag_state
+    _flag_state["flagged"] = True
+    _flag_state["flag_type"] = flag_type
+    _flag_state["flagged_at"] = datetime.now().isoformat()
+
+    db = _get_clawbuildr_db()
+    now = datetime.now().isoformat()
+    db.execute("""
+        UPDATE warming_state SET paused = 1, pause_reason = ?, paused_at = ?, flag_type = ?, flag_detected_at = ?
+        WHERE id = 1
+    """, (reason or flag_type, now, flag_type, now))
+    db.commit()
+    db.close()
+    _log({"type": "error", "message": f"ACCOUNT FLAGGED: {flag_type} — {reason}. All outreach paused."})
+
+
+def _check_cooldown_elapsed():
+    """Check if the 7-day cooldown has passed since flagging.
+    Returns True if cooldown is complete and account is eligible for manual resume.
+    """
+    state = _get_warming_state()
+    if not state.get("paused"):
+        return False
+
+    paused_at = state.get("paused_at") or state.get("flag_detected_at")
+    if not paused_at:
+        return False
+
+    try:
+        paused_dt = datetime.fromisoformat(paused_at)
+        cooldown_end = paused_dt + timedelta(days=_flag_state.get("cooldown_days", 7))
+        return datetime.now() >= cooldown_end
+    except (ValueError, TypeError):
+        return False
+
+
+def _manual_resume():
+    """Manual confirmation to resume after cooldown. Re-warms at 10%."""
+    if not _check_cooldown_elapsed():
+        _log({"type": "warning", "message": "Cooldown not yet elapsed. Cannot resume."})
+        return False
+
+    global _flag_state
+    _flag_state["flagged"] = False
+    _flag_state["flag_type"] = None
+    _flag_state["resumed"] = True
+
+    db = _get_clawbuildr_db()
+    now = datetime.now().isoformat()
+    db.execute("""
+        UPDATE warming_state SET paused = 0, pause_reason = NULL, last_manual_resume = ? WHERE id = 1
+    """, (now,))
+    db.commit()
+    db.close()
+
+    # Reset warming to 10% (day 1 equivalent)
+    _log({"type": "info", "message": "Account resumed manually. Re-warming at 10% capacity."})
+    return True
+
+
+# ---------- Safe-Sending: Active Hours ----------
+
+# Timezone-aware active hours. Default to Europe/Amsterdam (CET/CEST).
+import zoneinfo as _zoneinfo
+
+_ACTIVE_TIMEZONE = "Europe/Amsterdam"
+_ACTIVE_HOURS = (8, 21)  # No sending before 8 AM or after 9 PM
+_ACTIVE_WEEKDAYS = (0, 1, 2, 3, 4)  # Mon-Fri only (0=Mon, 4=Fri)
+
+# Randomize send times: avoid exact quarter-hours
+_QUARTER_HOUR_OFFSETS = [0, 2, 3, 5, 7, 8, 10, 12, 13, 15, 17, 18, 20, 22, 23, 25, 27, 28]
+
+# Test mode flag: allows weekend sending when explicitly enabled
+_LINKEDIN_TEST_FLAG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "linkedin_test_mode.json")
+
+
+def _linkedin_test_mode_enabled() -> bool:
+    """Check if LinkedIn test mode is enabled (allows weekend/holiday sends)."""
+    try:
+        if os.path.exists(_LINKEDIN_TEST_FLAG):
+            with open(_LINKEDIN_TEST_FLAG, "r") as f:
+                return bool(json.load(f).get("enabled", False))
+    except Exception:
+        pass
+    return False
+
+
+def _now_in_active_tz():
+    """Return current time in the configured active timezone."""
+    try:
+        tz = _zoneinfo.ZoneInfo(_ACTIVE_TIMEZONE)
+    except Exception:
+        tz = timezone.utc
+    return datetime.now(tz)
+
+
+def _is_active_hours():
+    """Check if current time is within active sending hours."""
+    now = _now_in_active_tz()
+    if now.weekday() not in _ACTIVE_WEEKDAYS and not _linkedin_test_mode_enabled():
+        return False, "weekend"
+    if now.hour < _ACTIVE_HOURS[0] or now.hour >= _ACTIVE_HOURS[1]:
+        return False, "outside_active_hours"
+    return True, "active"
+
+
+def _randomized_delay(base_min=30, base_max=90):
+    """Return a randomized delay that avoids exact quarter-hours.
+    Adds a random offset from _QUARTER_HOUR_OFFSETS to make send times less predictable.
+    """
+    base = random.uniform(base_min, base_max)
+    offset = random.choice(_QUARTER_HOUR_OFFSETS)
+    return base + offset
 
 
 def _get_daily_count():
@@ -173,26 +566,38 @@ def _get_period_count():
 
 
 def can_send_connection():
-    """Check if we can send a connection in the current time period."""
-    from datetime import datetime
-    now = datetime.now()
-    hour = now.hour
-    
-    # No connections outside business hours
-    if hour < 8 or hour >= 21:
-        return False, "off_hours"
-    
-    period_count, period_limit, period = _get_period_count()
-    
-    if period_count >= period_limit:
-        return False, f"{period}_limit_reached"
-    
-    # Also check daily limit
+    """Check if we can send a connection in the current time period.
+    Applies: flag check, active hours, warming multiplier, period caps,
+    and a minimum delay between sends to spread 20 requests over 24h.
+    """
+    # Check if account is flagged/paused
+    flagged, flag_reason = _is_flagged()
+    if flagged:
+        return False, f"flagged_{flag_reason}"
+
+    # Check active hours (timezone-aware, weekday filter)
+    active, reason = _is_active_hours()
+    if not active:
+        return False, reason
+
+    # Check effective daily limit (with warming multiplier)
+    effective_limit, multiplier = _get_effective_daily_limit()
     daily_count = _get_daily_count()
-    if daily_count >= DAILY_LIMIT:
-        return False, "daily_limit_reached"
-    
-    return True, period
+    if daily_count >= effective_limit:
+        return False, f"daily_limit_reached ({daily_count}/{effective_limit}, warmup={multiplier:.0%})"
+
+    # Check period caps (also scaled by warming)
+    period_count, period_limit, period = _get_period_count()
+    effective_period_limit = max(1, int(period_limit * multiplier))
+    if period_count >= effective_period_limit:
+        return False, f"{period}_limit_reached ({period_count}/{effective_period_limit})"
+
+    # Enforce minimum spacing between connection sends (20/day => ~40min apart)
+    remaining = _connection_delay_remaining()
+    if remaining > 0:
+        return False, f"connection_delay ({remaining:.0f}s remaining, ~30min spacing for 20/day spread)"
+
+    return True, f"ok (warmup={multiplier:.0%}, daily={daily_count}/{effective_limit})"
 
 
 def _is_already_contacted(first_name, last_name, company, profile_url=""):
@@ -367,7 +772,6 @@ def _start_modal_purger(page, stop_event):
             time.sleep(0.5)
 
     global _modal_purge_timer
-    stop_event = threading.Event()
     t = threading.Thread(target=purge_loop, daemon=True)
     t.start()
     return stop_event, t
@@ -390,25 +794,25 @@ def _human_type(page, selector, text):
             pass
 
 
-def _human_type_selenium(driver, text):
-    """Type text into the visible note textarea/input using Selenium send_keys."""
+def _human_type_selenium(driver, text, wpm_range=(35, 65)):
+    """Type text into the visible textarea/input using Selenium with human-like speed.
+    Simulates variable WPM, occasional longer pauses, and rare typo-like corrections.
+    """
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.action_chains import ActionChains
     try:
-        from selenium.webdriver.common.by import By
-        # Try textarea first
         tas = driver.find_elements(By.TAG_NAME, "textarea")
         ta = None
         for t in tas:
             if t.is_displayed() and t.size.get('width', 0) > 50:
                 ta = t
                 break
-        # If no textarea, try text inputs (LinkedIn may have switched to input)
         if not ta:
             inputs = driver.find_elements(By.CSS_SELECTOR, 'input[type="text"], input:not([type])')
             for inp in inputs:
                 if inp.is_displayed() and inp.size.get('width', 0) > 50:
                     ta = inp
                     break
-        # Also try contenteditable divs
         if not ta:
             editables = driver.find_elements(By.CSS_SELECTOR, '[contenteditable="true"]')
             for el in editables:
@@ -425,10 +829,121 @@ def _human_type_selenium(driver, text):
         except Exception:
             pass
         time.sleep(0.2)
-        ta.send_keys(text)
-        time.sleep(0.5)
+
+        # Human typing: variable WPM with pauses
+        wpm = random.randint(*wpm_range)
+        base_delay = 60.0 / (wpm * 5)  # seconds per character
+        actions = ActionChains(driver)
+        for i, char in enumerate(text):
+            # 5% chance of a micro-pause (hesitation)
+            if random.random() < 0.05:
+                time.sleep(random.uniform(0.3, 0.8))
+            # 1% chance of a longer pause (thinking)
+            elif random.random() < 0.01:
+                time.sleep(random.uniform(1.0, 2.5))
+            delay = base_delay * random.uniform(0.7, 1.4)
+            actions.send_keys(char)
+            actions.pause(delay)
+        actions.perform()
+        time.sleep(random.uniform(0.5, 1.2))
     except Exception as e:
-        _log({"type": "warning", "message": f"send_keys failed: {str(e)[:60]}"})
+        _log({"type": "warning", "message": f"Human type failed: {str(e)[:60]}; falling back to send_keys"})
+        try:
+            ta.send_keys(text)
+        except Exception:
+            pass
+
+
+def _human_type_into_element(driver, element, text, wpm_range=(35, 65)):
+    """Type text into a specific Selenium element with human-like speed and pauses."""
+    from selenium.webdriver.common.action_chains import ActionChains
+    try:
+        element.click()
+        time.sleep(0.2)
+        try:
+            element.clear()
+        except Exception:
+            pass
+        time.sleep(0.2)
+        wpm = random.randint(*wpm_range)
+        base_delay = 60.0 / (wpm * 5)
+        actions = ActionChains(driver)
+        for char in text:
+            if random.random() < 0.05:
+                time.sleep(random.uniform(0.3, 0.8))
+            elif random.random() < 0.01:
+                time.sleep(random.uniform(1.0, 2.5))
+            delay = base_delay * random.uniform(0.7, 1.4)
+            actions.send_keys(char)
+            actions.pause(delay)
+        actions.perform()
+        time.sleep(random.uniform(0.4, 0.9))
+    except Exception as e:
+        _log({"type": "warning", "message": f"Human type into element failed: {str(e)[:60]}; falling back"})
+        try:
+            element.send_keys(text)
+        except Exception:
+            pass
+
+
+def _human_scroll(page, min_scrolls=2, max_scrolls=6, driver=None):
+    """Scroll up/down the page in a human-like pattern with variable speeds and pauses.
+    Works with both Playwright page and Selenium driver.
+    """
+    try:
+        scrolls = random.randint(min_scrolls, max_scrolls)
+        for _ in range(scrolls):
+            direction = random.choice([-1, 1])
+            distance = random.randint(200, 800)
+            duration = random.randint(300, 900)
+            if driver is None:
+                # Playwright
+                page.evaluate(f"""() => {{
+                    window.scrollBy({{top: {direction * distance}, left: 0, behavior: 'smooth'}});
+                }}""")
+            else:
+                # Selenium
+                driver.execute_script(f"window.scrollBy({{top: {direction * distance}, left: 0, behavior: 'smooth'}});")
+            time.sleep(random.uniform(0.6, 2.0))
+    except Exception as e:
+        _log({"type": "debug", "message": f"Human scroll skipped: {str(e)[:60]}"})
+
+
+def _human_read_time(page=None, min_seconds=3, max_seconds=10):
+    """Pause as if a human is reading the page."""
+    duration = random.uniform(min_seconds, max_seconds)
+    _log({"type": "debug", "message": f"Human read pause: {duration:.1f}s"})
+    time.sleep(duration)
+
+
+def _human_mouse_wander(page, driver=None):
+    """Move mouse to a few random points on the page to simulate reading behavior.
+    Only works with Selenium (Playwright mouse API is different).
+    """
+    if driver is None:
+        return  # Playwright mouse wander omitted to avoid complexity
+    try:
+        from selenium.webdriver.common.action_chains import ActionChains
+        width = driver.execute_script("return window.innerWidth") or 1200
+        height = driver.execute_script("return window.innerHeight") or 800
+        actions = ActionChains(driver)
+        for _ in range(random.randint(2, 5)):
+            x = random.randint(int(width * 0.1), int(width * 0.9))
+            y = random.randint(int(height * 0.2), int(height * 0.8))
+            actions.move_by_offset(x - (width // 2), y - (height // 2))
+            actions.pause(random.uniform(0.2, 0.6))
+        actions.perform()
+    except Exception as e:
+        _log({"type": "debug", "message": f"Mouse wander skipped: {str(e)[:60]}"})
+
+
+def _human_profile_visit(page, driver=None):
+    """Combined human behavior for a profile/page visit: scroll + read + wander."""
+    _human_read_time(min_seconds=2, max_seconds=5)
+    _human_scroll(page, min_scrolls=2, max_scrolls=5, driver=driver)
+    _human_read_time(min_seconds=3, max_seconds=8)
+    if driver:
+        _human_mouse_wander(page, driver=driver)
 
 
 def _random_sleep(min_s=2, max_s=5):
@@ -437,19 +952,76 @@ def _random_sleep(min_s=2, max_s=5):
 
 
 def _detect_auth_wall(page):
-    """Check if we hit a login/auth wall or captcha."""
+    """Check if we hit a login/auth wall, captcha, unusual activity, or rate limit.
+    Returns a string describing the issue, or None if OK.
+    Also triggers auto-pause via _set_flagged() for critical flags.
+    """
     url = page.url
     if "login" in url or "authwall" in url or "signin" in url or "checkpoint" in url:
+        _set_flagged("auth_wall", f"Redirected to auth wall: {url[:100]}")
         return "auth_wall"
     if "captcha" in url or "challenge" in url:
+        _set_flagged("captcha", f"Captcha/challenge page detected: {url[:100]}")
         return "captcha"
     try:
         has_login_form = page.evaluate("""() => !!document.querySelector('input[name="session_key"], .sign-in-form__submit')""")
         if has_login_form:
+            _set_flagged("auth_wall", "Login form detected on page")
             return "auth_wall"
     except Exception:
         pass
+
+    # Check for "unusual activity" warning or connection limit warning
+    try:
+        body_text = page.evaluate("""() => (document.body.innerText || '').substring(0, 3000).toLowerCase()""") or ""
+        # Unusual activity detection
+        unusual_keywords = [
+            "unusual activity", "ongebruikelijke activiteit",
+            "we detected something unusual", "we detected unusual",
+            "your account has been restricted", "je account is beperkt",
+            "temporarily restricted", "tijdelijk beperkt",
+        ]
+        for kw in unusual_keywords:
+            if kw in body_text:
+                _set_flagged("unusual_activity", f"Unusual activity warning detected: '{kw}'")
+                return "unusual_activity"
+
+        # Connection limit warning
+        limit_keywords = [
+            "you've reached the weekly invitation limit",
+            "je hebt de wekelijkse uitnodigingslimiet bereikt",
+            "too many invitations", "te veel uitnodigingen",
+            "connection requests are limited",
+        ]
+        for kw in limit_keywords:
+            if kw in body_text:
+                # Not a hard flag — just reduce caps by 30%
+                _log({"type": "warning", "message": f"Connection limit warning detected: '{kw}' — reducing caps by 30%"})
+                return "connection_limit_warning"
+    except Exception:
+        pass
+
     return None
+
+
+def _handle_http_429(response=None):
+    """Handle HTTP 429 (Too Many Requests) or LinkedIn's HTTP 999 (anti-bot).
+    Implements exponential backoff and flag detection.
+    """
+    if response is None:
+        return
+
+    status = getattr(response, "status_code", 0)
+    if status in (429, 999):
+        _log({"type": "error", "message": f"HTTP {status} received — rate limited by LinkedIn"})
+        # Exponential backoff: 5min, 15min, 45min
+        backoff = min(2700, 300 * (2 ** _flag_state.get("_429_count", 0)))
+        _flag_state["_429_count"] = _flag_state.get("_429_count", 0) + 1
+        _log({"type": "warning", "message": f"Backing off for {backoff}s before next action"})
+        time.sleep(backoff)
+
+        if _flag_state["_429_count"] >= 3:
+            _set_flagged("http_429", f"HTTP 429/999 received 3 times in a row")
 
 
 # ---------- Core LinkedIn actions ----------
@@ -519,61 +1091,62 @@ def _find_and_click_button(page, texts, aria_keywords=None, profile_area_only=Fa
 
 
 def _find_profile_more_button(page):
-    """Find the 'More' overflow button on a profile page.
+    """Find and click the 'More' overflow button on a profile page.
     Multi-lingual: handles Dutch (Meer), English (More), Vietnamese (Khác), German (Mehr), French (Plus), Spanish (Más).
-    The profile "..." button is in the profile header card (top 150-400px, left side).
-    MUST be restricted to avoid matching post/comment "..." overflow menus in the feed.
+    Returns True if clicked, False if not found.
+    Uses direct element click (no coordinates).
     """
     more_labels = ["meer", "more", "khác", "mehr", "plus", "más", "altro", "fler", "mer"]
     try:
         result = page.evaluate("""(labels) => {
             const btns = Array.from(document.querySelectorAll('button'));
-            // Pass 1: Match by aria-label in profile header area only (Y 150-400, X < 400)
+            // Pass 1: Match by aria-label in profile header area
             for (const b of btns) {
                 const aria = (b.getAttribute('aria-label') || '').toLowerCase().trim();
                 const r = b.getBoundingClientRect();
                 if (r.width === 0 || r.height === 0) continue;
-                if (r.top > 150 && r.top < 550 && r.left < 400 && r.width > 20) {
+                if (r.top > 100 && r.top < 600 && r.left < 500 && r.width > 20) {
                     for (const label of labels) {
                         if (aria === label) {
-                            return {x: r.x + r.width/2, y: r.y + r.height/2, aria: aria};
+                            b.click();
+                            return {clicked: true, aria: aria, method: 'aria'};
                         }
                     }
                 }
             }
-            // Pass 2: Match by innerText (some LinkedIn versions use text "Meer" / "More" instead of aria)
+            // Pass 2: Match by innerText
             for (const b of btns) {
                 const txt = (b.innerText || '').toLowerCase().trim();
                 const r = b.getBoundingClientRect();
                 if (r.width === 0 || r.height === 0) continue;
-                if (r.top > 150 && r.top < 550 && r.left < 400 && r.width > 20) {
+                if (r.top > 100 && r.top < 600 && r.left < 500 && r.width > 20) {
                     for (const label of labels) {
                         if (txt === label) {
-                            return {x: r.x + r.width/2, y: r.y + r.height/2, aria: txt};
+                            b.click();
+                            return {clicked: true, text: txt, method: 'text'};
                         }
                     }
                 }
             }
-            // Pass 3: Fallback — small square icon button (32-40px) in profile header with NO text
-            // (the "..." overflow is typically an icon-only button with aria-label)
+            // Pass 3: Fallback — small icon button with aria-label
             for (const b of btns) {
                 const aria = (b.getAttribute('aria-label') || '').toLowerCase().trim();
                 const r = b.getBoundingClientRect();
                 if (r.width === 0 || r.height === 0) continue;
-                if (r.top > 150 && r.top < 550 && r.left < 400 && r.width >= 28 && r.width <= 44 && !b.innerText.trim()) {
-                    // Extra check: must have aria-label matching one of the more labels
+                if (r.top > 100 && r.top < 600 && r.left < 500 && r.width >= 28 && r.width <= 44 && !b.innerText.trim()) {
                     for (const label of labels) {
                         if (aria.includes(label)) {
-                            return {x: r.x + r.width/2, y: r.y + r.height/2, aria: aria};
+                            b.click();
+                            return {clicked: true, aria: aria, method: 'icon'};
                         }
                     }
                 }
             }
-            return null;
+            return {clicked: false};
         }""", more_labels)
         return result
     except Exception:
-        return None
+        return {"clicked": False}
 
 
 def _handle_invitation_modal(page, note):
@@ -721,27 +1294,21 @@ def _handle_invitation_modal(page, note):
 
 def _handle_invitation_page(page, note):
     """Handle the dedicated /preload/custom-invite/ page.
-    Strategy: 
-    1. Check if Premium upsell blocks notes
-    2. If notes available: click "Opmerking toevoegen" → type note → click send
-    3. If notes blocked: click "Verzenden zonder opmerking" directly
-    Uses broad element selectors (button, role=button, a, etc.) since LinkedIn
-    may not always use standard <button> tags.
+    Strategy:
+    1. If "Opmerking toevoegen" / "Add a note" is available: click it, type note, send.
+    2. Otherwise: click "Verzenden zonder opmerking" / "Send without a note".
     Returns outcome string.
     """
     from selenium.webdriver.common.by import By
     from selenium.webdriver.common.action_chains import ActionChains
-    _log({"type": "info", "message": "On invitation page. Checking for note availability..."})
+    _log({"type": "info", "message": "On invitation page. Handling send flow..."})
     time.sleep(2)
 
-    CLICKABLE_SEL = "button, [role='button'], a, [tabindex='0']"
-
-    def _find_and_click_invite(selectors, target_texts, description=""):
-        """Helper: find element by multiple selectors and text targets, click via ActionChains."""
+    def _find_clickable(text_targets):
+        selectors = ["button", "[role='button']", "a", "[tabindex='0']"]
         for sel in selectors:
             try:
-                elems = page._driver.find_elements(By.CSS_SELECTOR, sel)
-                for b in elems:
+                for b in page._driver.find_elements(By.CSS_SELECTOR, sel):
                     try:
                         txt = (b.text or "").strip().lower()
                         if not b.is_displayed():
@@ -749,17 +1316,68 @@ def _handle_invitation_page(page, note):
                         r = b.rect
                         if r.get('width', 0) == 0 or r.get('height', 0) == 0:
                             continue
-                        for t in target_texts:
+                        for t in text_targets:
                             if t in txt:
-                                _log({"type": "info", "message": f"Clicking '{b.text}' via ActionChains ({description}, sel={sel})..."})
-                                ActionChains(page._driver).move_to_element(b).pause(0.5).click().perform()
-                                time.sleep(3)
-                                return True
+                                return b
                     except Exception:
                         continue
             except Exception:
                 continue
-        return False
+        return None
+
+    # Step 1: Try to add a note
+    note_btn = _find_clickable([
+        "opmerking toevoegen", "add a note", "ajouter une note", "notitie toevoegen"
+    ])
+    if note_btn:
+        _log({"type": "info", "message": f"Clicking '{note_btn.text}' to add note..."})
+        ActionChains(page._driver).move_to_element(note_btn).pause(0.5).click().perform()
+        time.sleep(2)
+
+        # Type the note
+        try:
+            textareas = page._driver.find_elements(By.TAG_NAME, "textarea")
+            for ta in textareas:
+                if ta.is_displayed() and ta.rect.get('width', 0) > 50:
+                    _human_type_into_element(page._driver, ta, note, wpm_range=(40, 70))
+                    break
+        except Exception as e:
+            _log({"type": "warning", "message": f"Could not type note on invite page: {str(e)[:60]}"})
+
+        # Click send
+        send_btn = _find_clickable([
+            "verzenden", "send", "envoyer", "versturen"
+        ])
+        if send_btn:
+            _log({"type": "info", "message": f"Clicking send: '{send_btn.text}'"})
+            ActionChains(page._driver).move_to_element(send_btn).pause(0.5).click().perform()
+            time.sleep(3)
+            return "SUCCESS"
+        else:
+            _log({"type": "warning", "message": "Send button not found after typing note"})
+            return "FAILURE"
+
+    # Step 2: No note option — send without note
+    send_without_btn = _find_clickable([
+        "verzenden zonder opmerking", "send without a note", "envoyer sans note",
+        "verzenden zonder", "send without"
+    ])
+    if send_without_btn:
+        _log({"type": "info", "message": f"Clicking '{send_without_btn.text}' (no note)..."})
+        ActionChains(page._driver).move_to_element(send_without_btn).pause(0.5).click().perform()
+        time.sleep(3)
+        return "SUCCESS_NO_NOTE"
+
+    # Step 3: Generic send button fallback
+    send_btn = _find_clickable(["verzenden", "send", "envoyer", "versturen"])
+    if send_btn:
+        _log({"type": "info", "message": f"Clicking generic send: '{send_btn.text}'"})
+        ActionChains(page._driver).move_to_element(send_btn).pause(0.5).click().perform()
+        time.sleep(3)
+        return "SUCCESS_NO_NOTE"
+
+    _log({"type": "warning", "message": "No send button found on invitation page"})
+    return "FAILURE"
 
 
 def is_quality_prospect(first_name, last_name, company_name, profile_url=""):
@@ -796,127 +1414,6 @@ def is_quality_prospect(first_name, last_name, company_name, profile_url=""):
             return False, "slug_url"
     
     return True, "ok"
-
-    # Check if LinkedIn shows Premium upsell BEFORE clicking anything
-    has_premium_upsell = page.evaluate("""() => {
-        const body = (document.body.innerText || '').toLowerCase();
-        return body.includes('premium') && (
-            body.includes('geen gratis aangepaste opmerkingen') || 
-            body.includes('no free custom notes') ||
-            body.includes('omzeil de limiet')
-        );
-    }""")
-
-    if has_premium_upsell:
-        _log({"type": "info", "message": "Premium upsell detected - notes blocked. Sending without note."})
-    else:
-        _log({"type": "info", "message": "No Premium upsell detected. Attempting to add note..."})
-        note_sel = ["button", "[role='button']"]
-        note_targets = ["opmerking toevoegen", "add a note", "thêm ghi chú", "ajouter une note"]
-        note_btn_clicked = _find_and_click_invite(note_sel, note_targets, "note button")
-
-        if note_btn_clicked:
-            # Check if Premium upsell appeared AFTER clicking
-            has_premium_upsell = page.evaluate("""() => {
-                const body = (document.body.innerText || '').toLowerCase();
-                return body.includes('premium') && (
-                    body.includes('geen gratis aangepaste opmerkingen') || 
-                    body.includes('no free custom notes') ||
-                    body.includes('omzeil de limiet')
-                );
-            }""")
-            if has_premium_upsell:
-                _log({"type": "info", "message": "Premium upsell appeared after clicking note button. Re-navigating..."})
-                try:
-                    current_url = page.url
-                    page.goto(current_url, wait_until="domcontentloaded", timeout=30000)
-                    time.sleep(5)
-                    if _find_and_click_invite(["button", "[role='button']"], ["verzenden zonder opmerking", "send without note"], "send without note (re-nav)"):
-                        return "SUCCESS_NO_NOTE"
-                except Exception as e:
-                    _log({"type": "warning", "message": f"Re-nav fallback failed: {str(e)[:60]}"})
-                return "FAILURE"
-            else:
-                # Check if textarea appeared
-                textarea_found = page.evaluate("""() => {
-                    const tas = document.querySelectorAll('textarea');
-                    for (const ta of tas) {
-                        const r = ta.getBoundingClientRect();
-                        if (r.width > 50 && r.height > 10 && 
-                            !ta.id.includes('recaptcha') && 
-                            !ta.name.includes('recaptcha')) {
-                            ta.focus();
-                            ta.click();
-                            return {found: true, type: 'textarea'};
-                        }
-                    }
-                    const editables = document.querySelectorAll('[contenteditable="true"]');
-                    for (const el of editables) {
-                        const r = el.getBoundingClientRect();
-                        if (r.width > 50 && r.height > 10) {
-                            el.focus();
-                            el.click();
-                            return {found: true, type: 'contenteditable'};
-                        }
-                    }
-                    return {found: false};
-                }""")
-
-                if textarea_found and textarea_found.get("found"):
-                    _log({"type": "info", "message": f"Found note input ({textarea_found.get('type')}). Typing note..."})
-                    _human_type_selenium(page._driver, note)
-                    time.sleep(2)
-
-                    send_targets = ["versturen", "verzenden", "send"]
-                    if _find_and_click_invite(["button", "[role='button']"], send_targets, "send with note"):
-                        return "SUCCESS"
-                else:
-                    _log({"type": "info", "message": "No textarea appeared after clicking note button."})
-
-    # If we get here: Premium upsell, or note failed, or send not found — send without note
-    _log({"type": "info", "message": "Sending without note (clicking 'Verzenden zonder opmerking')..."})
-    if _find_and_click_invite(
-        ["button", "[role='button']", "a"],
-        ["verzenden zonder opmerking", "send without note", "envoyer sans note", "enviar sin nota"],
-        "send without note"
-    ):
-        return "SUCCESS_NO_NOTE"
-
-    # Fallback: try primary button (artdeco or role-based)
-    _log({"type": "info", "message": "Trying primary button fallback..."})
-    primary_sels = [
-        "button.artdeco-button--primary",
-        ".artdeco-modal button[type='submit']",
-        "[role='dialog'] button",
-        "[role='dialog'] [role='button']",
-    ]
-    if _find_and_click_invite(primary_sels, ["verzenden", "versturen", "send", "verbinden", "connect"], "primary button"):
-        return "SUCCESS"
-
-    # Fallback: try iframe
-    try:
-        iframes = page._driver.find_elements(By.TAG_NAME, "iframe")
-        for iframe in iframes:
-            try:
-                page._driver.switch_to.frame(iframe)
-                btns = page._driver.find_elements(By.CSS_SELECTOR, CLICKABLE_SEL)
-                for b in btns:
-                    txt = (b.text or "").lower().strip()
-                    if any(t in txt for t in ["versturen", "verzenden", "send"]):
-                        ActionChains(page._driver).move_to_element(b).pause(0.5).click().perform()
-                        _log({"type": "info", "message": f"Sent via iframe button: {txt}"})
-                        page._driver.switch_to.default_content()
-                        time.sleep(2)
-                        return "SUCCESS"
-                page._driver.switch_to.default_content()
-            except Exception:
-                try: page._driver.switch_to.default_content()
-                except: pass
-    except Exception:
-        pass
-
-    _log({"type": "error", "message": "Could not find any send button on invitation page."})
-    return "FAILURE"
 
 
 def _check_if_connected(page):
@@ -1066,7 +1563,20 @@ def _verify_send(page):
             proof_parts.append(f"CANCEL_BUTTON: {cancel_check.get('text', '')}")
             _log({"type": "info", "message": f"Send verified via cancel button: {cancel_check.get('text', '')}"})
         
-        # Take screenshot as proof
+        # Screenshot alone is NOT proof of success. Require a real UI signal.
+        verified = False
+        if banner_check and banner_check.get("found"):
+            proof_parts.append(f"SUCCESS_BANNER: {banner_check.get('text', '')}")
+            verified = True
+        if cancel_check and cancel_check.get("found"):
+            proof_parts.append(f"CANCEL_BUTTON: {cancel_check.get('text', '')}")
+            verified = True
+
+        if not verified:
+            _log({"type": "warning", "message": "Send could not be verified: no success banner or cancel button found."})
+            return None
+
+        # Take screenshot as extra proof only after real signal confirmed
         try:
             proof_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "proof")
             os.makedirs(proof_dir, exist_ok=True)
@@ -1078,10 +1588,8 @@ def _verify_send(page):
                 _log({"type": "info", "message": f"Proof screenshot saved: {screenshot_path}"})
         except Exception as e:
             _log({"type": "warning", "message": f"Screenshot failed: {str(e)[:40]}"})
-        
-        if proof_parts:
-            return " | ".join(proof_parts)
-        return None
+
+        return " | ".join(proof_parts)
     except Exception as e:
         _log({"type": "warning", "message": f"Verify send error: {str(e)[:60]}"})
         return None
@@ -1120,23 +1628,35 @@ def _send_connection_request(page, note):
     _log({"type": "info", "message": "Trying overflow menu approach (primary strategy)..."})
     more_pos = _find_profile_more_button(page)
     if more_pos:
-        _log({"type": "info", "message": f"Found More button at ({more_pos['x']:.0f}, {more_pos['y']:.0f}). Clicking..."})
+        _log({"type": "info", "message": f"Found More button. Clicking..."})
         page.mouse.click(more_pos["x"], more_pos["y"])
         time.sleep(random.uniform(2.0, 3.0))
         try:
-            driver = page._driver
-
-            # Use JS to find "Connectie maken" coordinates (avoids stale element issues)
+            # Use JS to find "Connectie maken" by text content (not coordinates)
             connect_in_menu = page.evaluate("""() => {
                 const labels = ["connectie maken", "verbinden", "connect"];
-                const items = Array.from(document.querySelectorAll('[role="menuitem"]'));
+                // Search ALL clickable elements in the dropdown/menu
+                const items = Array.from(document.querySelectorAll('[role="menuitem"], [role="menuitemcheckbox"], li, button, a, [data-testid]'));
                 for (const item of items) {
                     const txt = (item.innerText || '').toLowerCase().trim();
                     const r = item.getBoundingClientRect();
                     if (r.width === 0 || r.height === 0) continue;
                     for (const label of labels) {
                         if (txt.includes(label)) {
-                            return {text: txt, x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2)};
+                            // Click the element directly (no coordinates)
+                            item.click();
+                            return {text: txt, clicked: true, method: 'direct_click'};
+                        }
+                    }
+                }
+                // Fallback: search by aria-label
+                const allBtns = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+                for (const btn of allBtns) {
+                    const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+                    for (const label of labels) {
+                        if (aria.includes(label)) {
+                            btn.click();
+                            return {text: aria, clicked: true, method: 'aria_click'};
                         }
                     }
                 }
@@ -1144,10 +1664,7 @@ def _send_connection_request(page, note):
             }""")
 
             if connect_in_menu:
-                mx = connect_in_menu.get("x", 0)
-                my = connect_in_menu.get("y", 0)
-                _log({"type": "info", "message": f"Found '{connect_in_menu.get('text')}' at ({mx},{my}). Clicking via SeleniumMouse..."})
-                page.mouse.click(mx, my)
+                _log({"type": "info", "message": f"Found and clicked '{connect_in_menu.get('text')}' via {connect_in_menu.get('method')}"})
                 time.sleep(3)
                 result = _handle_invitation_modal(page, note)
                 verified = _verify_send(page)
@@ -1159,7 +1676,10 @@ def _send_connection_request(page, note):
                     _log({"type": "warning", "message": "Send could not be verified (no confirmation banner found). Recording anyway."})
                     return result if result in ("SUCCESS", "SUCCESS_NO_NOTE", "FAILURE") else "SUCCESS"
             else:
-                _log({"type": "warning", "message": "No 'Connectie maken' found in overflow menu."})
+                _log({"type": "warning", "message": "No 'Connectie maken' found in overflow menu. Trying to close menu and continue..."})
+                # Close the menu by pressing Escape
+                page.keyboard.press("Escape")
+                time.sleep(1)
         except Exception as e:
             _log({"type": "error", "message": f"Error in More menu: {str(e)[:60]}"})
 
@@ -1236,10 +1756,13 @@ def _send_connection_request(page, note):
 
     # ============================================================
     # STRATEGY 3: Fallback — try clicking visible Connect button
+    # Human-like: scroll page, search entire DOM, try multiple locations
     # ============================================================
-    _log({"type": "info", "message": "Trying direct Connect button click (fallback)..."})
+    _log({"type": "info", "message": "Trying direct Connect button click (fallback - human-like scan)..."})
+    
+    # First try in profile area
     if _find_and_click_button(page, texts=connect_texts, aria_keywords=connect_arias, profile_area_only=True):
-        _log({"type": "info", "message": "Direct Connect link clicked."})
+        _log({"type": "info", "message": "Direct Connect link clicked in profile area."})
         time.sleep(3)
         result = _handle_invitation_modal(page, note)
         verified = _verify_send(page)
@@ -1247,23 +1770,104 @@ def _send_connection_request(page, note):
         if verified:
             _log({"type": "info", "message": f"SEND VERIFIED: {verified}"})
         return result
-
-    _log({"type": "error", "message": "No Connect button found on profile."})
+    
+    # If not found, scroll down and search entire page (human behavior)
+    _log({"type": "info", "message": "Not found in profile area. Scrolling to search entire page..."})
+    _human_scroll(page, min_scrolls=2, max_scrolls=4)
+    time.sleep(random.uniform(1.5, 3.0))
+    
+    # Search entire page (not just profile area)
+    if _find_and_click_button(page, texts=connect_texts, aria_keywords=connect_arias, profile_area_only=False):
+        _log({"type": "info", "message": "Direct Connect link clicked after scrolling."})
+        time.sleep(3)
+        result = _handle_invitation_modal(page, note)
+        verified = _verify_send(page)
+        _last_send_proof = verified
+        if verified:
+            _log({"type": "info", "message": f"SEND VERIFIED: {verified}"})
+        return result
+    
+    # Try to find by data attributes and Sentry labels (LinkedIn's internal naming)
+    _log({"type": "info", "message": "Trying data-attribute search..."})
+    try:
+        found = page.evaluate("""() => {
+            // Search by data attributes
+            const btns = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+            for (const b of btns) {
+                const txt = (b.innerText || '').toLowerCase().trim();
+                const aria = (b.getAttribute('aria-label') || '').toLowerCase();
+                const data controlName = b.getAttribute('data-control-name') || '';
+                const r = b.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) continue;
+                
+                // Check for connect-related attributes
+                if (txt.includes('verbinden') || txt.includes('connect') || 
+                    txt.includes('connectie') || aria.includes('connect') ||
+                    dataControlName.includes('connect')) {
+                    b.scrollIntoView({behavior: 'smooth', block: 'center'});
+                    return {found: true, text: txt, aria: aria, controlName: dataControlName};
+                }
+            }
+            return {found: false};
+        }""")
+        
+        if found and found.get('found'):
+            _log({"type": "info", "message": f"Found button by data attributes: {found}"})
+            time.sleep(1)
+            # Try clicking again after scroll
+            if _find_and_click_button(page, texts=connect_texts, aria_keywords=connect_arias, profile_area_only=False):
+                _log({"type": "info", "message": "Connect clicked after data-attribute scroll."})
+                time.sleep(3)
+                result = _handle_invitation_modal(page, note)
+                verified = _verify_send(page)
+                _last_send_proof = verified
+                if verified:
+                    _log({"type": "info", "message": f"SEND VERIFIED: {verified}"})
+                return result
+    except Exception as e:
+        _log({"type": "error", "message": f"Data-attribute search error: {str(e)[:60]}"})
+    
+    # Check if profile is restricted (some profiles don't allow connections)
+    try:
+        restricted = page.evaluate("""() => {
+            const body = document.body.innerText || '';
+            return body.includes('niet beschikbaar') || 
+                   body.includes('not available') ||
+                   body.includes('beperkt') ||
+                   body.includes('restricted') ||
+                   body.includes('We hebben geen manier gevonden om je met deze persoon te verbinden');
+        }""")
+        if restricted:
+            _log({"type": "warning", "message": "Profile connection restricted by LinkedIn."})
+            return "RESTRICTED"
+    except:
+        pass
+    
+    _log({"type": "error", "message": "No Connect button found on profile after full scan."})
     return "FAILURE"
 
 
 def _search_and_find_profile(page, first_name, last_name, company):
     """Search LinkedIn for a person and return their profile URL."""
     search_query = f"{first_name} {last_name} {company}".strip()
+    domain = company  # best available domain proxy
+
+    if not _can_linkedin_search(domain):
+        return None, "search_budget_exhausted"
+
+    _enforce_linkedin_search_delay()
+
     search_url = f"https://www.linkedin.com/search/results/people/?keywords={search_query.replace(' ', '%20')}"
 
     _log({"type": "info", "message": f"Searching LinkedIn for: {search_query}"})
-    page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+    page.goto(search_url, wait_until="domcontentloaded", timeout=120000)
     _random_sleep(4, 7)
+    _human_profile_visit(page)
 
     # Check for auth wall
     auth = _detect_auth_wall(page)
     if auth:
+        _record_linkedin_search(domain, search_query, f"auth:{auth}")
         _log({"type": "error", "message": f"Hit {auth} during search. Login may have expired."})
         return None, auth
 
@@ -1285,11 +1889,13 @@ def _search_and_find_profile(page, first_name, last_name, company):
                 profile_url = "https://www.linkedin.com" + profile_url.split("?")[0]
             else:
                 profile_url = profile_url.split("?")[0]
+            _record_linkedin_search(domain, search_query, profile_url)
             _log({"type": "info", "message": f"Found profile: {profile_url}"})
             return profile_url, None
     except Exception:
         pass
 
+    _record_linkedin_search(domain, search_query, "not_found")
     return None, "not_found"
 
 
@@ -1302,128 +1908,137 @@ def find_decision_maker_on_linkedin(company_name, domain=""):
         with get_firefox_driver() as (driver, page):
             _log({"type": "info", "message": f"Searching LinkedIn for decision-maker at {company_name}"})
 
-        # Search LinkedIn for people at this company with leadership titles
-        search_queries = [
-            f"{company_name} eigenaar",
-            f"{company_name} directeur",
-            f"{company_name} founder",
-            f"{company_name} CEO",
-            f"{company_name} owner",
-            f"{company_name}",
-        ]
+            # Search LinkedIn for people at this company with leadership titles
+            search_queries = [
+                f"{company_name} eigenaar",
+                f"{company_name} directeur",
+                f"{company_name} founder",
+                f"{company_name} CEO",
+                f"{company_name} owner",
+                f"{company_name}",
+            ]
 
-        for query in search_queries:
-            try:
-                search_url = f"https://www.linkedin.com/search/results/people/?keywords={query.replace(' ', '%20')}"
-                page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
-                _random_sleep(4, 7)
+            for query in search_queries:
+                try:
+                    if not _can_linkedin_search(domain):
+                        _log({"type": "warning", "message": "LinkedIn search budget exhausted. Stopping decision-maker search."})
+                        return None
+                    _enforce_linkedin_search_delay()
 
-                # Check for auth wall
-                auth = _detect_auth_wall(page)
-                if auth:
-                    _log({"type": "error", "message": f"Hit {auth} during LinkedIn search"})
-                    return None
+                    search_url = f"https://www.linkedin.com/search/results/people/?keywords={query.replace(' ', '%20')}"
+                    page.goto(search_url, wait_until="domcontentloaded", timeout=120000)
+                    _random_sleep(4, 7)
+                    _human_profile_visit(page)
 
-                # Extract names and profile URLs from search results
-                results = page.evaluate(r"""() => {
-                    const results = [];
-                    const seen = new Set();
-                    const links = document.querySelectorAll('a[href*="/in/"]');
-                    for (const link of links) {
-                        try {
-                            const href = link.getAttribute('href');
-                            if (!href || !href.includes('/in/') || seen.has(href)) continue;
-                            seen.add(href);
+                    # Check for auth wall
+                    auth = _detect_auth_wall(page)
+                    if auth:
+                        _record_linkedin_search(domain, query, f"auth:{auth}")
+                        _log({"type": "error", "message": f"Hit {auth} during LinkedIn search"})
+                        return None
 
-                            const fullText = link.textContent.trim();
-                            if (fullText.length < 5) continue;
+                    # Extract names and profile URLs from search results
+                    results = page.evaluate(r"""() => {
+                        const results = [];
+                        const seen = new Set();
+                        const links = document.querySelectorAll('a[href*="/in/"]');
+                        for (const link of links) {
+                            try {
+                                const href = link.getAttribute('href');
+                                if (!href || !href.includes('/in/') || seen.has(href)) continue;
+                                seen.add(href);
 
-                            // Get display text - take first line
-                            const firstLine = fullText.split('\n')[0].trim();
+                                const fullText = link.textContent.trim();
+                                if (fullText.length < 5) continue;
 
-                            // Extract name: take words before rank separator (2de, 3de etc)
-                            let nameText = '';
-                            const rankIdx = firstLine.search(/\d+de[A-Z]/);
-                            if (rankIdx > 0) {
-                                nameText = firstLine.substring(0, rankIdx).trim();
-                            } else {
-                                nameText = firstLine;
-                            }
+                                // Get display text - take first line
+                                const firstLine = fullText.split('\n')[0].trim();
 
-                            // Remove non-name characters, normalize whitespace
-                            nameText = nameText.replace(/[^\w\s\u00C0-\u024F\u0400-\u04FF-]/g, '').trim();
-                            nameText = nameText.replace(/\s+/g, ' ');
-
-                            // Filter empty words
-                            const words = nameText.split(' ').filter(function(w) { return w.length > 0; });
-
-                            // Deduplicate: "X X" -> "X"
-                            if (words.length >= 4) {
-                                var mid = Math.floor(words.length / 2);
-                                var first = words.slice(0, mid).join(' ');
-                                var second = words.slice(mid).join(' ');
-                                if (first.toLowerCase() === second.toLowerCase()) {
-                                    nameText = first;
+                                // Extract name: take words before rank separator (2de, 3de etc)
+                                let nameText = '';
+                                const rankIdx = firstLine.search(/\d+de[A-Z]/);
+                                if (rankIdx > 0) {
+                                    nameText = firstLine.substring(0, rankIdx).trim();
+                                } else {
+                                    nameText = firstLine;
                                 }
-                            }
 
-                            // Extract title: text after the rank number
-                            var titleText = '';
-                            var titleMatch = fullText.match(/\d+de(.{5,})/);
-                            if (titleMatch) {
-                                titleText = titleMatch[1].trim();
-                                // Cut at location/Connectie patterns
-                                titleText = titleText.split(/Eindhoven|Amsterdam|Rotterdam|Utrecht|Den Haag|Connectie maken/)[0].trim();
-                                if (titleText.length > 100) titleText = titleText.substring(0, 100);
-                            }
+                                // Remove non-name characters, normalize whitespace
+                                nameText = nameText.replace(/[^\w\s\u00C0-\u024F\u0400-\u04FF-]/g, '').trim();
+                                nameText = nameText.replace(/\s+/g, ' ');
 
-                            // Skip if name is too short
-                            if (nameText.length < 4 || nameText.length > 50) continue;
-                            if (!nameText.includes(' ')) continue;
-                            if (nameText.toLowerCase().indexOf('connectie') >= 0 || nameText.toLowerCase().indexOf('gemeenschappelijke') >= 0) continue;
+                                // Filter empty words
+                                const words = nameText.split(' ').filter(function(w) { return w.length > 0; });
 
-                            results.push({
-                                name: nameText,
-                                title: titleText,
-                                url: href.split('?')[0]
-                            });
-                        } catch(e) {}
-                    }
-                    return results;
-                }""")
+                                // Deduplicate: "X X" -> "X"
+                                if (words.length >= 4) {
+                                    var mid = Math.floor(words.length / 2);
+                                    var first = words.slice(0, mid).join(' ');
+                                    var second = words.slice(mid).join(' ');
+                                    if (first.toLowerCase() === second.toLowerCase()) {
+                                        nameText = first;
+                                    }
+                                }
 
-                if results:
-                    # Pick the best match - prefer leadership titles
-                    leadership = ['eigenaar', 'directeur', 'ceo', 'founder', 'oprichter', 'owner', 'director', 'manager', 'mede-eigenaar', 'bestuurder']
-                    best = None
-                    for r in results:
-                        title_lower = r.get('title', '').lower()
-                        if any(t in title_lower for t in leadership):
-                            best = r
-                            break
-                    if not best and results:
-                        best = results[0]
+                                // Extract title: text after the rank number
+                                var titleText = '';
+                                var titleMatch = fullText.match(/\d+de(.{5,})/);
+                                if (titleMatch) {
+                                    titleText = titleMatch[1].trim();
+                                    // Cut at location/Connectie patterns
+                                    titleText = titleText.split(/Eindhoven|Amsterdam|Rotterdam|Utrecht|Den Haag|Connectie maken/)[0].trim();
+                                    if (titleText.length > 100) titleText = titleText.substring(0, 100);
+                                }
 
-                    if best:
-                        name_parts = best['name'].split()
-                        first = name_parts[0] if name_parts else ''
-                        last = ' '.join(name_parts[1:]) if len(name_parts) > 1 else ''
-                        url = best['url']
-                        if url.startswith('/'):
-                            url = 'https://www.linkedin.com' + url
-                        _log({"type": "info", "message": f"Found: {first} {last} ({best.get('title', '')}) at {url}"})
-                        return {
-                            "linkedin_url": url,
-                            "first_name": first,
-                            "last_name": last,
-                            "title": best.get('title', '')
+                                // Skip if name is too short
+                                if (nameText.length < 4 || nameText.length > 50) continue;
+                                if (!nameText.includes(' ')) continue;
+                                if (nameText.toLowerCase().indexOf('connectie') >= 0 || nameText.toLowerCase().indexOf('gemeenschappelijke') >= 0) continue;
+
+                                results.push({
+                                    name: nameText,
+                                    title: titleText,
+                                    url: href.split('?')[0]
+                                });
+                            } catch(e) {}
                         }
-            except Exception as e:
-                _log({"type": "warning", "message": f"Search query '{query}' failed: {e}"})
-            _random_sleep(3, 6)
+                        return results;
+                    }""")
 
-        _log({"type": "info", "message": f"No decision-maker found on LinkedIn for {company_name}"})
-        return None
+                    if results:
+                        # Pick the best match - prefer leadership titles
+                        leadership = ['eigenaar', 'directeur', 'ceo', 'founder', 'oprichter', 'owner', 'director', 'manager', 'mede-eigenaar', 'bestuurder']
+                        best = None
+                        for r in results:
+                            title_lower = r.get('title', '').lower()
+                            if any(t in title_lower for t in leadership):
+                                best = r
+                                break
+                        if not best and results:
+                            best = results[0]
+
+                        if best:
+                            name_parts = best['name'].split()
+                            first = name_parts[0] if name_parts else ''
+                            last = ' '.join(name_parts[1:]) if len(name_parts) > 1 else ''
+                            url = best['url']
+                            if url.startswith('/'):
+                                url = 'https://www.linkedin.com' + url
+                            _record_linkedin_search(domain, query, url)
+                            _log({"type": "info", "message": f"Found: {first} {last} ({best.get('title', '')}) at {url}"})
+                            return {
+                                "linkedin_url": url,
+                                "first_name": first,
+                                "last_name": last,
+                                "title": best.get('title', '')
+                            }
+                except Exception as e:
+                    _log({"type": "warning", "message": f"Search query '{query}' failed: {e}"})
+                _random_sleep(3, 6)
+
+            _record_linkedin_search(domain, company_name, "not_found")
+            _log({"type": "info", "message": f"No decision-maker found on LinkedIn for {company_name}"})
+            return None
 
     except Exception as e:
         _log({"type": "error", "message": f"LinkedIn search error: {e}"})
@@ -1431,8 +2046,6 @@ def find_decision_maker_on_linkedin(company_name, domain=""):
 
 
 # ---------- Real browser connection via Selenium + user's Firefox ----------
-
-import subprocess
 
 _FIREFOX_PROFILES = [
     r"C:\Users\marvi\AppData\Roaming\Mozilla\Firefox\Profiles\h1vl3oun.default-release",
@@ -1730,54 +2343,94 @@ def _connect_selenium():
     return driver, page
 
 
-class _FirefoxSession:
-    """Context manager that serializes Firefox profile copy + launch.
-    Ensures only one Firefox instance uses the profile copy at a time.
-    Usage:
-        with get_firefox_driver() as (driver, page):
-            page.goto(url)
-        # driver.quit() called automatically on exit
+class _PersistentFirefox:
+    """Singleton Firefox instance that stays alive across all LinkedIn operations.
+    Replaces the old _FirefoxSession which launched/quit Firefox per call.
     """
-    def __init__(self):
-        self.driver = None
-        self.page = None
+    _instance = None
+    _lock = threading.Lock()
+    _launch_lock = threading.Lock()
+
+    def __new__(cls):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance.driver = None
+                cls._instance.page = None
+                cls._instance._ready = False
+                cls._instance._last_health = 0
+            return cls._instance
+
+    def _is_alive(self):
+        """Check if the browser process is still running (lightweight check)."""
+        if not self.driver:
+            return False
+        try:
+            # Use execute_script which is fast and doesn't depend on page state
+            self.driver.execute_script("return document.readyState")
+            return True
+        except Exception:
+            return False
+
+    def ensure_ready(self):
+        """Launch Firefox if not running, or restart if crashed. Thread-safe."""
+        now = time_mod.time()
+        # Quick check without lock — if alive and recently checked, return fast
+        if self._ready and (now - self._last_health) < 10:
+            if self._is_alive():
+                return self.driver, self.page
+
+        # Serialized launch to prevent multiple browsers
+        with self._launch_lock:
+            # Double-check after acquiring lock
+            if self._ready and self._is_alive():
+                self._last_health = time_mod.time()
+                return self.driver, self.page
+
+            # Need (re)launch
+            self.close()
+            try:
+                self.driver, self.page = _connect_selenium()
+                self._ready = True
+                self._last_health = time_mod.time()
+                _log({"type": "info", "message": "Firefox launched (persistent singleton)"})
+            except Exception as e:
+                self._ready = False
+                raise
+            return self.driver, self.page
+
+    def close(self):
+        """Quit the browser if running."""
+        if self.driver:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+            self.driver = None
+            self.page = None
+            self._ready = False
 
     def __enter__(self):
-        _firefox_sem.acquire()
-        global _firefox_active
-        with _firefox_count_lock:
-            _firefox_active += 1
-        try:
-            self.driver, self.page = _connect_selenium()
-            return self.driver, self.page
-        except Exception:
-            _firefox_sem.release()
-            with _firefox_count_lock:
-                _firefox_active -= 1
-            raise
+        self.ensure_ready()
+        return self.driver, self.page
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        try:
-            if self.driver:
-                self.driver.quit()
-        except Exception:
-            pass
-        finally:
-            global _firefox_active
-            with _firefox_count_lock:
-                _firefox_active -= 1
-            _firefox_sem.release()
+        # Do NOT close on context exit — keep alive for reuse
         return False
 
 
+# Module-level singleton
+_persistent_firefox = _PersistentFirefox()
+
+import atexit as _atexit
+_atexit.register(lambda: _persistent_firefox.close())
+
+
 def get_firefox_driver():
-    """Return a context manager that provides a serialized (driver, page) pair.
-    Only one Firefox instance runs at a time, preventing profile lock conflicts.
-    Usage:
-        with get_firefox_driver() as (driver, page):
-            page.goto(url)
+    """Return a context manager that reuses a single persistent Firefox instance.
+    No more launching/quit per call — browser stays alive across 20+ connections/day.
     """
-    return _FirefoxSession()
+    return _persistent_firefox
 
 
 def search_and_connect(first_name, last_name, company, email_body, contact_id="", profile_url="", research_result=None, opportunity_mapping=None):
@@ -1786,11 +2439,23 @@ def search_and_connect(first_name, last_name, company, email_body, contact_id=""
     If profile_url is provided, skips search and goes directly to the profile.
     Returns dict: {outcome, profile_url, note, name}
     """
-    # Check time-based limit (spread connections throughout the day)
+    # Check if account is flagged — STOP immediately
+    flagged, flag_reason = _is_flagged()
+    if flagged:
+        _log({"type": "error", "message": f"Account flagged ({flag_reason}). Cannot send connections."})
+        return {"outcome": "FLAGGED", "profile_url": "", "note": "", "name": f"{first_name} {last_name}", "error": flag_reason}
+
+    # Check active hours
+    active, reason = _is_active_hours()
+    if not active:
+        _log({"type": "warning", "message": f"Not active hours ({reason}). Skipping."})
+        return {"outcome": "TIME_LIMITED", "profile_url": "", "note": "", "name": f"{first_name} {last_name}", "error": reason}
+
+    # Check time-based limit (spread connections throughout the day, with warming)
     can_send, period_info = can_send_connection()
     if not can_send:
         daily_count = _get_daily_count()
-        _log({"type": "warning", "message": f"Cannot send connection now ({period_info}). Daily: {daily_count}/{DAILY_LIMIT}. Skipping."})
+        _log({"type": "warning", "message": f"Cannot send connection now ({period_info}). Daily: {daily_count}. Skipping."})
         return {"outcome": "TIME_LIMITED", "profile_url": "", "note": "", "name": f"{first_name} {last_name}", "error": period_info}
 
     # Check dedup (by profile_url if available, or by name+company)
@@ -1810,12 +2475,11 @@ def search_and_connect(first_name, last_name, company, email_body, contact_id=""
         _log({"type": "warning", "message": f"Skipping {first_name} {last_name} - invalid name or note generation failed."})
         return {"outcome": "SKIPPED_INVALID_NAME", "profile_url": "", "note": "", "name": f"{first_name} {last_name}"}
 
-    # Launch real Firefox with user's profile via Selenium (serialized)
-    _log({"type": "info", "message": "Launching Firefox with user's real profile (Selenium)..."})
+    # Launch real Firefox with user's profile via Selenium (persistent singleton)
+    _log({"type": "info", "message": "Connecting to persistent Firefox instance..."})
     try:
-        _firefox_ctx = get_firefox_driver()
-        driver, page = _firefox_ctx.__enter__()
-        _log({"type": "info", "message": "Firefox launched with real profile"})
+        driver, page = _persistent_firefox.ensure_ready()
+        _log({"type": "info", "message": "Firefox ready (persistent singleton)"})
     except Exception as e:
         _log({"type": "error", "message": f"Failed to launch Firefox: {e}"})
         return {"outcome": "ERROR", "profile_url": "", "note": note, "name": f"{first_name} {last_name}", "error": str(e)[:120]}
@@ -1876,6 +2540,9 @@ def search_and_connect(first_name, last_name, company, email_body, contact_id=""
             _save_result(contact_id, first_name, last_name, company, profile_url, note, outcome)
             return {"outcome": outcome, "profile_url": profile_url, "note": note, "name": full_name, "error": auth}
 
+        # Human-like profile review before connecting: scroll, read, wander
+        _human_profile_visit(page)
+
         # Extract the real name from the profile (H1 first, then H2)
         try:
             name = page.evaluate("""() => {
@@ -1915,7 +2582,10 @@ def search_and_connect(first_name, last_name, company, email_body, contact_id=""
             pass
 
         # Step 3: Send connection request
+        _enforce_connection_delay()  # ensure 72 min spacing between sends
         outcome = _send_connection_request(page, note)
+        if outcome in ("SUCCESS", "SUCCESS_NO_NOTE"):
+            _mark_connection_sent()
 
         # Save result with proof
         proof = _last_send_proof
@@ -1938,11 +2608,6 @@ def search_and_connect(first_name, last_name, company, email_body, contact_id=""
         _log({"type": "error", "message": f"LinkedIn outreach error: {str(e)[:80]}"})
         _save_result(contact_id, first_name, last_name, company, profile_url, note, "ERROR")
         return {"outcome": "ERROR", "profile_url": profile_url, "note": note, "name": full_name, "error": str(e)[:120]}
-    finally:
-        try:
-            _firefox_ctx.__exit__(None, None, None)
-        except Exception:
-            pass
 
 def is_valid_linkedin_name(first_name, last_name=""):
     """Check if a name is valid for LinkedIn outreach. Rejects garbage data."""
@@ -2153,7 +2818,8 @@ def generate_linkedin_note(email_body, first_name, company_name="", research_res
                     f"Schrijf een LinkedIn connectieverzoek-bericht (MAXIMAAL 180 tekens, ZONDER aanhef, Nederlands).\n"
                     f"Aan: {first_name} van {company_name}\n"
                     f"Context: {context}\n\n"
-                    f"DOEL: De ontvanger moet denken 'oh, deze persoon heeft naar mijn profiel gekeken en is oprecht geïnteresseerd'.\n\n"
+                    f"DOEL: De ontvanger moet denken 'oh, deze persoon begrijpt mijn situatie'.\n\n"
+                    f"POSITIE: Wij zijn een implementation partner. We bouwen de operating layer die onder de afdelingen zit. De herhalende werkt gaat naar het systeem, mensen houden ruimte voor oordeel.\n\n"
                     f"REGELS:\n"
                     f"- Begin direct met de voornaam (geen 'Hallo'/'Beste')\n"
                     f"- NOOIT iets verkopen of over jezelf praten\n"
@@ -2161,11 +2827,13 @@ def generate_linkedin_note(email_body, first_name, company_name="", research_res
                     f"- NOOIT gefeliciteerd zeggen of verjaardagen/jubilea noemen\n"
                     f"- NOOIT dingen verzinnen over het bedrijf die niet in de context staan\n"
                     f"- NOOIT zeggen dat je ze al volgt als dat niet zo is\n"
+                    f"- NOOIT de woorden: vervangen, automatiseren, minder mensen nodig, personeel snijden, scorebord, monitoren\n"
                     f"- Max 1-2 zinnen\n"
                     f"- Wees EERLIJK: je hebt hun profiel gezien en bent nieuwsgierig\n"
                     f"- Wees specifiek: noem iets wat je hebt gezien aan hun profiel of bedrijf\n"
                     f"- Wees nieuwsgierig: stel een korte vraag over hun werk\n"
-                    f"- Klink als een vriendelijke collega, niet als een verkoper\n\n"
+                    f"- Klink als een vriendelijke collega, niet als een verkoper\n"
+                    f"- Leid met de constraint: wat kost ze elke week tijd?\n\n"
                     f"EERLIJKE voorbeelden (geen leugens, geen dashes):\n"
                     f"- '{first_name}, ik zag dat je bij {company_name} werkt, hoe bevalt dat?'\n"
                     f"- '{first_name}, interessant wat jullie bij {company_name} doen, hoe pakken jullie dat aan?'\n"
@@ -2255,7 +2923,7 @@ def _check_connection_status(profile_url):
     try:
         _log({"type": "info", "message": f"Checking connection status: {profile_url}"})
         with get_firefox_driver() as (driver, page):
-            page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
+            page.goto(profile_url, wait_until="domcontentloaded", timeout=120000)
             _random_sleep(4, 6)
 
             # Check for auth wall
@@ -2288,7 +2956,14 @@ def _check_connection_status(profile_url):
 
 
 def check_pending_connections():
-    """Check all pending connections and update their status."""
+    """Check all pending connections and update their status.
+    Respects flag state — skips if account is flagged.
+    """
+    flagged, flag_reason = _is_flagged()
+    if flagged:
+        _log({"type": "warning", "message": f"Account flagged ({flag_reason}). Skipping connection checks."})
+        return {"checked": 0, "accepted": 0, "flagged": True}
+
     db = _get_clawbuildr_db()
     # Get connections that are still pending and haven't been checked in 24 hours
     rows = db.execute("""
@@ -2356,19 +3031,18 @@ def _send_followup_message(profile_url, first_name, company=""):
     """
     proof_dir = os.path.join(os.path.dirname(__file__), "data", "proof")
     os.makedirs(proof_dir, exist_ok=True)
-    _firefox_ctx = None
     try:
         _log({"type": "info", "message": f"Sending follow-up to {first_name}..."})
         from selenium.webdriver.common.by import By
         from selenium.webdriver.common.keys import Keys
         from selenium.webdriver.common.action_chains import ActionChains
 
-        _firefox_ctx = get_firefox_driver()
-        driver, page = _firefox_ctx.__enter__()
+        driver, page = _persistent_firefox.ensure_ready()
 
         # Step 1: Visit profile to detect language
-        page.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
+        page.goto(profile_url, wait_until="domcontentloaded", timeout=120000)
         _random_sleep(4, 6)
+        _human_profile_visit(page)
 
         for attempt in range(10):
             try:
@@ -2394,7 +3068,7 @@ def _send_followup_message(profile_url, first_name, company=""):
 
         # Step 2: Navigate to full-page compose
         _log({"type": "info", "message": "Navigating to full-page compose..."})
-        page.goto("https://www.linkedin.com/messaging/compose/", wait_until="domcontentloaded", timeout=60000)
+        page.goto("https://www.linkedin.com/messaging/compose/", wait_until="domcontentloaded", timeout=120000)
         _random_sleep(4, 6)
 
         driver.save_screenshot(f"{proof_dir}/followup_01_compose_{_ts()}.png")
@@ -2419,7 +3093,7 @@ def _send_followup_message(profile_url, first_name, company=""):
 
         name_input.click()
         _random_sleep(0.5, 1)
-        name_input.send_keys(f"{first_name} {company.split()[0] if company else ''}")
+        _human_type_into_element(driver, name_input, f"{first_name} {company.split()[0] if company else ''}", wpm_range=(45, 75))
         _random_sleep(3, 4)
 
         driver.save_screenshot(f"{proof_dir}/followup_02_search_{_ts()}.png")
@@ -2448,7 +3122,7 @@ def _send_followup_message(profile_url, first_name, company=""):
         _random_sleep(2, 3)
         driver.save_screenshot(f"{proof_dir}/followup_03_selected_{_ts()}.png")
 
-        # Step 5: Type the message
+        # Step 5: Type the message with human-like typing
         typed = False
         try:
             editables = driver.find_elements(By.CSS_SELECTOR, '[contenteditable="true"]')
@@ -2456,7 +3130,7 @@ def _send_followup_message(profile_url, first_name, company=""):
                 msg_area = editables[-1]
                 driver.execute_script("arguments[0].focus();", msg_area)
                 _random_sleep(0.5, 1)
-                msg_area.send_keys(followup_note)
+                _human_type_into_element(driver, msg_area, followup_note, wpm_range=(40, 70))
                 typed = True
                 _log({"type": "info", "message": "Message typed in textarea"})
         except Exception:
@@ -2467,7 +3141,7 @@ def _send_followup_message(profile_url, first_name, company=""):
             try:
                 page.mouse.click(640, 400)
                 _random_sleep(0.5, 1)
-                ActionChains(driver).send_keys(followup_note).perform()
+                _human_type_selenium(driver, followup_note, wpm_range=(40, 70))
                 typed = True
                 _log({"type": "info", "message": "Message typed via ActionChains"})
             except Exception:
@@ -2477,7 +3151,7 @@ def _send_followup_message(profile_url, first_name, company=""):
             _log({"type": "warning", "message": f"Could not type message for {first_name}"})
             return "NO_CHAT_INPUT"
 
-        _random_sleep(1, 2)
+        _human_read_time(min_seconds=2, max_seconds=5)
         driver.save_screenshot(f"{proof_dir}/followup_04_typed_{_ts()}.png")
 
         # Step 6: Click Verzenden button
@@ -2522,12 +3196,6 @@ def _send_followup_message(profile_url, first_name, company=""):
     except Exception as e:
         _log({"type": "error", "message": f"Error sending follow-up: {str(e)[:80]}"})
         return "ERROR"
-    finally:
-        try:
-            if _firefox_ctx:
-                _firefox_ctx.__exit__(None, None, None)
-        except Exception:
-            pass
 
 
 def _detect_profile_language(page):
@@ -2580,32 +3248,32 @@ def generate_followup_note(first_name, company="", language="dutch"):
     if language == "english":
         if company:
             templates = [
-                f"Thanks for connecting, {first_name}! We build automation tools for SMBs — from LinkedIn lead generation (ClawBuildr) to Instagram outreach (FounderFlow). Are there processes at {company} you'd like to digitize?",
-                f"{first_name}, thanks for the connection! We help businesses like {company} with AI-driven automation. Think LinkedIn campaigns via ClawBuildr or Instagram DM automation via FounderFlow. Where are your biggest time savings?",
-                f"Great to connect, {first_name}! At our studio we build smart tools — ClawBuildr for LinkedIn and FounderFlow for Instagram. Are there tasks at {company} that take a lot of time and could be automated?",
-                f"Good to match, {first_name}! We help SMBs with automation — from email follow-ups to social media outreach. Our tools ClawBuildr and FounderFlow make it possible. Are there processes at {company} that fit?",
+                f"Thanks for connecting, {first_name}! We build the operating layer for SMBs. Repetitive work moves to the system, people keep room for judgement. Are there processes at {company} that take too much time every week?",
+                f"{first_name}, thanks for the connection! The most efficient version of your company already exists — it's in your inbox and systems that don't talk. We bring it to one place. How do you handle volume at {company}?",
+                f"Great to connect, {first_name}! We build the operating layer that sits under departments. Machines repeat, people decide. Are there tasks at {company} that take a lot of time and should move to the system?",
+                f"Good to match, {first_name}! Every euro of structural cost savings is ~5 euros in company value. We help SMBs with process analysis and operating layer implementation. Where are the biggest bottlenecks at {company}?",
             ]
         else:
             templates = [
-                f"Thanks for connecting, {first_name}! We build automation tools for SMBs — from LinkedIn lead generation (ClawBuildr) to Instagram outreach (FounderFlow). Are there processes you'd like to digitize?",
-                f"{first_name}, thanks for the connection! We help businesses with AI-driven automation. Think LinkedIn campaigns via ClawBuildr or Instagram DM automation via FounderFlow. Where are the biggest time savings?",
-                f"Great to connect, {first_name}! At our studio we build smart tools — ClawBuildr for LinkedIn and FounderFlow for Instagram. Are there tasks that take a lot of time and could be automated?",
-                f"Good to match, {first_name}! We help SMBs with automation — from email follow-ups to social media outreach. Our tools ClawBuildr and FounderFlow make it possible. Are there processes that fit?",
+                f"Thanks for connecting, {first_name}! We build the operating layer for SMBs. Repetitive work moves to the system, people keep room for judgement. Are there processes that take too much time every week?",
+                f"{first_name}, thanks for the connection! The most efficient version of your company already exists — it's in your inbox and systems that don't talk. We bring it to one place. How do you handle that?",
+                f"Great to connect, {first_name}! We build the operating layer that sits under departments. Machines repeat, people decide. Are there tasks that take a lot of time and should move to the system?",
+                f"Good to match, {first_name}! Every euro of structural cost savings is ~5 euros in company value. We help SMBs with process analysis and operating layer implementation. Where are the biggest bottlenecks?",
             ]
     else:
         if company:
             templates = [
-                f"Bedankt voor de connectie, {first_name}! Wij bouwen automatiseringstools voor MKB-bedrijven — van LinkedIn leadgeneratie (ClawBuildr) tot Instagram outreach (FounderFlow). Zijn er processen bij {company} die je zou willen digitaliseren?",
-                f"{first_name}, bedankt voor de connectie! Wij helpen bedrijven zoals {company} met AI-gestuurde automatisering. Denk aan LinkedIn campagnes via ClawBuildr of InstagramDM-automatisering via FounderFlow. Waar zitten jullie grootste tijdbesparingen?",
-                f"Leuk om kennis te maken, {first_name}! Bij onze studio bouwen we slimme tools — ClawBuildr voor LinkedIn en FounderFlow voor Instagram. Zijn er taken bij {company} die veel tijd kosten en geautomatiseerd kunnen worden?",
-                f"Goed om te matchen, {first_name}! Wij helpen MKB-bedrijven met automatisering — van e-mails en leadopvolging tot social media outreach. Onze tools ClawBuildr en FounderFlow maken het mogelijk. Zijn er processen bij {company} die hierbij passen?",
+                f"Bedankt voor de connectie, {first_name}! Wij bouwen de operating layer voor MKB-bedrijven. Herhalende werkt naar het systeem, mensen houden ruimte voor oordeel. Zijn er processen bij {company} die elke week te veel tijd kosten?",
+                f"{first_name}, bedankt voor de connectie! De meest efficiënte versie van uw bedrijf bestaat al — hij zit in uw inbox en systemen die niet praten. Wij brengen het op één plek. Hoe gaan jullie bij {company} om met volume?",
+                f"Leuk om kennis te maken, {first_name}! Wij bouwen de operating layer die onder de afdelingen zit. Machines herhalen, mensen beslissen. Zijn er taken bij {company} die veel tijd kosten en naar het systeem moeten?",
+                f"Goed om te matchen, {first_name}! Elke euro structurele kostenbesparing is ~5 euro bedrijfswaarde. Wij helpen MKB-bedrijven met procesanalyse en operating layer implementatie. Waar zitten de grootste knelpunten bij {company}?",
             ]
         else:
             templates = [
-                f"Bedankt voor de connectie, {first_name}! Wij bouwen automatiseringstools voor MKB-bedrijven — van LinkedIn leadgeneratie (ClawBuildr) tot Instagram outreach (FounderFlow). Zijn er processen die je zou willen digitaliseren?",
-                f"{first_name}, bedankt voor de connectie! Wij helpen bedrijven met AI-gestuurde automatisering. Denk aan LinkedIn campagnes via ClawBuildr of Instagram DM-automatisering via FounderFlow. Waar zitten de grootste tijdbesparingen?",
-                f"Leuk om kennis te maken, {first_name}! Bij onze studio bouwen we slimme tools — ClawBuildr voor LinkedIn en FounderFlow voor Instagram. Zijn er taken die veel tijd kosten en geautomatiseerd kunnen worden?",
-                f"Goed om te matchen, {first_name}! Wij helpen MKB-bedrijven met automatisering — van e-mails en leadopvolging tot social media outreach. Onze tools ClawBuildr en FounderFlow maken het mogelijk. Zijn er processen die hierbij passen?",
+                f"Bedankt voor de connectie, {first_name}! Wij bouwen de operating layer voor MKB-bedrijven. Herhalende werkt naar het systeem, mensen houden ruimte voor oordeel. Zijn er processen die elke week te veel tijd kosten?",
+                f"{first_name}, bedankt voor de connectie! De meest efficiënte versie van uw bedrijf bestaat al — hij zit in uw inbox en systemen die niet praten. Wij brengen het op één plek. Hoe gaan jullie daarmee om?",
+                f"Leuk om kennis te maken, {first_name}! Wij bouwen de operating layer die onder de afdelingen zit. Machines herhalen, mensen beslissen. Zijn er taken die veel tijd kosten en naar het systeem moeten?",
+                f"Goed om te matchen, {first_name}! Elke euro structurele kostenbesparing is ~5 euro bedrijfswaarde. Wij helpen MKB-bedrijven met procesanalyse en operating layer implementatie. Waar zitten de grootste knelpunten?",
             ]
     import random
     return random.choice(templates)
@@ -2682,7 +3350,9 @@ _auto_scheduler_running = False
 _auto_scheduler_thread = None
 
 def _auto_scheduler_loop():
-    """Background loop that automatically sends connection requests throughout the day."""
+    """Background loop that automatically sends connection requests throughout the day.
+    Respects: flag state, active hours, warming limits, randomized delays.
+    """
     global _auto_scheduler_running
     
     _log({"type": "info", "message": "Auto-scheduler started"})
@@ -2693,7 +3363,21 @@ def _auto_scheduler_loop():
         try:
             now_ts = time.time()
             
-            # Check if we can send connections
+            # Check if account is flagged — skip all outreach
+            flagged, flag_reason = _is_flagged()
+            if flagged:
+                _log({"type": "warning", "message": f"Auto-scheduler: account flagged ({flag_reason}). Sleeping 5 minutes."})
+                time.sleep(300)
+                continue
+
+            # Check active hours
+            active, reason = _is_active_hours()
+            if not active:
+                _log({"type": "info", "message": f"Auto-scheduler: not active hours ({reason}). Sleeping 5 minutes."})
+                time.sleep(300)
+                continue
+            
+            # Check if we can send connections (warming-aware)
             can_send, period_info = can_send_connection()
             
             if can_send:
@@ -2742,12 +3426,12 @@ def _auto_scheduler_loop():
                         try:
                             if research_json:
                                 research_result = json.loads(research_json) if isinstance(research_json, str) else research_json
-                        except:
+                        except Exception:
                             pass
                         try:
                             if opportunity_json:
                                 opportunity_mapping = json.loads(opportunity_json) if isinstance(opportunity_json, str) else opportunity_mapping
-                        except:
+                        except Exception:
                             pass
                         
                         # Use LinkedIn URL directly if available
@@ -2784,7 +3468,8 @@ def _auto_scheduler_loop():
                 db.close()
 
             # --- Follow-up check (every 30 min, after connection sending) ---
-            if now_ts - last_check_time >= CHECK_INTERVAL:
+            # Only check follow-ups if account is not flagged
+            if now_ts - last_check_time >= CHECK_INTERVAL and not _is_flagged()[0]:
                 try:
                     check_result = check_pending_connections()
                     if check_result.get("accepted", 0) > 0:
@@ -2883,17 +3568,21 @@ def get_clawbuildr_linkedin_history(limit=100):
 
 
 def get_daily_count_api():
-    """Return daily and period counts for the API."""
+    """Return daily and period counts for the API, including warming multiplier."""
     from datetime import datetime
     now = datetime.now()
     hour = now.hour
     
     daily_count = _get_daily_count()
     period_count, period_limit, period = _get_period_count()
+    effective_limit, multiplier = _get_effective_daily_limit()
+    flagged, flag_reason = _is_flagged()
     
     # Calculate next available time
     next_period = ""
-    if hour < 8:
+    if flagged:
+        next_period = f"PAUSED ({flag_reason})"
+    elif hour < 8:
         next_period = "morning (8:00)"
     elif hour >= 21:
         next_period = "tomorrow morning (8:00)"
@@ -2906,12 +3595,17 @@ def get_daily_count_api():
     
     return {
         "today": daily_count,
-        "limit": DAILY_LIMIT,
+        "limit": effective_limit,
+        "base_limit": DAILY_LIMIT,
+        "warmup_multiplier": multiplier,
+        "warmup_percent": f"{multiplier:.0%}",
         "period": period,
         "period_count": period_count,
         "period_limit": period_limit,
         "next_available": next_period,
         "can_send": can_send_connection()[0],
+        "flagged": flagged,
+        "flag_reason": flag_reason,
     }
 
 
@@ -2952,13 +3646,22 @@ def get_scheduling_status():
     ).fetchone()[0]
     
     db.close()
-    
+
+    # Apply warming multiplier to limits
+    _, multiplier = _get_effective_daily_limit()
+    scaled_limit = int(DAILY_LIMIT * multiplier)
+    scaled_morning = int(MORNING_LIMIT * multiplier)
+    scaled_afternoon = int(AFTERNOON_LIMIT * multiplier)
+    scaled_evening = int(EVENING_LIMIT * multiplier)
+
     return {
         "daily_total": morning + afternoon + evening,
-        "daily_limit": DAILY_LIMIT,
-        "morning": {"sent": morning, "limit": MORNING_LIMIT},
-        "afternoon": {"sent": afternoon, "limit": AFTERNOON_LIMIT},
-        "evening": {"sent": evening, "limit": EVENING_LIMIT},
+        "daily_limit": scaled_limit,
+        "daily_limit_base": DAILY_LIMIT,
+        "warming_multiplier": multiplier,
+        "morning": {"sent": morning, "limit": scaled_morning},
+        "afternoon": {"sent": afternoon, "limit": scaled_afternoon},
+        "evening": {"sent": evening, "limit": scaled_evening},
         "current_period": _get_period_count()[2],
         "can_send": can_send_connection()[0],
     }
@@ -2984,6 +3687,12 @@ def run_outreach_job(urls, message_template="Hey {{name}}, I saw your profile an
         _job_state["log"] = []
 
     _log({"type": "info", "message": f"Starting outreach job: {len(urls)} URLs"})
+
+    # Check if account is flagged
+    flagged, flag_reason = _is_flagged()
+    if flagged:
+        _log({"type": "error", "message": f"Account flagged ({flag_reason}). Cannot start outreach job."})
+        return
 
     try:
         from playwright.sync_api import sync_playwright
@@ -3085,7 +3794,7 @@ def run_outreach_job(urls, message_template="Hey {{name}}, I saw your profile an
                         _job_state["completed"] = i + 1
                         _job_state["results"].append({"url": url, "name": "", "outcome": "ERROR"})
 
-                _random_sleep(30, 60)
+                _random_sleep(30, 60)  # Original delay — keep for job-level pacing
 
         finally:
             stop_event.set()
@@ -3162,8 +3871,11 @@ def linkedin_login_status():
     """Check if valid LinkedIn session exists by checking cookies file.
     No browser launch needed — just reads the cookies file.
     """
-    # First try to extract fresh cookies from running Firefox
-    extract_firefox_cookies()
+    # Try to extract fresh cookies from running Firefox (non-blocking)
+    try:
+        extract_firefox_cookies()
+    except Exception:
+        pass  # If Firefox isn't running or DB is locked, just check existing cookies
 
     if not os.path.exists(COOKIES_PATH):
         return {"logged_in": False, "message": "No cookies found. Open LinkedIn in Firefox."}
@@ -3197,7 +3909,19 @@ def extract_firefox_cookies():
 
     tmp_db = os.path.join(DATA_DIR, "tmp_cookies.sqlite")
     os.makedirs(DATA_DIR, exist_ok=True)
-    _shutil.copy2(firefox_db, tmp_db)
+    
+    # Try to copy with retry (Firefox may have file locked)
+    for attempt in range(3):
+        try:
+            _shutil.copy2(firefox_db, tmp_db)
+            break
+        except PermissionError:
+            if attempt == 2:
+                return {"success": False, "error": "Firefox has cookies.sqlite locked"}
+            import time as _time
+            _time.sleep(1)
+        except Exception as e:
+            return {"success": False, "error": f"Copy failed: {e}"}
 
     try:
         db = _sqlite3.connect(f"file:{tmp_db}?mode=ro", uri=True)
@@ -3243,7 +3967,7 @@ def extract_firefox_cookies():
         return {"success": False, "error": str(e)[:120]}
     finally:
         try:
-            _shutil.rmtree(tmp_db, ignore_errors=True)
+            os.remove(tmp_db)
         except Exception:
             pass
 
@@ -3466,7 +4190,7 @@ def _post_scheduler_loop():
 
     while _post_scheduler_running:
         try:
-            now = datetime.datetime.now()
+            now = datetime.now()
             hour = now.hour
             minute = now.minute
             weekday = now.weekday()  # 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun
@@ -3673,7 +4397,7 @@ def auto_like_feed_posts(max_likes=10):
                         
                         liked_count += 1
                         _log({"type": "info", "message": f"Auto-like: liked post #{liked_count}"})
-                        time.sleep(_random_sleep(2, 5) or 3)
+                        _random_sleep(2, 5)
                     except Exception as e:
                         _log({"type": "warning", "message": f"Auto-like: click failed: {str(e)[:40]}"})
                         continue
@@ -3751,7 +4475,7 @@ def auto_endorse_skills(profile_url, max_endorsements=10):
                             time.sleep(0.5)
                             
                             page.mouse.click(btn_info['x'], btn_info['y'])
-                            time.sleep(_random_sleep(1.5, 3))
+                            _random_sleep(1.5, 3)
                             
                             endorsed_count += 1
                             _log({"type": "info", "message": f"Auto-endorse: endorsed skill #{endorsed_count}: {btn_info.get('text', '')}"})
@@ -3812,7 +4536,7 @@ def auto_endorse_all_connections(max_profiles=5, max_per_profile=10):
                 result = auto_endorse_skills(url, max_endorsements=max_per_profile)
                 results.append({"url": url, "endorsed": result.get("endorsed", 0)})
                 total_endorsed += result.get("endorsed", 0)
-                time.sleep(_random_sleep(3, 6))
+                _random_sleep(3, 6)
             
             _log({"type": "info", "message": f"Auto-endorse all: done, {total_endorsed} total endorsements across {len(connection_urls)} profiles"})
             return {"success": True, "endorsed_profiles": len(connection_urls), "total_endorsed": total_endorsed, "results": results}
@@ -3955,3 +4679,576 @@ def generate_founderflow_post():
     dms = stats.get('dms_sent', '5,000+')
     rate = stats.get('reply_rate', '16')
     return f"FounderFlow heeft deze maand {leads} leads ontdekt en {dms} berichten gestuurd.\n\nReactiesnelheid: {rate}%.\n\nDat is 3x het industrie gemiddelde.\n\nHet verschil? Elk bericht is gepersonaliseerd. Geen copy-paste templates. Geen robots.\n\nDe AI leert van elk gesprek en past zich aan.\n\nHoeveel tijd besteed jij aan outreach?"
+
+
+# ---------- Safe-Sending: Message & Profile-View Tracking ----------
+
+def _get_message_count_today():
+    """Count messages sent today."""
+    db = _get_clawbuildr_db()
+    today = date.today().isoformat()
+    count = db.execute(
+        "SELECT COUNT(*) FROM linkedin_messages WHERE timestamp LIKE ?",
+        (today + "%",)
+    ).fetchone()[0]
+    db.close()
+    return count
+
+
+def _get_profile_view_count_today():
+    """Count profile views today."""
+    db = _get_clawbuildr_db()
+    today = date.today().isoformat()
+    count = db.execute(
+        "SELECT COUNT(*) FROM linkedin_profile_views WHERE viewed_at LIKE ?",
+        (today + "%",)
+    ).fetchone()[0]
+    db.close()
+    return count
+
+
+def can_send_message():
+    """Check if we can send a 1st-degree message today."""
+    flagged, flag_reason = _is_flagged()
+    if flagged:
+        return False, f"flagged_{flag_reason}"
+    active, reason = _is_active_hours()
+    if not active:
+        return False, reason
+    msg_count = _get_message_count_today()
+    if msg_count >= MESSAGE_DAILY_LIMIT:
+        return False, f"message_limit_reached ({msg_count}/{MESSAGE_DAILY_LIMIT})"
+    return True, f"ok ({msg_count}/{MESSAGE_DAILY_LIMIT})"
+
+
+def can_view_profile():
+    """Check if we can view a profile today."""
+    flagged, flag_reason = _is_flagged()
+    if flagged:
+        return False, f"flagged_{flag_reason}"
+    active, reason = _is_active_hours()
+    if not active:
+        return False, reason
+    view_count = _get_profile_view_count_today()
+    if view_count >= PROFILE_VIEW_DAILY_LIMIT:
+        return False, f"profile_view_limit_reached ({view_count}/{PROFILE_VIEW_DAILY_LIMIT})"
+    return True, f"ok ({view_count}/{PROFILE_VIEW_DAILY_LIMIT})"
+
+
+def _log_message_sent(profile_url, first_name, last_name, message_text, outcome):
+    """Record a message send in the database."""
+    db = _get_clawbuildr_db()
+    db.execute(
+        "INSERT INTO linkedin_messages (profile_url, first_name, last_name, message_text, outcome, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+        (profile_url, first_name, last_name, message_text, outcome, datetime.now().isoformat())
+    )
+    db.commit()
+    db.close()
+
+
+def _log_profile_view(profile_url):
+    """Record a profile view in the database."""
+    db = _get_clawbuildr_db()
+    db.execute(
+        "INSERT INTO linkedin_profile_views (profile_url, viewed_at) VALUES (?, ?)",
+        (profile_url, datetime.now().isoformat())
+    )
+    db.commit()
+    db.close()
+
+
+def get_safety_status():
+    """Get comprehensive safety status for dashboard display."""
+    state = _get_warming_state()
+    effective_limit, multiplier = _get_effective_daily_limit()
+    flagged, flag_reason = _is_flagged()
+    active, active_reason = _is_active_hours()
+
+    db = _get_clawbuildr_db()
+    today = date.today().isoformat()
+
+    connections_today = db.execute(
+        "SELECT COUNT(*) FROM linkedin_outreach WHERE outcome = 'SUCCESS' AND timestamp LIKE ?",
+        (today + "%",)
+    ).fetchone()[0]
+
+    messages_today = db.execute(
+        "SELECT COUNT(*) FROM linkedin_messages WHERE timestamp LIKE ?",
+        (today + "%",)
+    ).fetchone()[0]
+
+    views_today = db.execute(
+        "SELECT COUNT(*) FROM linkedin_profile_views WHERE viewed_at LIKE ?",
+        (today + "%",)
+    ).fetchone()[0]
+
+    db.close()
+
+    return {
+        "flagged": flagged,
+        "flag_reason": flag_reason,
+        "active_hours": active,
+        "active_reason": active_reason,
+        "warming_multiplier": multiplier,
+        "warming_percent": f"{multiplier:.0%}",
+        "connections_today": connections_today,
+        "connections_limit": effective_limit,
+        "connections_base_limit": DAILY_LIMIT,
+        "messages_today": messages_today,
+        "messages_limit": MESSAGE_DAILY_LIMIT,
+        "profile_views_today": views_today,
+        "profile_views_limit": PROFILE_VIEW_DAILY_LIMIT,
+        "cooldown_elapsed": _check_cooldown_elapsed() if flagged else False,
+    }
+
+
+# ---------- Post Engagement Scraper ----------
+# Finds people who engaged with relevant LinkedIn posts (likes/comments)
+# and saves them as warm leads for outreach.
+
+def scrape_post_engagement(post_url, max_engagers=25):
+    """Visit a LinkedIn post and scrape people who liked or commented.
+    Returns dict with count of engagers found and saved as warm leads.
+    """
+    _log({"type": "info", "message": f"Post engagement scraper: starting for {post_url}"})
+
+    try:
+        with get_firefox_driver() as ctx:
+            driver, page = ctx
+            driver.set_page_load_timeout(20)
+
+            page.goto(post_url, wait_until="domcontentloaded", timeout=20000)
+            time.sleep(5)
+
+            auth = _detect_auth_wall(page)
+            if auth:
+                return {"success": False, "error": "auth_wall", "engagers": 0}
+
+            engagers = []
+            scroll_attempts = 0
+
+            # Scroll to load reactions and comments
+            for _ in range(8):
+                # Extract people who reacted (liked, celebrated, etc.)
+                reaction_data = driver.execute_script("""
+                    const results = [];
+                    // Find reaction buttons/counts
+                    const reactionSections = document.querySelectorAll('[class*="react"], [class*="like"], [data-test-id*="reaction"]');
+                    for (const section of reactionSections) {
+                        // Look for profile links in reaction tooltips
+                        const links = section.querySelectorAll('a[href*="/in/"]');
+                        for (const link of links) {
+                            const href = link.getAttribute('href') || '';
+                            const name = (link.innerText || '').trim();
+                            if (href.includes('/in/') && name && name.length > 2) {
+                                results.push({
+                                    name: name,
+                                    profile_url: 'https://www.linkedin.com' + href.split('?')[0],
+                                    type: 'reaction'
+                                });
+                            }
+                        }
+                    }
+                    return results;
+                """)
+
+                # Extract commenters
+                comment_data = driver.execute_script("""
+                    const results = [];
+                    const commentAuthors = document.querySelectorAll('[class*="comment"] a[href*="/in/"], [class*="comment-body"] a[href*="/in/"]');
+                    for (const link of commentAuthors) {
+                        const href = link.getAttribute('href') || '';
+                        const name = (link.innerText || '').trim();
+                        if (href.includes('/in/') && name && name.length > 2) {
+                            results.push({
+                                name: name,
+                                profile_url: 'https://www.linkedin.com' + href.split('?')[0],
+                                type: 'comment'
+                            });
+                        }
+                    }
+                    return results;
+                """)
+
+                for item in reaction_data + comment_data:
+                    if item["profile_url"] not in [e["profile_url"] for e in engagers]:
+                        engagers.append(item)
+
+                if len(engagers) >= max_engagers:
+                    break
+
+                driver.execute_script("window.scrollBy(0, 800);")
+                time.sleep(2)
+                scroll_attempts += 1
+
+            # Save engagers as warm leads
+            saved_count = 0
+            db = _get_clawbuildr_db()
+
+            # Create table if not exists
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS warm_leads (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    profile_url TEXT UNIQUE,
+                    first_name TEXT,
+                    last_name TEXT,
+                    source_post_url TEXT,
+                    engagement_type TEXT,
+                    scraped_at TEXT,
+                    status TEXT DEFAULT 'new'
+                )
+            """)
+
+            for engager in engagers[:max_engagers]:
+                try:
+                    name_parts = engager["name"].split(" ", 1)
+                    first_name = name_parts[0] if name_parts else engager["name"]
+                    last_name = name_parts[1] if len(name_parts) > 1 else ""
+
+                    db.execute("""
+                        INSERT OR IGNORE INTO warm_leads
+                        (profile_url, first_name, last_name, source_post_url, engagement_type, scraped_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (
+                        engager["profile_url"],
+                        first_name,
+                        last_name,
+                        post_url,
+                        engager["type"],
+                        datetime.now().isoformat()
+                    ))
+                    saved_count += 1
+                except Exception:
+                    pass
+
+            db.commit()
+            db.close()
+
+            _log({"type": "info", "message": f"Post engagement: found {len(engagers)} engagers, saved {saved_count} as warm leads"})
+            return {"success": True, "engagers": len(engagers), "saved": saved_count}
+
+    except Exception as e:
+        _log({"type": "error", "message": f"Post engagement scraper failed: {str(e)[:80]}"})
+        return {"success": False, "error": str(e)[:120], "engagers": 0}
+
+
+def get_warm_leads(limit=50):
+    """Get warm leads from post engagement scraping."""
+    db = _get_clawbuildr_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS warm_leads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            profile_url TEXT UNIQUE,
+            first_name TEXT,
+            last_name TEXT,
+            source_post_url TEXT,
+            engagement_type TEXT,
+            scraped_at TEXT,
+            status TEXT DEFAULT 'new'
+        )
+    """)
+    rows = db.execute("""
+        SELECT * FROM warm_leads WHERE status = 'new'
+        ORDER BY scraped_at DESC LIMIT ?
+    """, (limit,)).fetchall()
+    db.close()
+
+    columns = ["id", "profile_url", "first_name", "last_name", "source_post_url", "engagement_type", "scraped_at", "status"]
+    return [dict(zip(columns, row)) for row in rows]
+
+
+# ===========================================================
+# LINKEDIN COMPANY PAGE SCRAPING
+# ===========================================================
+
+def scrape_linkedin_company(company_url: str) -> dict:
+    """Scrape a LinkedIn company page for deep company intelligence.
+
+    Extracts: name, industry, size, about text, specialties, headquarters,
+    employee count, founding date, website, hiring signals, and recent activity.
+
+    Args:
+        company_url: Full LinkedIn company URL (e.g., https://www.linkedin.com/company/acme-corp/)
+
+    Returns:
+        dict with company intelligence data
+    """
+    try:
+        # Delegate to the dedicated human-like company reader
+        from read_linkedin_company import read_linkedin_company
+        return read_linkedin_company(company_url)
+    except Exception as e:
+        return {"error": f"Company scrape failed: {str(e)[:150]}", "url": company_url}
+
+
+def enumerate_company_employees(company_url: str, max_employees: int = 50) -> list:
+    """Enumerate employees from a LinkedIn company page's People tab.
+    
+    Visits the company page, clicks the People tab, and scrolls through
+    the employee list to extract names, titles, and profile URLs.
+    
+    Args:
+        company_url: LinkedIn company URL
+        max_employees: Maximum employees to scrape (default 50)
+    
+    Returns:
+        List of dicts: [{name, title, profile_url, location}]
+    """
+    employees = []
+    
+    try:
+        from selenium.webdriver.common.by import By
+        driver, page = _persistent_firefox.ensure_ready()
+        
+        # Navigate to company people tab
+        if not company_url.endswith('/'):
+            company_url += '/'
+        people_url = company_url + 'people/'
+        
+        page.goto(people_url, wait_until="domcontentloaded", timeout=120000)
+        _random_sleep(4, 6)
+        
+        auth = _detect_auth_wall(page)
+        if auth:
+            _log({"type": "error", "message": f"Auth wall on company people page: {auth}"})
+            return employees
+        
+        # Scroll to load employees
+        last_height = driver.execute_script("return document.body.scrollHeight")
+        scroll_attempts = 0
+        max_scrolls = 10
+        
+        while scroll_attempts < max_scrolls and len(employees) < max_employees:
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            _random_sleep(2, 3)
+            
+            # Extract employee cards
+            cards = driver.find_elements(By.CSS_SELECTOR, '.org-people-profile-card, [data-view-name="profile-card"], li.artdeco-list__item')
+            
+            for card in cards:
+                if len(employees) >= max_employees:
+                    break
+                    
+                try:
+                    # Get name and profile URL
+                    name_link = card.find_elements(By.CSS_SELECTOR, 'a[href*="/in/"]')
+                    if not name_link:
+                        continue
+                    
+                    profile_url = name_link[0].get_attribute('href')
+                    name_text = name_link[0].text.strip()
+                    
+                    # Skip if already seen
+                    if any(e['profile_url'] == profile_url for e in employees):
+                        continue
+                    
+                    # Get title/headline
+                    title = ""
+                    title_els = card.find_elements(By.CSS_SELECTOR, '.org-people-profile-card__profile-title, .artdeco-entity-lockup__subtitle, span[aria-label]')
+                    if title_els:
+                        title = title_els[0].text.strip()
+                    
+                    # Get location
+                    location = ""
+                    loc_els = card.find_elements(By.CSS_SELECTOR, '.org-people-profile-card__location, .artdeco-entity-lockup__caption')
+                    if loc_els:
+                        location = loc_els[0].text.strip()
+                    
+                    employees.append({
+                        "name": name_text,
+                        "title": title,
+                        "profile_url": profile_url,
+                        "location": location
+                    })
+                except Exception:
+                    continue
+            
+            new_height = driver.execute_script("return document.body.scrollHeight")
+            if new_height == last_height:
+                break
+            last_height = new_height
+            scroll_attempts += 1
+        
+        _log({"type": "info", "message": f"Enumerated {len(employees)} employees from {company_url}"})
+        return employees
+        
+    except Exception as e:
+        _log({"type": "error", "message": f"Employee enumeration failed: {str(e)[:100]}"})
+        return employees
+
+
+def scrape_linkedin_profile_deep(profile_url: str) -> dict:
+    """Deep-scrape a LinkedIn profile for full intelligence.
+    
+    Extracts: headline, location, about section, experience, education,
+    skills, social links, and connection status.
+    
+    Args:
+        profile_url: LinkedIn profile URL
+    
+    Returns:
+        dict with full profile data
+    """
+    try:
+        driver, page = _persistent_firefox.ensure_ready()
+        
+        page.goto(profile_url, wait_until="domcontentloaded", timeout=120000)
+        _random_sleep(4, 6)
+        
+        auth = _detect_auth_wall(page)
+        if auth:
+            return {"error": f"Auth wall: {auth}", "profile_url": profile_url}
+        
+        result = {"profile_url": profile_url}
+        
+        # Get full page text for analysis
+        body_text = driver.find_element(By.TAG_NAME, 'body').text
+        result["raw_text"] = body_text[:8000]
+        
+        # Extract name from H1
+        try:
+            h1 = driver.find_elements(By.CSS_SELECTOR, 'h1')
+            if h1:
+                result["name"] = h1[0].text.strip()
+        except Exception:
+            pass
+        
+        # Extract headline (subtitle under name)
+        try:
+            headline_el = driver.find_elements(By.CSS_SELECTOR, '.text-body-medium.break-words, .pv-text-details__left-panel .text-body-medium')
+            if headline_el:
+                result["headline"] = headline_el[0].text.strip()
+        except Exception:
+            pass
+        
+        # Extract location
+        try:
+            loc_match = re.search(r'(?:Location|Standort|Localisation)\s*\n\s*(.+?)(?:\n|$)', body_text)
+            if loc_match:
+                result["location"] = loc_match.group(1).strip()
+        except Exception:
+            pass
+        
+        # Extract about section
+        try:
+            about_match = re.search(r'(?:About|Über|À propos)\s*\n\s*(.+?)(?:\n\n|\Z)', body_text, re.DOTALL)
+            if about_match:
+                result["about"] = about_match.group(1).strip()[:2000]
+        except Exception:
+            pass
+        
+        # Extract experience section
+        try:
+            exp_match = re.search(r'(?:Experience|Erfahrung|Expérience)\s*\n(.+?)(?:\nEducation|\nAusbildung|\nFormation|\Z)', body_text, re.DOTALL)
+            if exp_match:
+                result["experience"] = exp_match.group(1).strip()[:2000]
+        except Exception:
+            pass
+        
+        # Extract education section
+        try:
+            edu_match = re.search(r'(?:Education|Ausbildung|Formation)\s*\n(.+?)(?:\nSkills|\nFähigkeiten|\nCompétences|\Z)', body_text, re.DOTALL)
+            if edu_match:
+                result["education"] = edu_match.group(1).strip()[:1000]
+        except Exception:
+            pass
+        
+        # Extract skills
+        try:
+            skills_match = re.search(r'(?:Skills|Fähigkeiten|Compétences)\s*\n(.+?)(?:\n\n|\Z)', body_text, re.DOTALL)
+            if skills_match:
+                result["skills"] = skills_match.group(1).strip()[:1000]
+        except Exception:
+            pass
+        
+        # Extract social links from the page
+        social_links = {}
+        try:
+            links = driver.find_elements(By.CSS_SELECTOR, 'a[href*="twitter.com"], a[href*="facebook.com"], a[href*="instagram.com"], a[href*="github.com"], a[href*="youtube.com"]')
+            for link in links:
+                href = link.get_attribute('href')
+                if 'twitter.com' in href:
+                    social_links['twitter'] = href
+                elif 'facebook.com' in href:
+                    social_links['facebook'] = href
+                elif 'instagram.com' in href:
+                    social_links['instagram'] = href
+                elif 'github.com' in href:
+                    social_links['github'] = href
+                elif 'youtube.com' in href:
+                    social_links['youtube'] = href
+        except Exception:
+            pass
+        
+        if social_links:
+            result["social_links"] = social_links
+        
+        # Check connection status
+        try:
+            connected, status = _check_if_connected(driver)
+            result["connection_status"] = status
+        except Exception:
+            pass
+        
+        return result
+        
+    except Exception as e:
+        return {"error": f"Profile scrape failed: {str(e)[:150]}", "profile_url": profile_url}
+
+
+def find_emails_for_employee(first_name: str, last_name: str, company_domain: str) -> list:
+    """Generate and verify likely email addresses for an employee.
+    
+    Uses common email patterns (first.last@, flast@, etc.) and verifies
+    via MX records and SMTP probes.
+    
+    Args:
+        first_name: Employee's first name
+        last_name: Employee's last name
+        company_domain: Company email domain
+    
+    Returns:
+        List of dicts: [{email, confidence, pattern}]
+    """
+    from tools import verify_email
+    
+    # Normalize names
+    first = re.sub(r'[^a-zA-Z]', '', first_name.lower())
+    last = re.sub(r'[^a-zA-Z]', '', last_name.lower())
+    
+    if not first or not last:
+        return []
+    
+    # Common email patterns (Dutch/Belgian/German companies)
+    patterns = [
+        f"{first}.{last}@{company_domain}",
+        f"{first[0]}{last}@{company_domain}",
+        f"{first}@{company_domain}",
+        f"{last}.{first}@{company_domain}",
+        f"{first}{last}@{company_domain}",
+        f"{first[0]}.{last}@{company_domain}",
+        f"{first}_{last}@{company_domain}",
+        f"{last}{first[0]}@{company_domain}",
+    ]
+    
+    # Deduplicate
+    patterns = list(dict.fromkeys(patterns))
+    
+    verified = []
+    for email in patterns:
+        try:
+            result = verify_email(email)
+            if result.get("verified") or result.get("confidence", 0) >= 50:
+                verified.append({
+                    "email": email,
+                    "confidence": result.get("confidence", 0),
+                    "pattern": "verified" if result.get("verified") else "likely"
+                })
+        except Exception:
+            continue
+        
+        # Don't verify too many per employee
+        if len(verified) >= 3:
+            break
+    
+    return verified

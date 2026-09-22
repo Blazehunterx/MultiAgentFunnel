@@ -6,6 +6,7 @@ class LeadInput(BaseModel):
     domain: Optional[str] = None
     contact_email: Optional[str] = None
     contact_name: Optional[str] = None
+    linkedin_url: Optional[str] = None
 
 class ResearchData(BaseModel):
     company: str
@@ -17,6 +18,37 @@ class ResearchData(BaseModel):
     data_quality_score: int
     contact_emails: List[str] = []
     contact_name: Optional[str] = None
+    # LinkedIn company data
+    linkedin_company_url: Optional[str] = None
+    linkedin_industry: Optional[str] = None
+    linkedin_size: Optional[str] = None
+    linkedin_about: Optional[str] = None
+    linkedin_specialties: Optional[str] = None
+    linkedin_headquarters: Optional[str] = None
+    linkedin_founded: Optional[str] = None
+    linkedin_employee_count: Optional[str] = None
+    linkedin_website: Optional[str] = None
+    linkedin_followers: Optional[str] = None
+    linkedin_hiring_count: int = 0
+    linkedin_hiring_jobs: List[dict] = []
+    linkedin_company_posts: List[str] = []
+    # Social links & phones
+    social_links: dict = {}
+    phones: List[str] = []
+    # Employee data
+    employees: List[dict] = []
+    # Deep profile data (if single lead)
+    headline: Optional[str] = None
+    location: Optional[str] = None
+    experience: Optional[str] = None
+    education: Optional[str] = None
+    skills: Optional[str] = None
+    tenure: Optional[str] = None
+    profile_posts: List[str] = []
+    mutual_connections_count: int = 0
+    mutual_connections_text: Optional[str] = None
+    # KVK data
+    kvk_data: dict = {}
 
 class TrustResult(BaseModel):
     trust_score: int
