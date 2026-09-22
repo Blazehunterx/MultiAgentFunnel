@@ -19,10 +19,29 @@
   </script>
   <style>
     body { background: #f8fafc; }
-    .step-dot { transition: all 0.3s ease; }
     .fade-in { animation: fadeIn 0.35s ease; }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
     input:focus, textarea:focus { box-shadow: 0 0 0 3px rgba(99,102,241,0.18); }
+    .choice-card {
+      cursor: pointer; border: 2px solid #e2e8f0; border-radius: 16px; padding: 16px 18px;
+      background: #fff; transition: all 0.15s ease; position: relative; text-align: left;
+      display: block; width: 100%;
+    }
+    .choice-card:hover { border-color: #c7d2fe; background: #fafaff; }
+    .choice-card.selected { border-color: #4f46e5; background: #eef2ff; box-shadow: 0 0 0 1px #4f46e5; }
+    .choice-card .check {
+      position: absolute; top: 12px; right: 14px; width: 22px; height: 22px; border-radius: 50%;
+      border: 2px solid #cbd5e1; display: flex; align-items: center; justify-content: center;
+      font-size: 11px; color: transparent; transition: all 0.15s ease;
+    }
+    .choice-card.selected .check { background: #4f46e5; border-color: #4f46e5; color: #fff; }
+    .chip {
+      cursor: pointer; border: 1.5px solid #e2e8f0; border-radius: 999px; padding: 7px 14px;
+      font-size: 13px; font-weight: 500; color: #475569; background: #fff; transition: all 0.15s ease;
+      display: inline-flex; align-items: center; gap: 6px;
+    }
+    .chip:hover { border-color: #c7d2fe; }
+    .chip.selected { border-color: #4f46e5; background: #eef2ff; color: #4338ca; }
   </style>
 </head>
 <body class="min-h-screen text-slate-700">
@@ -31,13 +50,13 @@
     <div class="text-center mb-10">
       <div class="inline-flex items-center justify-center w-12 h-12 rounded-xl bg-brand-600 text-white text-xl font-bold mb-4">CB</div>
       <h1 class="text-2xl font-semibold text-slate-900">ClawBuildr instellen</h1>
-      <p class="text-slate-500 mt-1">In 2 minuten je outbound campagne live.</p>
+      <p class="text-slate-500 mt-1">Kies je kanalen en lanceer je eerste campagne.</p>
     </div>
 
     <!-- Progress -->
     <div class="mb-10">
       <div class="flex items-center justify-between text-xs font-medium text-slate-400 mb-2">
-        <span id="progress-label">Stap 1 van 6</span>
+        <span id="progress-label">Start</span>
         <span id="progress-pct">0%</span>
       </div>
       <div class="h-2 bg-slate-200 rounded-full overflow-hidden">
@@ -46,26 +65,76 @@
     </div>
 
     <!-- Card -->
-    <div id="card" class="bg-white rounded-2xl shadow-sm border border-slate-200 p-8 md:p-10 fade-in min-h-[420px] flex flex-col">
+    <div id="card" class="bg-white rounded-2xl shadow-sm border border-slate-200 p-8 md:p-10 fade-in min-h-[460px] flex flex-col">
       <!-- dynamic content -->
     </div>
   </div>
 
   <script>
-    const STEPS = ['welcome','profile','icp','message','search','review','running'];
+    const STEPS = ['welcome','profile','channels','gmail','icp','message','sequence','sources','search','review','running'];
     let current = 'welcome';
+
+    const INDUSTRY_PRESETS = [
+      'Accountancy','Tandartspraktijk','Juridisch','Vastgoed','IT',
+      'Marketing','Recruitment','Bouw','Schoonmaak','Fysiotherapie'
+    ];
+    const ROLE_PRESETS = ['Directeur','Eigenaar','CEO','Office Manager','Marketing Manager','HR Manager','Praktijkhouder','Partner'];
+    const SIZE_PRESETS = ['1-10','10-50','50-200','200+'];
+    const REGION_PRESETS = [
+      {id:'nl', label:'Nederland'},
+      {id:'be', label:'België'},
+      {id:'de', label:'Duitsland'}
+    ];
+    const PAIN_PRESETS = [
+      'Te weinig tijd voor administratie',
+      'Handmatig prospecten kost te veel tijd',
+      'Leads reageren niet terug',
+      'Onvoldoende online zichtbaarheid',
+      'Hoge kosten per lead',
+      'Concurrentie sneller dan wij'
+    ];
+    const SEQUENCE_PRESETS = [
+      {id:'gentle', icon:'fa-feather', title:'Zacht', desc:'3 opvolgingen, ruime pauzes (48u / 96u / 7d)', tone:'Relatief, nooit opdringerig.'},
+      {id:'direct', icon:'fa-bolt', title:'Direct', desc:'3 opvolgingen, korte pauzes (24u / 72u / 5d)', tone:'Zakelijk en naar de kern.'},
+      {id:'soft', icon:'fa-hand-holding-heart', title:'Minimalistisch', desc:'2 opvolgingen (72u / 7d)', tone:'Alleen de basis, maximaal rustig.'}
+    ];
+    const SOURCE_PRESETS = [
+      {id:'hunter', icon:'fa-crosshairs', title:'Hunter.io', desc:'Zoekt e-mailadressen op bedrijfsdomeinen (88 NL/BE/DE MKB-domeinen).'},
+      {id:'directories', icon:'fa-book', title:'Bedrijvengidsen', desc:'Schaapt publieke gidsen zoals Yelp, Yellow Pages en branchegidsen.'},
+      {id:'kvk', icon:'fa-building', title:'KVK / handelsregister', desc:'Officiële registratiegegevens van Nederlandse bedrijven.'}
+    ];
+    const SEARCH_BY_INDUSTRY = {
+      'Accountancy': ['accountancy kantoor Nederland','belastingadviseur MKB'],
+      'Tandartspraktijk': ['tandartspraktijk Amsterdam','mondhygienist praktijk'],
+      'Juridisch': ['advocatenkantoor Nederland','juridisch adviseur MKB'],
+      'Vastgoed': ['makelaar Nederland','vastgoedbeheer MKB'],
+      'IT': ['IT dienstverlener MKB','software bureau Nederland'],
+      'Marketing': ['marketing bureau Nederland','online marketing agency MKB'],
+      'Recruitment': ['recruitment bureau Amsterdam','werving en selectie Nederland'],
+      'Bouw': ['aannemingsbedrijf Nederland','bouwbedrijf MKB'],
+      'Schoonmaak': ['schoonmaakbedrijf Nederland','facility management MKB'],
+      'Fysiotherapie': ['fysiotherapie praktijk','fysiotherapeut Nederland']
+    };
+
     let form = {
       display_name: '',
       sending_email: '',
       calendar_link: '',
       signature_block: '',
+      campaign_channels: ['email','linkedin'],
+      gmail_status: '',
       value_doctrine: '',
       brand_voice: 'Professioneel, direct, vriendelijk. Gebruik informeel Nederlands (je/jullie).',
-      icp_industries: '',
-      icp_roles: '',
-      icp_company_size: '10-200',
-      search_queries: '',
+      icp_industries: [],
+      icp_roles: [],
+      icp_company_size: '10-50',
+      icp_regions: ['nl'],
+      pain_points: [],
       activation_message: '',
+      sequence_template: 'gentle',
+      lead_sources: ['hunter','directories','kvk'],
+      search_presets: [],
+      search_queries: '',
     };
 
     async function init() {
@@ -78,7 +147,7 @@
         const tenant = await tenantRes.json();
         mergeTenant(tenant);
         if (status && status.data && status.data.step_data) {
-          Object.values(status.data.step_data).forEach(stepData => mergeTenant(stepData));
+          Object.values(status.data.step_data).forEach(stepData => mergeStepData(stepData));
         }
         if (status && status.current_step && STEPS.includes(status.current_step)) {
           current = status.current_step;
@@ -90,6 +159,15 @@
       render();
     }
 
+    function asArr(v) {
+      if (Array.isArray(v)) return v;
+      if (typeof v === 'string' && v.trim()) {
+        if (v.trim().startsWith('[')) { try { return JSON.parse(v); } catch (e) {} }
+        return v.split('\n').map(s => s.trim()).filter(Boolean);
+      }
+      return [];
+    }
+
     function mergeTenant(t) {
       if (!t) return;
       if (t.display_name) form.display_name = t.display_name;
@@ -98,16 +176,43 @@
       if (t.signature_block) form.signature_block = t.signature_block;
       if (t.value_doctrine) form.value_doctrine = t.value_doctrine;
       if (t.brand_voice) form.brand_voice = t.brand_voice;
-      if (Array.isArray(t.icp_industries)) form.icp_industries = t.icp_industries.join('\n');
-      if (Array.isArray(t.icp_roles)) form.icp_roles = t.icp_roles.join('\n');
       if (t.icp_company_size) form.icp_company_size = t.icp_company_size;
-      if (Array.isArray(t.search_queries)) form.search_queries = t.search_queries.join('\n');
+      if (t.sequence_template) form.sequence_template = t.sequence_template;
+      const a = asArr(t.icp_industries); if (a.length) form.icp_industries = a;
+      const r = asArr(t.icp_roles); if (r.length) form.icp_roles = r;
+      const reg = asArr(t.icp_regions); if (reg.length) form.icp_regions = reg;
+      const pp = asArr(t.pain_points); if (pp.length) form.pain_points = pp;
+      const ls = asArr(t.lead_sources); if (ls.length) form.lead_sources = ls;
+      const cc = asArr(t.campaign_channels); if (cc.length) form.campaign_channels = cc;
+      const sq = asArr(t.search_queries); if (sq.length) form.search_queries = sq.join('\n');
+      mergeStepData(t);
+    }
+
+    function mergeStepData(d) {
+      if (!d) return;
+      if (Array.isArray(d.campaign_channels) && d.campaign_channels.length) form.campaign_channels = d.campaign_channels;
+      if (d.sequence_template) form.sequence_template = d.sequence_template;
+      if (Array.isArray(d.lead_sources) && d.lead_sources.length) form.lead_sources = d.lead_sources;
+      if (Array.isArray(d.icp_regions) && d.icp_regions.length) form.icp_regions = d.icp_regions;
+      if (Array.isArray(d.pain_points) && d.pain_points.length) form.pain_points = d.pain_points;
+      if (Array.isArray(d.icp_industries) && d.icp_industries.length) form.icp_industries = d.icp_industries;
+      if (Array.isArray(d.icp_roles) && d.icp_roles.length) form.icp_roles = d.icp_roles;
+      if (d.icp_company_size) form.icp_company_size = d.icp_company_size;
+      if (Array.isArray(d.search_presets)) form.search_presets = d.search_presets;
+      if (typeof d.search_queries === 'string') form.search_queries = d.search_queries;
+      if (d.display_name) form.display_name = d.display_name;
+      if (d.sending_email) form.sending_email = d.sending_email;
+      if (d.calendar_link) form.calendar_link = d.calendar_link;
+      if (d.signature_block) form.signature_block = d.signature_block;
+      if (d.value_doctrine) form.value_doctrine = d.value_doctrine;
+      if (d.brand_voice) form.brand_voice = d.brand_voice;
+      if (d.activation_message) form.activation_message = d.activation_message;
     }
 
     function field(label, id, placeholder, type='input', value='', extra='') {
       const input = type === 'textarea'
         ? `<textarea id="${id}" rows="4" placeholder="${placeholder}" class="w-full mt-2 px-4 py-3 rounded-xl border border-slate-200 text-slate-800 placeholder-slate-400 focus:outline-none focus:border-brand-500 transition">${value}</textarea>`
-        : `<input id="${id}" type="text" value="${value.replace(/"/g,'&quot;')}" placeholder="${placeholder}" class="w-full mt-2 px-4 py-3 rounded-xl border border-slate-200 text-slate-800 placeholder-slate-400 focus:outline-none focus:border-brand-500 transition">`;
+        : `<input id="${id}" type="text" value="${String(value).replace(/"/g,'&quot;')}" placeholder="${placeholder}" class="w-full mt-2 px-4 py-3 rounded-xl border border-slate-200 text-slate-800 placeholder-slate-400 focus:outline-none focus:border-brand-500 transition">`;
       return `<label class="block text-sm font-medium text-slate-700 mb-4">${label}${input}${extra ? `<p class="mt-1.5 text-xs text-slate-400">${extra}</p>` : ''}</label>`;
     }
 
@@ -117,6 +222,52 @@
           ${showBack ? `<button onclick="back()" class="text-slate-500 hover:text-slate-800 font-medium text-sm px-4 py-2">← Terug</button>` : '<div></div>'}
           <button id="nextBtn" onclick="${nextAction}()" class="px-8 py-3 rounded-full text-sm font-semibold transition ${nextPrimary ? 'bg-brand-600 hover:bg-brand-700 text-white shadow-md hover:shadow-lg' : 'bg-slate-100 hover:bg-slate-200 text-slate-800'}">${nextLabel}</button>
         </div>`;
+    }
+
+    function choiceCard(group, value, icon, title, desc, selected) {
+      return `
+        <button type="button" class="choice-card ${selected ? 'selected' : ''}" onclick="toggleChoice('${group}','${value.replace(/'/g,"\\'")}')">
+          <span class="check"><i class="fa-solid fa-check"></i></span>
+          <div class="flex items-start gap-3 pr-8">
+            ${icon ? `<i class="fa-solid ${icon} text-brand-600 mt-0.5"></i>` : ''}
+            <div>
+              <div class="font-semibold text-slate-900 text-sm">${title}</div>
+              ${desc ? `<div class="text-xs text-slate-500 mt-1 leading-relaxed">${desc}</div>` : ''}
+            </div>
+          </div>
+        </button>`;
+    }
+
+    function toggleChoice(group, value) {
+      readForm();
+      if (group === 'channels') {
+        if (value === 'both') form.campaign_channels = ['email','linkedin'];
+        else {
+          const i = form.campaign_channels.indexOf(value);
+          if (i >= 0) form.campaign_channels.splice(i, 1);
+          else form.campaign_channels.push(value);
+          if (!form.campaign_channels.length) form.campaign_channels = [value];
+        }
+      } else if (group === 'sequence') {
+        form.sequence_template = value;
+      } else if (group === 'size') {
+        form.icp_company_size = value;
+      } else {
+        const arrName = {industries:'icp_industries', roles:'icp_roles', regions:'icp_regions', pains:'pain_points', sources:'lead_sources', searchpreset:'search_presets'}[group];
+        if (!arrName) return;
+        const arr = form[arrName];
+        const i = arr.indexOf(value);
+        if (i >= 0) arr.splice(i, 1); else arr.push(value);
+      }
+      render();
+    }
+
+    function readForm() {
+      const ids = ['display_name','sending_email','calendar_link','signature_block','value_doctrine','brand_voice','activation_message','search_queries'];
+      ids.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) form[id] = el.value;
+      });
     }
 
     function render() {
@@ -130,13 +281,13 @@
       void card.offsetWidth;
       card.classList.add('fade-in');
 
-      if (current === 'welcome') card.innerHTML = renderWelcome();
-      else if (current === 'profile') card.innerHTML = renderProfile();
-      else if (current === 'icp') card.innerHTML = renderIcp();
-      else if (current === 'message') card.innerHTML = renderMessage();
-      else if (current === 'search') card.innerHTML = renderSearch();
-      else if (current === 'review') card.innerHTML = renderReview();
-      else if (current === 'running') card.innerHTML = renderRunning();
+      const renderers = {
+        welcome: renderWelcome, profile: renderProfile, channels: renderChannels,
+        gmail: renderGmail, icp: renderIcp, message: renderMessage,
+        sequence: renderSequence, sources: renderSources, search: renderSearch,
+        review: renderReview, running: renderRunning
+      };
+      card.innerHTML = (renderers[current] || renderWelcome)();
     }
 
     function renderWelcome() {
@@ -144,13 +295,13 @@
         <div class="flex-1 flex flex-col justify-center">
           <h2 class="text-3xl font-semibold text-slate-900 mb-4">Laten we je outreach automatiseren</h2>
           <p class="text-slate-500 text-lg leading-relaxed mb-8">
-            ClawBuildr zoekt zelfstandig leads, schrijft persoonlijke e-mails en stuurt vervolgberichten.
-            Jij hoeft alleen aan te geven wie je zoekt en wat je aanbiedt.
+            Kies je kanalen, verbind je mailbox en bepaal wie je zoekt.
+            Na de lancering draait de campagne volledig automatisch.
           </p>
           <ul class="space-y-3 text-slate-600 mb-10">
-            <li class="flex items-center gap-3"><i class="fa-solid fa-check-circle text-brand-600"></i> Kies je ideale klantprofiel</li>
-            <li class="flex items-center gap-3"><i class="fa-solid fa-check-circle text-brand-600"></i> Beschrijf je aanbod in je eigen woorden</li>
-            <li class="flex items-center gap-3"><i class="fa-solid fa-check-circle text-brand-600"></i> Lanceer je eerste campagne</li>
+            <li class="flex items-center gap-3"><i class="fa-solid fa-check-circle text-brand-600"></i> Kies E-mail, LinkedIn of allebei</li>
+            <li class="flex items-center gap-3"><i class="fa-solid fa-check-circle text-brand-600"></i> Stel je ideale klant en boodschap in</li>
+            <li class="flex items-center gap-3"><i class="fa-solid fa-check-circle text-brand-600"></i> Eerste campagne start direct na setup</li>
           </ul>
           ${navButtons(false, 'Start setup', 'next')}
         </div>`;
@@ -169,23 +320,135 @@
         ${navButtons(true)}`;
     }
 
+    function renderChannels() {
+      const c = form.campaign_channels;
+      const emailOn = c.includes('email'), liOn = c.includes('linkedin');
+      const both = emailOn && liOn;
+      return `
+        <div class="flex-1">
+          <h2 class="text-2xl font-semibold text-slate-900 mb-1">Welke kanalen wil je gebruiken?</h2>
+          <p class="text-slate-500 mb-6">Kies minimaal één kanaal. Je kunt altijd later wisselen.</p>
+          <div class="grid gap-4">
+            <button type="button" class="choice-card ${emailOn ? 'selected' : ''}" onclick="toggleChoice('channels','email')">
+              <span class="check"><i class="fa-solid fa-check"></i></span>
+              <div class="flex items-start gap-4 pr-8">
+                <i class="fa-solid fa-envelope text-brand-600 text-lg mt-0.5"></i>
+                <div>
+                  <div class="font-semibold text-slate-900">E-mail</div>
+                  <div class="text-sm text-slate-500 mt-1">Persoonlijke cold emails met AI-teksten en automatische opvolging.</div>
+                </div>
+              </div>
+            </button>
+            <button type="button" class="choice-card ${liOn ? 'selected' : ''}" onclick="toggleChoice('channels','linkedin')">
+              <span class="check"><i class="fa-solid fa-check"></i></span>
+              <div class="flex items-start gap-4 pr-8">
+                <i class="fa-brands fa-linkedin text-brand-600 text-lg mt-0.5"></i>
+                <div>
+                  <div class="font-semibold text-slate-900">LinkedIn</div>
+                  <div class="text-sm text-slate-500 mt-1">Automatische connectverzoeken met een persoonlijk bericht.</div>
+                </div>
+              </div>
+            </button>
+            <div class="text-center text-xs text-slate-400 pt-1">
+              Geselecteerd: <span class="font-semibold text-brand-600">${c.map(x => x === 'email' ? 'E-mail' : 'LinkedIn').join(' + ') || 'niets'}</span>
+              ${both ? ' — of kies beide door ze allebei aan te laten staan.' : ''}
+            </div>
+          </div>
+        </div>
+        ${navButtons(true)}`;
+    }
+
+    function renderGmail() {
+      const needsGmail = form.campaign_channels.includes('email');
+      if (!needsGmail) {
+        return `
+          <div class="flex-1 flex flex-col justify-center text-center">
+            <div class="w-16 h-16 rounded-full bg-brand-50 flex items-center justify-center mb-6 mx-auto">
+              <i class="fa-brands fa-linkedin text-2xl text-brand-600"></i>
+            </div>
+            <h2 class="text-2xl font-semibold text-slate-900 mb-2">Geen mailbox nodig</h2>
+            <p class="text-slate-500 max-w-md mx-auto">Je hebt alleen LinkedIn gekozen, dus we slaan de mailbox-koppeling over.</p>
+          </div>
+          ${navButtons(true)}`;
+      }
+      const status = form.gmail_status;
+      return `
+        <div class="flex-1">
+          <h2 class="text-2xl font-semibold text-slate-900 mb-1">Verbind je mailbox</h2>
+          <p class="text-slate-500 mb-6">We gebruiken je mailbox om e-mails te versturen en reacties te ontvangen.</p>
+          <div class="bg-slate-50 rounded-xl p-6 mb-6">
+            <div class="flex items-center gap-4">
+              <div class="w-12 h-12 rounded-xl bg-white border border-slate-200 flex items-center justify-center">
+                <i class="fa-brands fa-google text-xl text-slate-600"></i>
+              </div>
+              <div class="flex-1">
+                <div class="font-semibold text-slate-900 text-sm">Google / Gmail OAuth</div>
+                <div class="text-xs text-slate-500 mt-0.5">Opent in je browser — log in met het mailbox-adres dat je zojuist invulde.</div>
+              </div>
+              <button id="gmailBtn" onclick="connectGmail()" class="px-5 py-2.5 rounded-full text-sm font-semibold bg-brand-600 hover:bg-brand-700 text-white shadow transition">
+                ${status ? 'Opnieuw verbinden' : 'Verbind mailbox'}
+              </button>
+            </div>
+            ${status ? `<div class="mt-4 text-sm text-brand-700 bg-brand-50 rounded-lg px-4 py-3"><i class="fa-solid fa-circle-info mr-2"></i>${esc(status)}</div>` : ''}
+          </div>
+          <p class="text-xs text-slate-400">Je kunt deze stap overslaan en later vanaf het dashboard verbinden — dan blijft e-mail even uit.</p>
+        </div>
+        ${navButtons(true)}`;
+    }
+
+    async function connectGmail() {
+      const btn = document.getElementById('gmailBtn');
+      if (btn) { btn.disabled = true; btn.textContent = 'Bezig...'; }
+      try {
+        const res = await fetch('/api/onboarding/connect-gmail', {method:'POST'});
+        const data = await res.json();
+        form.gmail_status = data.message || 'Controleer je browser om de koppeling te voltooien.';
+      } catch (e) {
+        form.gmail_status = 'Koppeling mislukt — probeer het later opnieuw vanaf het dashboard.';
+      }
+      render();
+    }
+
     function renderIcp() {
       return `
-        <div>
+        <div class="flex-1">
           <h2 class="text-2xl font-semibold text-slate-900 mb-1">Wie is je ideale klant?</h2>
-          <p class="text-slate-500 mb-6">Hoe specifieker, hoe beter de leads. Gebruik één term per regel.</p>
-          ${field('Branches', 'icp_industries', 'Accountancy\nIT-dienstverlening\nRecruitment', 'textarea', form.icp_industries)}
-          ${field('Functies / rollen', 'icp_roles', 'Directeur\nEigenaar\nCEO', 'textarea', form.icp_roles)}
-          ${field('Bedrijfsgrootte', 'icp_company_size', 'bijv. 10-200', 'input', form.icp_company_size)}
+          <p class="text-slate-500 mb-5">Klik branches en rollen aan. Hoe specifieker, hoe beter de leads.</p>
+
+          <div class="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Branches</div>
+          <div class="flex flex-wrap gap-2 mb-5">
+            ${INDUSTRY_PRESETS.map(x => `<button type="button" class="chip ${form.icp_industries.includes(x) ? 'selected' : ''}" onclick="toggleChoice('industries','${x}')">${x}</button>`).join('')}
+          </div>
+
+          <div class="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Rollen</div>
+          <div class="flex flex-wrap gap-2 mb-5">
+            ${ROLE_PRESETS.map(x => `<button type="button" class="chip ${form.icp_roles.includes(x) ? 'selected' : ''}" onclick="toggleChoice('roles','${x}')">${x}</button>`).join('')}
+          </div>
+
+          <div class="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Bedrijfsgrootte</div>
+          <div class="grid grid-cols-4 gap-2 mb-5">
+            ${SIZE_PRESETS.map(x => `<button type="button" class="choice-card !p-3 text-center ${form.icp_company_size === x ? 'selected' : ''}" onclick="toggleChoice('size','${x}')"><span class="check !top-1.5 !right-1.5 !w-4 !h-4"><i class="fa-solid fa-check !text-[8px]"></i></span><div class="font-semibold text-sm text-slate-800 pr-4">${x}</div></button>`).join('')}
+          </div>
+
+          <div class="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Regio's</div>
+          <div class="flex flex-wrap gap-2">
+            ${REGION_PRESETS.map(x => `<button type="button" class="chip ${form.icp_regions.includes(x.id) ? 'selected' : ''}" onclick="toggleChoice('regions','${x.id}')">${x.label}</button>`).join('')}
+          </div>
         </div>
         ${navButtons(true)}`;
     }
 
     function renderMessage() {
       return `
-        <div>
+        <div class="flex-1">
           <h2 class="text-2xl font-semibold text-slate-900 mb-1">Wat bied je aan?</h2>
-          <p class="text-slate-500 mb-6">De AI gebruikt dit om elke e-mail persoonlijk te maken.</p>
+          <p class="text-slate-500 mb-5">De AI gebruikt dit om elke e-mail persoonlijk te maken.</p>
+
+          <div class="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Pijnpunten die je oplost (optioneel)</div>
+          <div class="flex flex-wrap gap-2 mb-5">
+            ${PAIN_PRESETS.map(x => `<button type="button" class="chip ${form.pain_points.includes(x) ? 'selected' : ''}" onclick="toggleChoice('pains','${x.replace(/'/g,"\\'")}')">${x}</button>`).join('')}
+          </div>
+
           ${field('Jouw value proposition', 'value_doctrine', 'Beschrijf het probleem dat je oplost en hoe. 3-5 zinnen.', 'textarea', form.value_doctrine)}
           ${field('Tone of voice', 'brand_voice', 'bijv. Professioneel, direct, vriendelijk. Gebruik je/jullie.', 'textarea', form.brand_voice)}
           ${field('Optionele openingshoek', 'activation_message', 'Laat leeg als de AI het zelf moet bedenken.', 'textarea', form.activation_message, 'Eén zin die we als rode draad gebruiken in de eerste e-mail.')}
@@ -193,31 +456,88 @@
         ${navButtons(true)}`;
     }
 
-    function renderSearch() {
+    function renderSequence() {
       return `
-        <div>
+        <div class="flex-1">
+          <h2 class="text-2xl font-semibold text-slate-900 mb-1">Hoe vaak volgen we op?</h2>
+          <p class="text-slate-500 mb-6">Kies een opvolgsequentie. Deze bepaalt toon en timing van de follow-ups.</p>
+          <div class="grid gap-4">
+            ${SEQUENCE_PRESETS.map(s => `
+              <button type="button" class="choice-card ${form.sequence_template === s.id ? 'selected' : ''}" onclick="toggleChoice('sequence','${s.id}')">
+                <span class="check"><i class="fa-solid fa-check"></i></span>
+                <div class="flex items-start gap-4 pr-8">
+                  <i class="fa-solid ${s.icon} text-brand-600 text-lg mt-0.5"></i>
+                  <div>
+                    <div class="font-semibold text-slate-900">${s.title}</div>
+                    <div class="text-sm text-slate-500 mt-0.5">${s.desc}</div>
+                    <div class="text-xs text-slate-400 mt-1">${s.tone}</div>
+                  </div>
+                </div>
+              </button>`).join('')}
+          </div>
+        </div>
+        ${navButtons(true)}`;
+    }
+
+    function renderSources() {
+      return `
+        <div class="flex-1">
+          <h2 class="text-2xl font-semibold text-slate-900 mb-1">Waar halen we leads vandaan?</h2>
+          <p class="text-slate-500 mb-6">Kies minimaal één bron. De pipeline scant deze elke cyclus automatisch.</p>
+          <div class="grid gap-4">
+            ${SOURCE_PRESETS.map(s => choiceCard('sources', s.id, s.icon, s.title, s.desc, form.lead_sources.includes(s.id))).join('')}
+          </div>
+          <div class="mt-4 text-xs text-slate-400">${form.lead_sources.length} bron(nen) actief</div>
+        </div>
+        ${navButtons(true)}`;
+    }
+
+    function presetSearchTerms() {
+      const set = new Set();
+      form.icp_industries.forEach(ind => (SEARCH_BY_INDUSTRY[ind] || []).forEach(q => set.add(q)));
+      return [...set];
+    }
+
+    function renderSearch() {
+      const presets = presetSearchTerms();
+      return `
+        <div class="flex-1">
           <h2 class="text-2xl font-semibold text-slate-900 mb-1">Waar zoeken we leads?</h2>
-          <p class="text-slate-500 mb-6">De zoekwoorden die we gebruiken om nieuwe bedrijven te vinden.</p>
-          ${field('Zoektermen', 'search_queries', 'accountancy kantoor Nederland\nIT dienstverlener MKB\nrecruitment bureau Amsterdam', 'textarea', form.search_queries, 'Één zoekterm per regel.')}
+          <p class="text-slate-500 mb-5">Suggesties op basis van je branches — klik aan wat je wilt gebruiken en voeg eigen termen toe.</p>
+          ${presets.length ? `
+            <div class="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Suggesties</div>
+            <div class="flex flex-wrap gap-2 mb-5">
+              ${presets.map(x => `<button type="button" class="chip ${form.search_presets.includes(x) ? 'selected' : ''}" onclick="toggleChoice('searchpreset','${x.replace(/'/g,"\\'")}')">${x}</button>`).join('')}
+            </div>` : ''}
+          ${field('Eigen zoektermen', 'search_queries', 'accountancy kantoor Nederland\nIT dienstverlener MKB', 'textarea', form.search_queries, 'Één zoekterm per regel.')}
         </div>
         ${navButtons(true, 'Doorgaan naar controle')}`;
     }
 
     function renderReview() {
-      const lines = s => (s || '').split('\n').filter(Boolean);
+      const chLabels = form.campaign_channels.map(x => x === 'email' ? 'E-mail' : 'LinkedIn');
+      const regionLabels = form.icp_regions.map(id => (REGION_PRESETS.find(r => r.id === id) || {label:id}).label);
+      const seq = SEQUENCE_PRESETS.find(s => s.id === form.sequence_template) || SEQUENCE_PRESETS[0];
+      const srcLabels = form.lead_sources.map(id => (SOURCE_PRESETS.find(s => s.id === id) || {title:id}).title);
+      const customTerms = (form.search_queries || '').split('\n').map(s => s.trim()).filter(Boolean);
+      const allTerms = [...new Set([...form.search_presets, ...customTerms])];
       return `
         <div class="flex-1">
           <h2 class="text-2xl font-semibold text-slate-900 mb-1">Controleer en lanceer</h2>
-          <p class="text-slate-500 mb-6">We starten met de leads die al in je database staan. Nieuwe leads voegen we automatisch toe.</p>
-          <div class="bg-slate-50 rounded-xl p-6 space-y-4 text-sm">
+          <p class="text-slate-500 mb-6">Na de lancering draait de campagne direct — leads zoeken, e-mails versturen en opvolgen gebeurt automatisch.</p>
+          <div class="bg-slate-50 rounded-xl p-6 space-y-3 text-sm">
             <div class="flex justify-between"><span class="text-slate-500">Bedrijf</span><span class="font-medium text-slate-900">${esc(form.display_name) || '-'}</span></div>
-            <div class="flex justify-between"><span class="text-slate-500">E-mail</span><span class="font-medium text-slate-900">${esc(form.sending_email) || '-'}</span></div>
-            <div class="flex justify-between"><span class="text-slate-500">Branches</span><span class="font-medium text-slate-900">${lines(form.icp_industries).length} geselecteerd</span></div>
-            <div class="flex justify-between"><span class="text-slate-500">Rollen</span><span class="font-medium text-slate-900">${lines(form.icp_roles).length} geselecteerd</span></div>
-            <div class="flex justify-between"><span class="text-slate-500">Zoektermen</span><span class="font-medium text-slate-900">${lines(form.search_queries).length} ingesteld</span></div>
-            <div class="pt-4 border-t border-slate-200">
+            <div class="flex justify-between"><span class="text-slate-500">Verzendmailbox</span><span class="font-medium text-slate-900">${esc(form.sending_email) || '-'}</span></div>
+            <div class="flex justify-between"><span class="text-slate-500">Kanalen</span><span class="font-medium text-slate-900">${chLabels.join(' + ') || '-'}</span></div>
+            <div class="flex justify-between"><span class="text-slate-500">Opvolging</span><span class="font-medium text-slate-900">${seq.title}</span></div>
+            <div class="flex justify-between"><span class="text-slate-500">Branches</span><span class="font-medium text-slate-900">${form.icp_industries.join(', ') || '-'}</span></div>
+            <div class="flex justify-between"><span class="text-slate-500">Rollen</span><span class="font-medium text-slate-900">${form.icp_roles.join(', ') || '-'}</span></div>
+            <div class="flex justify-between"><span class="text-slate-500">Regio's</span><span class="font-medium text-slate-900">${regionLabels.join(', ') || '-'}</span></div>
+            <div class="flex justify-between"><span class="text-slate-500">Leadbronnen</span><span class="font-medium text-slate-900">${srcLabels.join(', ') || '-'}</span></div>
+            <div class="flex justify-between"><span class="text-slate-500">Zoektermen</span><span class="font-medium text-slate-900">${allTerms.length} ingesteld</span></div>
+            <div class="pt-3 border-t border-slate-200">
               <span class="text-slate-500">Beschikbare leads nu:</span>
-              <span id="leadCount" class="ml-2 font-semibold text-brand-600"> laden...</span>
+              <span id="leadCount" class="ml-2 font-semibold text-brand-600">laden...</span>
             </div>
           </div>
         </div>
@@ -239,15 +559,12 @@
         </div>`;
     }
 
-    function readForm() {
-      const ids = ['display_name','sending_email','calendar_link','signature_block','value_doctrine','brand_voice','icp_industries','icp_roles','icp_company_size','search_queries','activation_message'];
-      ids.forEach(id => {
-        const el = document.getElementById(id);
-        if (el) form[id] = el.value;
-      });
-    }
-
     function toArr(str) { return (str || '').split('\n').map(s => s.trim()).filter(Boolean); }
+
+    function allSearchTerms() {
+      const custom = toArr(form.search_queries);
+      return [...new Set([...form.search_presets, ...custom])];
+    }
 
     async function saveCurrentStep(step) {
       readForm();
@@ -258,18 +575,25 @@
         calendar_link: form.calendar_link,
         signature_block: form.signature_block,
       };
+      if (step === 'channels') payload.data = { campaign_channels: form.campaign_channels };
+      if (step === 'gmail') payload.data = { gmail_status: form.gmail_status };
       if (step === 'icp') payload.data = {
-        icp_industries: toArr(form.icp_industries),
-        icp_roles: toArr(form.icp_roles),
+        icp_industries: form.icp_industries,
+        icp_roles: form.icp_roles,
         icp_company_size: form.icp_company_size,
+        icp_regions: form.icp_regions,
       };
       if (step === 'message') payload.data = {
         value_doctrine: form.value_doctrine,
         brand_voice: form.brand_voice,
         activation_message: form.activation_message,
+        pain_points: form.pain_points,
       };
+      if (step === 'sequence') payload.data = { sequence_template: form.sequence_template };
+      if (step === 'sources') payload.data = { lead_sources: form.lead_sources };
       if (step === 'search') payload.data = {
-        search_queries: toArr(form.search_queries),
+        search_presets: form.search_presets,
+        search_queries: form.search_queries,
       };
       try {
         await fetch('/api/onboarding/step', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
@@ -278,13 +602,21 @@
 
     async function next() {
       const idx = STEPS.indexOf(current);
+      readForm();
+      if (current === 'channels' && !form.campaign_channels.length) {
+        alert('Kies minimaal één kanaal.');
+        return;
+      }
+      if (current === 'sources' && !form.lead_sources.length) {
+        alert('Kies minimaal één leadbron.');
+        return;
+      }
       if (idx > 0 && idx < STEPS.length - 1) {
         await saveCurrentStep(STEPS[idx]);
       }
       current = STEPS[Math.min(idx + 1, STEPS.length - 1)];
       render();
       if (current === 'review') loadLeadCount();
-      if (current === 'running') startEngine();
     }
 
     function back() {
@@ -309,10 +641,15 @@
         signature_block: form.signature_block,
         value_doctrine: form.value_doctrine,
         brand_voice: form.brand_voice,
-        icp_industries: toArr(form.icp_industries),
-        icp_roles: toArr(form.icp_roles),
+        icp_industries: form.icp_industries,
+        icp_roles: form.icp_roles,
         icp_company_size: form.icp_company_size,
-        search_queries: toArr(form.search_queries),
+        icp_regions: form.icp_regions,
+        pain_points: form.pain_points,
+        campaign_channels: form.campaign_channels,
+        sequence_template: form.sequence_template,
+        lead_sources: form.lead_sources,
+        search_queries: allSearchTerms(),
         campaign_name: `${form.display_name} campagne`,
         create_campaign: true,
       };

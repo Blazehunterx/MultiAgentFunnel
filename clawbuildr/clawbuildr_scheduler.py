@@ -18,11 +18,36 @@ logger = logging.getLogger("ClawBuildr.Scheduler")
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 DB_PATH = os.path.join(DATA_DIR, "clawbuildr.db")
 
-FOLLOWUP_SEQUENCE = [
-    {"step": 1, "delay_hours": 48, "subject_prefix": "Re: ", "tone": "gentle"},
-    {"step": 2, "delay_hours": 96, "subject_prefix": "Re: ", "tone": "value_add"},
-    {"step": 3, "delay_hours": 168, "subject_prefix": "Re: ", "tone": "breakup"},
-]
+FOLLOWUP_TEMPLATES = {
+    "gentle": [
+        {"step": 1, "delay_hours": 48, "subject_prefix": "Re: ", "tone": "gentle"},
+        {"step": 2, "delay_hours": 96, "subject_prefix": "Re: ", "tone": "value_add"},
+        {"step": 3, "delay_hours": 168, "subject_prefix": "Re: ", "tone": "breakup"},
+    ],
+    "direct": [
+        {"step": 1, "delay_hours": 24, "subject_prefix": "Re: ", "tone": "direct"},
+        {"step": 2, "delay_hours": 72, "subject_prefix": "Re: ", "tone": "direct"},
+        {"step": 3, "delay_hours": 120, "subject_prefix": "Re: ", "tone": "breakup"},
+    ],
+    "soft": [
+        {"step": 1, "delay_hours": 72, "subject_prefix": "Re: ", "tone": "gentle"},
+        {"step": 2, "delay_hours": 168, "subject_prefix": "Re: ", "tone": "value_add"},
+    ],
+}
+
+FOLLOWUP_SEQUENCE = FOLLOWUP_TEMPLATES["gentle"]
+
+
+def set_followup_template(name: str) -> bool:
+    """Switch the active follow-up sequence template."""
+    global FOLLOWUP_SEQUENCE
+    if name in FOLLOWUP_TEMPLATES:
+        FOLLOWUP_SEQUENCE = FOLLOWUP_TEMPLATES[name]
+        logger.info(f"[Scheduler] Follow-up template set to '{name}'")
+        return True
+    logger.warning(f"[Scheduler] Unknown follow-up template '{name}', keeping default")
+    return False
+
 
 _DAILY_LIMIT = 50
 

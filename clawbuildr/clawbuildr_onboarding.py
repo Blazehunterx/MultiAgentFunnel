@@ -287,8 +287,12 @@ def verify_domain(workspace_id: int, domain: str) -> Dict[str, Any]:
 ONBOARDING_FLOW = [
     "welcome",
     "profile",
+    "channels",
+    "gmail",
     "icp",
     "message",
+    "sequence",
+    "sources",
     "search",
     "review",
     "running",

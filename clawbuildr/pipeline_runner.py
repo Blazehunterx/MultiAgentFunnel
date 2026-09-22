@@ -55,6 +55,68 @@ logger = logging.getLogger("ClawBuildr.PipelineRunner")
 
 shutdown_requested = False
 
+PID_FILE = os.path.join(DATA_DIR, "pipeline_runner.pid")
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return code.value == STILL_ACTIVE
+            return False
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _acquire_pid_lock() -> bool:
+    """Return True if this process may run; False if another runner is already alive."""
+    try:
+        if os.path.exists(PID_FILE):
+            try:
+                with open(PID_FILE) as f:
+                    old = int(f.read().strip())
+            except (ValueError, OSError):
+                old = -1
+            if old > 0 and old != os.getpid() and _pid_alive(old):
+                return False
+    except OSError:
+        pass
+    try:
+        with open(PID_FILE, "w") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
+    return True
+
+
+def _release_pid_lock():
+    try:
+        if os.path.exists(PID_FILE):
+            with open(PID_FILE) as f:
+                if f.read().strip() == str(os.getpid()):
+                    os.remove(PID_FILE)
+    except OSError:
+        pass
+
 
 def _signal_handler(sig, frame):
     global shutdown_requested
@@ -84,6 +146,25 @@ def _get_db():
     return conn
 
 
+def _get_tenant_setting(key: str, default=None):
+    """Read a setting from the active tenant config."""
+    try:
+        db = _get_db()
+        row = db.execute(f"SELECT {key} FROM tenant_config WHERE active = 1 LIMIT 1").fetchone()
+        db.close()
+        if row and row[key] is not None:
+            val = row[key]
+            if isinstance(val, str) and val.strip().startswith('['):
+                try:
+                    return json.loads(val)
+                except Exception:
+                    pass
+            return val
+    except Exception as e:
+        logger.debug(f"[TenantSetting] Could not read {key}: {e}")
+    return default
+
+
 def _db_write(sql, params=(), retries=10):
     """Execute a DB write with retry logic for lock contention."""
     for attempt in range(retries):
@@ -110,33 +191,33 @@ def _now():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _run_lead_gen():
-    """Generate leads from Hunter.io domains + dynamic discovery (KVK, business directories)."""
+    """Generate leads from sources chosen during onboarding."""
     try:
         from clawbuildr_lead_generator import generate_leads, KNOWN_BUSINESS_DOMAINS, _is_valid_business_domain
+        lead_sources = set(_get_tenant_setting("lead_sources", ["hunter", "directories", "kvk"]))
         db = _get_db()
         known = {r[0].lower() for r in db.execute("SELECT domain FROM companies").fetchall()}
         db.close()
 
-        available = [d for d in KNOWN_BUSINESS_DOMAINS if d.lower() not in known and _is_valid_business_domain(d)]
+        available = []
+        if "hunter" in lead_sources:
+            available = [d for d in KNOWN_BUSINESS_DOMAINS if d.lower() not in known and _is_valid_business_domain(d)]
+
+        if not available and "kvk" in lead_sources:
+            logger.info("[LeadGen] Running KVK discovery")
+            available = _discover_new_domains(known)
+
+        if not available and "directories" in lead_sources:
+            logger.info("[LeadGen] Running business directory discovery")
+            available = _discover_from_business_directories(known)
+
         if not available:
-            # Dynamic discovery: use KVK API + business directories
-            logger.info("[LeadGen] Static pool exhausted — running dynamic discovery")
-            new_domains = _discover_new_domains(known)
-            if new_domains:
-                available = new_domains
-            else:
-                # Try business directories as last resort
-                logger.info("[LeadGen] KVK returned nothing — trying business directories")
-                dir_domains = _discover_from_business_directories(known)
-                if dir_domains:
-                    available = dir_domains
-                else:
-                    logger.info("[LeadGen] No new domains found — will retry next cycle")
-                    return 0
+            logger.info("[LeadGen] No new domains found for selected sources — will retry next cycle")
+            return 0
 
         sample = random.sample(available, min(3, len(available)))
         result = asyncio.run(generate_leads(
-            domains=sample, max_leads=10, use_hunter=True, use_website_scrape=True,
+            domains=sample, max_leads=10, use_hunter=("hunter" in lead_sources), use_website_scrape=True,
         ))
         logger.info(f"[LeadGen] {result['found']} leads from {result['domains_processed']} domains")
         return result["found"]
@@ -593,6 +674,11 @@ def _run_regeneration():
 
 def _run_email_send():
     """Send emails with watchdog checks, learning, and human-like delays."""
+    # Check if email channel is enabled for this tenant
+    if "email" not in _get_tenant_setting("campaign_channels", ["email", "linkedin"]):
+        logger.info("[EmailSend] Email channel disabled for this tenant, skipping.")
+        return 0
+
     try:
         from tools import gmail_send
         from clawbuildr_ai_email import save_generated_email
@@ -780,6 +866,16 @@ def _run_email_send():
 
 def _run_followups():
     """Send follow-up emails for due contacts."""
+    # Check if email channel is enabled for this tenant
+    if "email" not in _get_tenant_setting("campaign_channels", ["email", "linkedin"]):
+        logger.info("[FollowUp] Email channel disabled for this tenant, skipping.")
+        return 0
+
+    # Set the follow-up template for this tenant
+    from clawbuildr_scheduler import set_followup_template
+    template = _get_tenant_setting("sequence_template", "gentle")
+    set_followup_template(template)
+
     try:
         from clawbuildr_scheduler import process_due_followups, mark_sent
         from clawbuildr_ai_email import generate_followup_email, save_generated_email
@@ -889,6 +985,11 @@ def _run_followups():
 
 def _run_linkedin_connections():
     """Send LinkedIn connection requests to contacts with LinkedIn URLs."""
+    # Check if LinkedIn channel is enabled for this tenant
+    if "linkedin" not in _get_tenant_setting("campaign_channels", ["email", "linkedin"]):
+        logger.info("[LinkedIn] LinkedIn channel disabled for this tenant, skipping.")
+        return 0
+
     try:
         from clawbuildr_linkedin_integration import get_linkedin_stats
         from linkedin_engine import search_and_connect, can_send_connection
@@ -1101,6 +1202,9 @@ def _print_status():
 
 def run_forever():
     global shutdown_requested
+    if not _acquire_pid_lock():
+        logger.error("Another pipeline_runner is already running — exiting.")
+        return
     logger.info("=" * 60)
     logger.info("ClawBuildr Pipeline Runner — Starting 24/7 loop")
     logger.info("Goal: 300+ emails in 7 days, 20 LinkedIn connections/day")
@@ -1177,6 +1281,7 @@ def run_forever():
             time.sleep(1)
 
     logger.info("Pipeline Runner stopped.")
+    _release_pid_lock()
 
 
 if __name__ == "__main__":

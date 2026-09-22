@@ -275,6 +275,19 @@ def run_migrations():
         )
         logger.info("[Migrations] Seeded 2 default tenant profiles (Injexion, ClawBuildr).")
 
+    # NEW: onboarding choice columns on tenant_config
+    for col, typedef in [
+        ("lead_sources", "TEXT NOT NULL DEFAULT '[\"hunter\",\"directories\",\"kvk\"]'"),
+        ("campaign_channels", "TEXT NOT NULL DEFAULT '[\"email\",\"linkedin\"]'"),
+        ("sequence_template", "TEXT NOT NULL DEFAULT 'gentle'"),
+        ("icp_regions", "TEXT NOT NULL DEFAULT '[\"nl\"]'"),
+        ("pain_points", "TEXT NOT NULL DEFAULT '[]'"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE tenant_config ADD COLUMN {col} {typedef}")
+        except Exception:
+            pass
+
     # NEW: email_events table for tracking
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS email_events (
@@ -943,7 +956,7 @@ def _get_active_tenant() -> dict:
         if row:
             t = dict(row)
             # Parse JSON fields
-            for field in ('icp_industries', 'icp_roles', 'search_queries'):
+            for field in ('icp_industries', 'icp_roles', 'search_queries', 'lead_sources', 'campaign_channels', 'icp_regions', 'pain_points'):
                 try:
                     t[field] = json.loads(t.get(field) or '[]')
                 except Exception:
@@ -969,6 +982,11 @@ def _get_active_tenant() -> dict:
             "logistiek dienstverlener Nederland",
             "transport bedrijf Nederland MKB",
         ],
+        'lead_sources': ["hunter", "directories", "kvk"],
+        'campaign_channels': ["email", "linkedin"],
+        'sequence_template': 'gentle',
+        'icp_regions': ["nl"],
+        'pain_points': [],
         'active': 1
     }
 
@@ -986,7 +1004,7 @@ def _get_active_tenant() -> dict:
         if row:
             t = dict(row)
             # Parse JSON fields
-            for field in ('icp_industries', 'icp_roles', 'search_queries'):
+            for field in ('icp_industries', 'icp_roles', 'search_queries', 'lead_sources', 'campaign_channels', 'icp_regions', 'pain_points'):
                 try:
                     t[field] = json.loads(t.get(field) or '[]')
                 except Exception:
@@ -1012,6 +1030,11 @@ def _get_active_tenant() -> dict:
             "logistiek dienstverlener Nederland",
             "transport bedrijf Nederland MKB",
         ],
+        'lead_sources': ["hunter", "directories", "kvk"],
+        'campaign_channels': ["email", "linkedin"],
+        'sequence_template': 'gentle',
+        'icp_regions': ["nl"],
+        'pain_points': [],
         'active': 1
     }
 
@@ -2122,10 +2145,11 @@ async def _find_linkedin_for_company(company_name: str, domain: str) -> dict:
             pass
 
     # STEP 1.5: If no name from website, search LinkedIn directly for decision-makers
+    # Bug fix: run blocking selenium + search delay in a thread so the event loop stays responsive
     if not found_names:
         try:
             from linkedin_engine import find_decision_maker_on_linkedin
-            li_result = find_decision_maker_on_linkedin(clean_name, domain)
+            li_result = await asyncio.to_thread(find_decision_maker_on_linkedin, clean_name, domain)
             if li_result:
                 fn = li_result.get("first_name", "")
                 ln = li_result.get("last_name", "")
@@ -4032,8 +4056,9 @@ async def save_tenant_config(request: Request):
             INSERT INTO tenant_config
                 (tenant_id, display_name, sending_email, sending_domain, calendar_link,
                  signature_block, value_doctrine, brand_voice, icp_industries,
-                 icp_roles, icp_company_size, search_queries, active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                 icp_roles, icp_company_size, search_queries, active,
+                 lead_sources, campaign_channels, sequence_template, icp_regions, pain_points)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
             ON CONFLICT(tenant_id) DO UPDATE SET
                 display_name   = excluded.display_name,
                 sending_email  = excluded.sending_email,
@@ -4046,7 +4071,12 @@ async def save_tenant_config(request: Request):
                 icp_roles      = excluded.icp_roles,
                 icp_company_size = excluded.icp_company_size,
                 search_queries = excluded.search_queries,
-                active         = 1
+                active         = 1,
+                lead_sources   = excluded.lead_sources,
+                campaign_channels = excluded.campaign_channels,
+                sequence_template = excluded.sequence_template,
+                icp_regions    = excluded.icp_regions,
+                pain_points    = excluded.pain_points
         """, (
             tenant_id,
             body.get("display_name", ""),
@@ -4059,7 +4089,12 @@ async def save_tenant_config(request: Request):
             json.dumps(body.get("icp_industries", [])),
             json.dumps(body.get("icp_roles", [])),
             body.get("icp_company_size", "10-200"),
-            json.dumps(body.get("search_queries", []))
+            json.dumps(body.get("search_queries", [])),
+            json.dumps(body.get("lead_sources", ["hunter", "directories", "kvk"])),
+            json.dumps(body.get("campaign_channels", ["email", "linkedin"])),
+            body.get("sequence_template", "gentle"),
+            json.dumps(body.get("icp_regions", ["nl"])),
+            json.dumps(body.get("pain_points", []))
         ))
         # Deactivate all other tenants
         conn.execute("UPDATE tenant_config SET active = 0 WHERE tenant_id != ?", (tenant_id,))
@@ -7422,9 +7457,16 @@ async def api_onboarding_step(request: Request):
     body = await request.json()
     step = body.get("step")
     data = body.get("data", {})
-    if step not in ["welcome", "profile", "icp", "message", "search", "review", "running"]:
+    if step not in ["welcome", "channels", "gmail", "profile", "icp", "message", "sequence", "sources", "search", "review", "running"]:
         raise HTTPException(status_code=400, detail="Invalid step")
     return save_onboarding_step(_active_tenant_id(), step, data)
+
+
+@app.post("/api/onboarding/connect-gmail")
+def api_onboarding_connect_gmail(background_tasks: BackgroundTasks):
+    """Trigger Gmail OAuth for the active tenant during onboarding."""
+    tenant_id = _active_tenant_id()
+    return connect_gmail_tenant(tenant_id, background_tasks)
 
 
 @app.post("/api/onboarding/launch")
@@ -7435,7 +7477,6 @@ async def api_onboarding_launch(request: Request):
     tenant = _get_active_tenant()
 
     # Merge launch payload into tenant config
-    from fastapi import Request as _Request  # already imported
     save_payload = {
         "tenant_id": tenant_id,
         "display_name": body.get("display_name", tenant.get("display_name", "")),
@@ -7449,6 +7490,11 @@ async def api_onboarding_launch(request: Request):
         "icp_roles": body.get("icp_roles", tenant.get("icp_roles", [])),
         "icp_company_size": body.get("icp_company_size", tenant.get("icp_company_size", "10-200")),
         "search_queries": body.get("search_queries", tenant.get("search_queries", [])),
+        "lead_sources": body.get("lead_sources", tenant.get("lead_sources", ["hunter", "directories", "kvk"])),
+        "campaign_channels": body.get("campaign_channels", tenant.get("campaign_channels", ["email", "linkedin"])),
+        "sequence_template": body.get("sequence_template", tenant.get("sequence_template", "gentle")),
+        "icp_regions": body.get("icp_regions", tenant.get("icp_regions", ["nl"])),
+        "pain_points": body.get("pain_points", tenant.get("pain_points", [])),
     }
     # Re-use existing tenant save logic
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
@@ -7457,8 +7503,9 @@ async def api_onboarding_launch(request: Request):
             INSERT INTO tenant_config
                 (tenant_id, display_name, sending_email, sending_domain, calendar_link,
                  signature_block, value_doctrine, brand_voice, icp_industries,
-                 icp_roles, icp_company_size, search_queries, active)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                 icp_roles, icp_company_size, search_queries, active,
+                 lead_sources, campaign_channels, sequence_template, icp_regions, pain_points)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
             ON CONFLICT(tenant_id) DO UPDATE SET
                 display_name   = excluded.display_name,
                 sending_email  = excluded.sending_email,
@@ -7471,7 +7518,12 @@ async def api_onboarding_launch(request: Request):
                 icp_roles      = excluded.icp_roles,
                 icp_company_size = excluded.icp_company_size,
                 search_queries = excluded.search_queries,
-                active         = 1
+                active         = 1,
+                lead_sources   = excluded.lead_sources,
+                campaign_channels = excluded.campaign_channels,
+                sequence_template = excluded.sequence_template,
+                icp_regions    = excluded.icp_regions,
+                pain_points    = excluded.pain_points
         """, (
             tenant_id,
             save_payload["display_name"],
@@ -7485,6 +7537,11 @@ async def api_onboarding_launch(request: Request):
             json.dumps(save_payload["icp_roles"]),
             save_payload["icp_company_size"],
             json.dumps(save_payload["search_queries"]),
+            json.dumps(save_payload["lead_sources"]),
+            json.dumps(save_payload["campaign_channels"]),
+            save_payload["sequence_template"],
+            json.dumps(save_payload["icp_regions"]),
+            json.dumps(save_payload["pain_points"]),
         ))
         conn.execute("UPDATE tenant_config SET active = 0 WHERE tenant_id != ?", (tenant_id,))
         conn.commit()
@@ -7635,6 +7692,25 @@ def api_selectable_contacts(limit: int = 200):
 def api_start_pipeline():
     """Start the pipeline_runner in the background (local machine only)."""
     import subprocess
+    # Guard: never spawn a duplicate runner
+    try:
+        if sys.platform == "win32":
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -like '*pipeline_runner*' }).ProcessId"],
+                timeout=10, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            running = [int(x) for x in out.split() if x.strip().isdigit()]
+        else:
+            try:
+                out = subprocess.check_output(["pgrep", "-f", "pipeline_runner.py"], stderr=subprocess.DEVNULL, timeout=10)
+                running = [int(x) for x in out.split()]
+            except subprocess.CalledProcessError:
+                running = []
+        if running:
+            return {"status": "already_running", "pids": running}
+    except Exception as e:
+        logger.warning(f"[Pipeline] Running-check failed: {e}")
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     script = os.path.join(base_dir, "clawbuildr", "pipeline_runner.py")
     try:
