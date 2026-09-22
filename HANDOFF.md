@@ -22,11 +22,11 @@ playwright install chromium
 ```
 
 ## Credentials
-- **Gmail SMTP**: `marvin@clawbuildr.com` / `oglh pngm riit jijx`
+- **Gmail SMTP**: see `.env` file (marvin@clawbuildr.com)
 - **Gmail IMAP**: `imap.gmail.com`
-- **Hunter.io**: `b0bd926d33dc4801b189c4f09184c443eb750e5b,aadc24fdd3090a1e94465346d19dad48bf4de0f2`
-- **Gemini**: `AIzaSyDf6_ZVbiV_GuHK8Udj5Kh2yZ8t7dIjvfs,AIzaSyC4gy1x59ARkJdJe0Gkusu-ZNp57ERPGpk` + 4 more
-- **Groq**: `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`
+- **Hunter.io**: see `.env` file (2 keys with round-robin rotation)
+- **Gemini**: see `.env` file (6 keys with round-robin rotation)
+- **Groq**: see `.env` file
 - **Vercel DNS**: SPF + DMARC already configured
 
 ## DNS Status
