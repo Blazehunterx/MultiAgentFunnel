@@ -8,7 +8,10 @@ import csv
 from urllib.parse import urlparse
 
 # CONFIGURATION
-DB_PATH = r"C:\Users\marvi\odysseus\data\clawbuildr.db"
+# Resolved relative to the repo so this runs on any machine, and so it points at
+# the same database the dashboard uses. Override with CLAWBUILDR_DB if needed.
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DB_PATH = os.environ.get("CLAWBUILDR_DB") or os.path.join(_BASE_DIR, "data", "clawbuildr.db")
 API_URL = "http://localhost:8000/api/agent-zero/ingest"
 DRY_RUN = False
 
