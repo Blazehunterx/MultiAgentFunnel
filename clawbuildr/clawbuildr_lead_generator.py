@@ -20,6 +20,12 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List, Tuple
 
 # Dutch + English placeholder/test emails that must never be used as leads
+from lead_quality import (  # noqa: E402
+    validate_lead,
+    is_generic_email,
+    is_garbage_person_name,
+)
+
 PLACEHOLDER_EMAILS = {
     "naam@voorbeeld.com", "naam@bedrijf.nl", "name@example.com",
     "test@test.com", "email@example.com", "info@example.com",
@@ -62,6 +68,8 @@ GENERIC_PREFIXES = {
     "customerservice", "klantenservice", "secretariaat", "directie",
     "inkoop", "verkoop", "financien", "personeel", "ict", "it",
     "automatisering", "communicatie", "juridisch", "legal",
+    "privacy", "dpo", "compliance", "security", "feedback",
+    "newsletter", "notifications", "abuse", "postmaster",
 }
 
 SKIP_DOMAINS = {
@@ -330,8 +338,11 @@ def generate_email_patterns(first_name: str, last_name: str, domain: str) -> Lis
 
 def verify_mx(domain: str) -> bool:
     try:
-        import dns.resolver
-        mx = dns.resolver.resolve(domain, "MX")
+        try:
+            import dns_client
+        except ImportError:
+            from clawbuildr import dns_client
+        mx = dns_client.resolve(domain, "MX")
         return len(list(mx)) > 0
     except Exception:
         return False
@@ -431,28 +442,26 @@ def insert_lead(
     email: str, role: str = "Decision Maker", linkedin_url: str = "",
     industry: str = "", source: str = "lead_generator",
 ) -> Optional[str]:
-    # FILTER: Skip placeholder/test emails
-    email_lower = email.lower().strip()
+    email_lower = (email or "").lower().strip()
     local_part = email_lower.split("@")[0] if "@" in email_lower else ""
     if email_lower in PLACEHOLDER_EMAILS or local_part in PLACEHOLDER_LOCAL_PARTS:
         return None
-    if not email_lower or "@" not in email_lower:
-        return None
-    if " " in email or "\t" in email:
-        return None
+    domain_lower = (domain or (email_lower.split("@")[-1] if "@" in email_lower else "")).lower().strip()
 
-    # FILTER: Skip non-business domains
-    if not _is_valid_business_domain(domain):
+    # Shared quality gate: format, generic/privacy@, placeholders, free mail,
+    # garbage names (page titles), business TLD
+    ok, _reason = validate_lead(
+        email=email_lower,
+        first_name=first_name or "",
+        last_name=last_name or "",
+        company_name=company_name or "",
+        domain=domain_lower,
+        require_business_tld=True,
+    )
+    if not ok:
+        logger.debug(f"[LeadGen] reject ({_reason}): {email_lower} name={first_name!r} co={company_name!r}")
         return None
-
-    # FILTER: Skip free email providers
-    free_providers = {
-        "gmail.com", "hotmail.com", "yahoo.com", "outlook.com", "live.com",
-        "aol.com", "icloud.com", "protonmail.com", "zoho.com", "yandex.com",
-        "mail.com", "gmx.com", "fastmail.com", "tutanota.com", "hushmail.com",
-        "mail.ru", "bk.ru", "inbox.ru", "list.ru",
-    }
-    if domain_lower in free_providers:
+    if not _is_valid_business_domain(domain_lower):
         return None
 
     db = _get_db()

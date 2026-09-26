@@ -215,9 +215,9 @@ def _run_lead_gen():
             logger.info("[LeadGen] No new domains found for selected sources — will retry next cycle")
             return 0
 
-        sample = random.sample(available, min(3, len(available)))
+        sample = random.sample(available, min(25, len(available)))
         result = asyncio.run(generate_leads(
-            domains=sample, max_leads=10, use_hunter=("hunter" in lead_sources), use_website_scrape=True,
+            domains=sample, max_leads=100, use_hunter=("hunter" in lead_sources), use_website_scrape=True,
         ))
         logger.info(f"[LeadGen] {result['found']} leads from {result['domains_processed']} domains")
         return result["found"]
@@ -436,6 +436,82 @@ def _run_research():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# STEP 2b: OPPORTUNITY MAPPING (pains → solutions for all researched leads)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _run_opportunity():
+    """Map opportunity for contacts that have research but no opportunity_mapping."""
+    try:
+        from pipeline import map_opportunity
+        from models import ResearchData
+
+        db = _get_db()
+        contacts = db.execute(
+            """SELECT c.contact_id, c.research_result,
+                      co.name as company_name, co.domain, co.industry
+               FROM contacts c
+               LEFT JOIN companies co ON c.company_id = co.company_id
+               WHERE (c.research_result IS NOT NULL AND c.research_result != '')
+                 AND (c.opportunity_mapping IS NULL OR c.opportunity_mapping = '')
+                 AND c.current_stage NOT IN ('CLOSED_LOST', 'CLOSED_WON', 'BLOCKED', 'BOUNCED', 'NURTURE')
+               ORDER BY c.created_at DESC
+               LIMIT 10"""
+        ).fetchall()
+
+        if not contacts:
+            db.close()
+            return 0
+
+        count = 0
+        for c in contacts:
+            try:
+                raw = c["research_result"]
+                research_dict = json.loads(raw) if isinstance(raw, str) and raw.strip().startswith("{") else (raw if isinstance(raw, dict) else {})
+                if not isinstance(research_dict, dict) or not research_dict:
+                    continue
+                # Coerce into ResearchData (best-effort — extra keys ignored)
+                try:
+                    known = {k: research_dict.get(k) for k in ResearchData.model_fields if k in research_dict}
+                    research = ResearchData(**known)
+                except Exception:
+                    research = ResearchData(
+                        company=c["company_name"] or "",
+                        domain=c["domain"] or "",
+                        summary=str(research_dict.get("summary") or "")[:2000],
+                        services=research_dict.get("services") or [],
+                        signals=research_dict.get("signals") or [],
+                        sources=research_dict.get("sources") or [],
+                        data_quality_score=int(research_dict.get("data_quality_score") or 50),
+                    )
+
+                opp = asyncio.run(map_opportunity(research))
+                opp_dict = opp.model_dump() if hasattr(opp, "model_dump") else (opp.dict() if hasattr(opp, "dict") else opp)
+                if not isinstance(opp_dict, dict):
+                    continue
+
+                db.execute(
+                    "UPDATE contacts SET opportunity_mapping = ? WHERE contact_id = ?",
+                    (json.dumps(opp_dict), c["contact_id"]),
+                )
+                db.commit()
+                count += 1
+                logger.info(
+                    f"[Opportunity] Mapped {c['company_name']}: "
+                    f"score={opp_dict.get('opportunity_score')} pains={len(opp_dict.get('pain_points') or [])}"
+                )
+                time.sleep(2)
+            except Exception as e:
+                logger.debug(f"[Opportunity] Failed for {c['company_name']}: {e}")
+
+        db.close()
+        logger.info(f"[Opportunity] {count}/{len(contacts)} opportunities mapped")
+        return count
+    except Exception as e:
+        logger.error(f"[Opportunity] Error: {e}")
+        return 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # STEP 3: AI EMAIL GENERATION (hyper-personalized)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -443,13 +519,16 @@ def _run_email_gen():
     """Generate hyper-personalized AI emails with A/B test assignment."""
     try:
         from clawbuildr_ai_email import generate_ai_email, save_generated_email
-        from clawbuildr_learning import record_ab_test_result
+        from clawbuildr_learning import record_ab_test_result, get_variant_weights
 
         db = _get_db()
 
+        # Completed tests stay in the mix so their WINNER keeps steering drafts;
+        # running tests lean on observed reply rates via get_variant_weights().
         active_tests = db.execute(
-            "SELECT id, test_name, variant_a, variant_b FROM ab_tests WHERE status = 'running'"
+            "SELECT id, test_name, variant_a, variant_b, status FROM ab_tests WHERE status IN ('running', 'completed')"
         ).fetchall()
+        variant_weights = get_variant_weights()
 
         contacts = db.execute(
             """SELECT c.contact_id, c.first_name, c.last_name, c.email, c.role,
@@ -485,7 +564,13 @@ def _run_email_gen():
 
                 ab_modifiers = {}
                 for test in active_tests:
-                    variant = random.choice(["a", "b"])
+                    w = variant_weights.get(test["test_name"])
+                    if w and (w.get("a", 0) >= 0.99 or w.get("b", 0) >= 0.99):
+                        variant = "a" if w.get("a", 0) >= 0.99 else "b"
+                    elif w:
+                        variant = "a" if random.random() < w.get("a", 0.5) else "b"
+                    else:
+                        variant = random.choice(["a", "b"])
                     ab_modifiers[test["test_name"]] = variant
 
                 custom_prompt = ""
@@ -680,7 +765,6 @@ def _run_email_send():
         return 0
 
     try:
-        from tools import gmail_send
         from clawbuildr_ai_email import save_generated_email
         from clawbuildr_watchdog import can_send, check_daily_limit, check_hourly_limit, check_bounce_rate
         from clawbuildr_learning import record_email_performance, record_timing
@@ -700,10 +784,14 @@ def _run_email_send():
         db = _get_db()
         contacts = db.execute(
             """SELECT c.contact_id, c.first_name, c.last_name, c.email,
-                      c.outreach_draft, co.name as company_name
+                      c.outreach_draft, c.research_result, co.name as company_name
                FROM contacts c
                LEFT JOIN companies co ON c.company_id = co.company_id
+               LEFT JOIN sequence_enrollments se
+                 ON se.contact_id = CAST(c.contact_id AS TEXT) AND UPPER(se.status) = 'ACTIVE'
+               LEFT JOIN sequence_graphs sg ON sg.graph_id = se.graph_id AND sg.active = 1
                WHERE c.current_stage = 'PENDING_APPROVAL'
+                 AND se.id IS NULL
                  AND c.outreach_draft IS NOT NULL AND c.outreach_draft != ''
                   AND c.email NOT LIKE 'info@%' AND c.email NOT LIKE 'sales@%'
                   AND c.email NOT LIKE 'contact@%' AND c.email NOT LIKE 'admin@%'
@@ -738,17 +826,29 @@ def _run_email_send():
                   AND c.email NOT LIKE '%jouw@%' AND c.email NOT LIKE '%test@%'
                   AND c.email NOT LIKE '%example@%' AND c.email NOT LIKE '%demo@%'
                   AND c.email NOT LIKE '% %'
-                  AND c.email NOT LIKE '%@gmail.com' AND c.email NOT LIKE '%@hotmail.com'
-                  AND c.email NOT LIKE '%@yahoo.com' AND c.email NOT LIKE '%@outlook.com'
-                  AND c.email NOT LIKE '%@live.com' AND c.email NOT LIKE '%@aol.com'
-                  AND c.email NOT LIKE '%@icloud.com' AND c.email NOT LIKE '%@protonmail.com'
-                  AND c.email NOT LIKE '%@zoho.com' AND c.email NOT LIKE '%@yandex.com'
-                  AND c.email NOT LIKE '%@mail.com' AND c.email NOT LIKE '%@gmx.com'
-                  AND c.email NOT LIKE '%@fastmail.com' AND c.email NOT LIKE '%@tutanota.com'
-                  AND c.email NOT LIKE '%@mail.ru' AND c.email NOT LIKE '%@bk.ru'
+                  AND LOWER(COALESCE(c.email,'')) NOT LIKE '%@gmail.com'
+                  AND LOWER(COALESCE(c.email,'')) NOT LIKE '%@hotmail.com'
+                  AND LOWER(COALESCE(c.email,'')) NOT LIKE '%@outlook.com'
+                  AND LOWER(COALESCE(c.email,'')) NOT LIKE '%@yahoo.com'
+                  AND LOWER(COALESCE(c.email,'')) NOT LIKE '%@live.com'
+                  AND LOWER(COALESCE(c.email,'')) NOT LIKE '%@aol.com'
+                  AND LOWER(COALESCE(c.email,'')) NOT LIKE '%@icloud.com'
+                  AND LOWER(COALESCE(c.email,'')) NOT LIKE '%@protonmail.com'
+                  AND LOWER(COALESCE(c.email,'')) NOT LIKE '%@zoho.com'
+                  AND LOWER(COALESCE(c.email,'')) NOT LIKE '%@yandex.com'
+                  AND LOWER(COALESCE(c.email,'')) NOT LIKE '%@mail.com'
+                  AND LOWER(COALESCE(c.email,'')) NOT LIKE '%@gmx.com'
+                  AND LOWER(COALESCE(c.email,'')) NOT LIKE '%@fastmail.com'
+                  AND LOWER(COALESCE(c.email,'')) NOT LIKE '%@tutanota.com'
+                  AND LOWER(COALESCE(c.email,'')) NOT LIKE '%@mail.ru'
+                  AND LOWER(COALESCE(c.email,'')) NOT LIKE '%@bk.ru'
+                  AND LOWER(COALESCE(c.first_name,'')) NOT IN ('privacy','unknown','info','contact','name','home','menu','search','login','blog','bedrijfspanden','veenendaal','sweco','architecten','eigenaar')
+                  AND LOWER(COALESCE(c.email,'')) NOT LIKE '%privacy%'
+                  AND LOWER(COALESCE(c.email,'')) NOT LIKE 'dpo@%'
+                  AND LOWER(COALESCE(c.email,'')) NOT LIKE '%groupprivacy%'
                   AND (co.domain LIKE '%.nl' OR co.domain LIKE '%.be' OR co.domain LIKE '%.de')
                   AND c.contact_id NOT IN (
-                      SELECT contact_id FROM emails WHERE status = 'bounced' AND contact_id IS NOT NULL
+                      SELECT contact_id FROM emails WHERE UPPER(status) = 'BOUNCED' AND contact_id IS NOT NULL
                   )
                ORDER BY RANDOM()
                LIMIT 5"""
@@ -765,10 +865,26 @@ def _run_email_send():
         db.close()
 
         count = 0
+        from clawbuildr_quality_gate import is_research_thin
         for c in contacts:
             if not can_send():
                 logger.info("[EmailSend] Watchdog: limit reached mid-batch")
                 break
+
+            # Thin research → do not send generic mail; hold for richer research
+            if is_research_thin(c["research_result"]):
+                logger.warning(f"[EmailSend] SKIP thin research for {c.get('company_name')}")
+                try:
+                    db2 = _get_db()
+                    db2.execute(
+                        "UPDATE contacts SET current_stage = 'NEEDS_REGENERATION' WHERE contact_id = ? AND current_stage = 'PENDING_APPROVAL'",
+                        (c["contact_id"],),
+                    )
+                    db2.commit()
+                    db2.close()
+                except Exception as hold_err:
+                    logger.debug(f"[EmailSend] hold failed: {hold_err}")
+                continue
 
             try:
                 draft = json.loads(c["outreach_draft"]) if c["outreach_draft"].startswith("{") else {
@@ -809,16 +925,25 @@ def _run_email_send():
                     )
                     continue
 
+                from tools import gmail_send, resolve_send_kwargs, record_account_send
+                send_acc = resolve_send_kwargs(contact_id=c["contact_id"])
                 result = asyncio.run(gmail_send(
                     to=c["email"],
                     subject=draft.get("subject", f"Quick question about {c['company_name'] or 'your business'}"),
                     body=draft.get("body", c["outreach_draft"]),
+                    from_addr=send_acc.get("email_address"),
+                    smtp_host=send_acc.get("smtp_host"),
+                    smtp_port=send_acc.get("smtp_port"),
+                    smtp_user=send_acc.get("smtp_user"),
+                    smtp_password=send_acc.get("smtp_password"),
                 ))
 
                 if result.get("status") != "sent":
                     logger.warning(f"[EmailSend] Gmail failed for {c['email']}: status={result.get('status')}, error={result.get('error', 'unknown')}")
 
                 if result.get("status") == "sent":
+                    if send_acc.get("account_id"):
+                        record_account_send(send_acc["account_id"])
                     _db_write(
                         "UPDATE contacts SET current_stage = 'EMAIL_SENT', updated_at = ? WHERE contact_id = ?",
                         (_now(), c["contact_id"]),
@@ -872,14 +997,41 @@ def _run_followups():
         return 0
 
     # Set the follow-up template for this tenant
-    from clawbuildr_scheduler import set_followup_template
+    from clawbuildr_scheduler import set_followup_template, set_followup_custom
+    # Active multi-channel sequence graphs own outreach — do not arm legacy linear follow-ups
+    try:
+        _db0 = _get_db()
+        _active_graph = _db0.execute(
+            "SELECT graph_id FROM sequence_graphs WHERE active = 1 LIMIT 1"
+        ).fetchone()
+        _db0.close()
+        if _active_graph:
+            logger.info("[FollowUp] Active sequence graph present — skipping legacy follow-ups (graph owns sequence).")
+            return 0
+    except Exception as _graph_err:
+        # Fail closed: if graph state is unreadable, do not risk double-sending
+        logger.warning(f"[FollowUp] graph check failed ({_graph_err}) — skipping legacy follow-ups this cycle")
+        return 0
     template = _get_tenant_setting("sequence_template", "gentle")
-    set_followup_template(template)
+    custom_raw = _get_tenant_setting("followup_custom_json", None)
+    custom_steps = None
+    if custom_raw:
+        try:
+            if isinstance(custom_raw, str):
+                custom_steps = json.loads(custom_raw)
+            elif isinstance(custom_raw, list):
+                custom_steps = custom_raw
+        except Exception:
+            custom_steps = None
+    if custom_steps:
+        set_followup_custom(custom_steps)
+    else:
+        set_followup_template(template)
 
     try:
         from clawbuildr_scheduler import process_due_followups, mark_sent
         from clawbuildr_ai_email import generate_followup_email, save_generated_email
-        from tools import gmail_send
+        from tools import gmail_send, resolve_send_kwargs, record_account_send
 
         due = process_due_followups()
         if not due:
@@ -946,14 +1098,22 @@ def _run_followups():
                         mark_sent(f["queue_id"], 0)
                         continue
 
+                    fu_acc = resolve_send_kwargs(contact_id=f["contact_id"])
                     send_result = asyncio.run(gmail_send(
                         to=contact["email"],
                         subject=result["subject"],
                         body=result["body"],
+                        from_addr=fu_acc.get("email_address"),
+                        smtp_host=fu_acc.get("smtp_host"),
+                        smtp_port=fu_acc.get("smtp_port"),
+                        smtp_user=fu_acc.get("smtp_user"),
+                        smtp_password=fu_acc.get("smtp_password"),
                     ))
                     logger.info(f"[FollowUp] Send result for {contact['email']}: {send_result.get('status', 'unknown')}")
 
                     if send_result.get("status") == "sent":
+                        if fu_acc.get("account_id"):
+                            record_account_send(fu_acc["account_id"])
                         email_id = save_generated_email(
                             contact_id=f["contact_id"],
                             subject=result["subject"],
@@ -962,6 +1122,17 @@ def _run_followups():
                             confidence=result.get("confidence", 0),
                             model_used=result.get("model_used", ""),
                         )
+                        # Real send already happened — mark SENT so watchdog counts it
+                        try:
+                            _fu_db = _get_db()
+                            _fu_db.execute(
+                                "UPDATE emails SET status = 'SENT', sent_at = ? WHERE email_id = ?",
+                                (datetime.now(timezone.utc).isoformat(), email_id),
+                            )
+                            _fu_db.commit()
+                            _fu_db.close()
+                        except Exception as _fu_st:
+                            logger.warning(f"[FollowUp] could not mark email SENT: {_fu_st}")
                         mark_sent(f["queue_id"], email_id)
                         count += 1
                         logger.info(
@@ -1229,6 +1400,11 @@ def run_forever():
             time.sleep(5)
 
             _run_research()
+            if shutdown_requested:
+                break
+            time.sleep(5)
+
+            _run_opportunity()
             if shutdown_requested:
                 break
             time.sleep(5)

@@ -36,8 +36,40 @@ def _skip_domain(domain: str) -> bool:
         "google.com", "bing.com", "brave.com", "duckduckgo.com", "mojeek.com",
         "youtube.com", "facebook.com", "apple.com", "microsoft.com",
         "nl.linkedin.com", "linkedin.nl",
+        # Reference / dictionary / thesaurus junk (not companies)
+        "dictionary.com", "thesaurus.com", "merriam-webster.com",
+        "oxfordlearnersdictionaries.com", "dictionary.cambridge.org",
+        "collinsdictionary.com", "wordreference.com", "yourdictionary.com",
+        "vocabulary.com", "synonym.com", "thesaurus.com", "duden.de",
+        "dict.cc", "leo.org", "pons.com", "linguee.com", "bab.la",
+        "britannica.com", "encyclopedia.com", "wikipedia.org",
+        # International job boards / staffing giants / portals
+        "jobstreet.com", "jac-recruitment.co.id", "robertwalters.co.id",
+        "softonic.com", "rumahweb.com", "binus.ac.id", "pertamina.com",
+        "adecco.com", "akkodis.com", "randstad.com", "manpower.com",
+        "monster.com", "glassdoor.com", "indeed.com", "simplyhired.com",
     }
-    return any(domain.endswith(d) for d in skip_domains) or not domain
+    return (
+        not domain
+        or domain in skip_domains
+        or any(domain.endswith("." + d) for d in skip_domains)
+    )
+
+
+_JUNK_TITLE_PATTERNS = re.compile(
+    r"\b(definitions?|synonyms?|antonyms?|meaning|thesaurus|dictionary|"
+    r"what is|what are|how to|examples? of|adjective|noun|verb|"
+    r"opposite|pronunciation|translation|vacanc(?:y|ies)|vacatures?|jobs? in|lowongan|"
+    r"top\s*\d+|alle\s+\w+|lijst\s+van|list\s+of|directory|gids)\b",
+    re.IGNORECASE,
+)
+
+
+def _skip_title(title: str) -> bool:
+    """Return True if SERP title looks like reference/content spam, not a company."""
+    if not title:
+        return True
+    return bool(_JUNK_TITLE_PATTERNS.search(title))
 
 
 def _extract_mojeek_results(html: str) -> list:
@@ -51,7 +83,7 @@ def _extract_mojeek_results(html: str) -> list:
         if href.startswith("/"):
             href = "https://www.mojeek.com" + href
         domain = _normalize_domain(href)
-        if _skip_domain(domain) or domain in seen:
+        if _skip_domain(domain) or _skip_title(title) or domain in seen:
             continue
         seen.add(domain)
         results.append({"title": title, "url": href, "domain": domain})
@@ -67,7 +99,7 @@ def _extract_ddg_results(html: str) -> list:
         href = match.group(1)
         title = re.sub(r'<[^>]+>', ' ', match.group(2)).strip()
         domain = _normalize_domain(href)
-        if _skip_domain(domain) or domain in seen:
+        if _skip_domain(domain) or _skip_title(title) or domain in seen:
             continue
         seen.add(domain)
         results.append({"title": title, "url": href, "domain": domain})
@@ -83,7 +115,7 @@ def _extract_brave_results(html: str) -> list:
         href = match.group(1)
         title = re.sub(r'<[^>]+>', ' ', match.group(2)).strip()
         domain = _normalize_domain(href)
-        if _skip_domain(domain) or domain in seen:
+        if _skip_domain(domain) or _skip_title(title) or domain in seen:
             continue
         seen.add(domain)
         results.append({"title": title, "url": href, "domain": domain})
@@ -125,7 +157,7 @@ def _extract_bing_results(html: str) -> list:
                 except Exception:
                     pass
         domain = _normalize_domain(href)
-        if _skip_domain(domain) or domain in seen or not domain:
+        if _skip_domain(domain) or _skip_title(title) or domain in seen or not domain:
             continue
         seen.add(domain)
         results.append({"title": title, "url": href, "domain": domain})
@@ -144,7 +176,7 @@ def _extract_google_results(html: str) -> list:
         if href.startswith("/url?q="):
             href = href.split("/url?q=", 1)[1].split("&", 1)[0]
         domain = _normalize_domain(href)
-        if _skip_domain(domain) or domain in seen:
+        if _skip_domain(domain) or _skip_title(title) or domain in seen:
             continue
         seen.add(domain)
         results.append({"title": title, "url": href, "domain": domain})
@@ -193,6 +225,8 @@ def _extract_results(html: str, source: str) -> list:
         "bing": _extract_bing_results,
         "google": _extract_google_results,
         "yelp": lambda h: [],  # Yelp handled separately
+        "startpage": _extract_generic_results,
+        "yandex": _extract_generic_results,
     }
     parser = parsers.get(source, _extract_generic_results)
     return parser(html)
@@ -225,27 +259,14 @@ async def search_web(query: str, logger=None) -> list:
         await asyncio.sleep(wait)
     _LAST_WEB_SEARCH_TIME = time.time()
 
-    # Engine configs: (name, url, params, parser)
+    # Dead engines removed (mojeek 403, brave 429, ddg timeout ~20s each — wasted ~60s/query).
+    # yandex/startpage return captchas under bulk load → junk/generic parser hits.
+    # google + bing are the only reliable HTTP engines from this IP.
     engines = [
         {
             "name": "google",
             "url": "https://www.google.com/search",
             "params": {"q": "{query}", "hl": "nl", "num": "10"},
-        },
-        {
-            "name": "mojeek",
-            "url": "https://www.mojeek.com/search",
-            "params": {"q": "{query}"},
-        },
-        {
-            "name": "duckduckgo_lite",
-            "url": "https://lite.duckduckgo.com/lite/",
-            "params": {"q": "{query}", "kl": "nl-nl"},
-        },
-        {
-            "name": "brave",
-            "url": "https://search.brave.com/search",
-            "params": {"q": "{query}"},
         },
         {
             "name": "bing",
@@ -295,7 +316,10 @@ async def search_web(query: str, logger=None) -> list:
 
             except Exception as e:
                 if logger:
-                    logger.warning(f"[Search Rotator] {engine['name']} failed: {str(e)[:80]}")
+                    logger.warning(
+                        f"[Search Rotator] {engine['name']} failed: "
+                        f"{type(e).__name__}: {e!r}"
+                    )
                 continue
 
     # Final fallback: Yelp.nl
@@ -315,21 +339,18 @@ async def search_web(query: str, logger=None) -> list:
                         logger.info(f"[Search Rotator] Yelp fallback returned {len(results)} results")
         except Exception as e:
             if logger:
-                logger.warning(f"[Search Rotator] Yelp fallback failed: {str(e)[:80]}")
+                logger.warning(
+                    f"[Search Rotator] Yelp fallback failed: {type(e).__name__}: {e!r}"
+                )
 
-    # Browser fallback: if HTTP engines gave poor/irrelevant results, use Firefox via Bing
-    if len(all_results) < 3:
-        try:
-            browser_results = await _browser_search_fallback(query)
-            for res in browser_results:
-                if res["domain"] not in seen_domains:
-                    seen_domains.add(res["domain"])
-                    all_results.append(res)
-            if browser_results and logger:
-                logger.info(f"[Search Rotator] Browser fallback returned {len(browser_results)} results")
-        except Exception as e:
-            if logger:
-                logger.warning(f"[Search Rotator] Browser fallback failed: {str(e)[:80]}")
+    # Browser fallback disabled: concurrent Firefox launches piled up windows
+    # during bulk sourcing. HTTP engines (google/mojeek/ddg/brave/bing) suffice.
+    # if len(all_results) < 3:
+    #     try:
+    #         browser_results = await _browser_search_fallback(query)
+    #         ...
+    #     except Exception as e:
+    #         ...
 
     return all_results[:10]
 

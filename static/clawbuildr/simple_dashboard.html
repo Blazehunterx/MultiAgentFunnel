@@ -24,6 +24,21 @@
     .fade-in { animation: fadeIn 0.3s ease; }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
     input:focus, textarea:focus { box-shadow: 0 0 0 3px rgba(99,102,241,0.18); }
+    .kanban { display: flex; gap: 12px; overflow-x: auto; align-items: flex-start; padding-bottom: 12px; }
+    .kanban-col { flex: 0 0 260px; background: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 1rem; min-height: 280px; display: flex; flex-direction: column; }
+    .kanban-col-head { padding: 12px 14px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .kanban-col-body { padding: 0 8px 10px; display: flex; flex-direction: column; gap: 8px; min-height: 80px; }
+    .kanban-col.drag-over { outline: 2px dashed #6366f1; outline-offset: -2px; background: #eef2ff; }
+    .kanban-card { background: white; border: 1px solid #e2e8f0; border-radius: 0.75rem; padding: 10px 12px; cursor: grab; box-shadow: 0 1px 2px rgba(0,0,0,0.04); transition: box-shadow .15s, transform .15s; }
+    .kanban-card:hover { box-shadow: 0 4px 12px rgba(15,23,42,.08); transform: translateY(-1px); }
+    .kanban-card.dragging { opacity: 0.45; }
+    .drawer-overlay { position: fixed; inset: 0; background: rgba(15,23,42,.35); z-index: 40; }
+    .lead-drawer { position: fixed; top: 0; right: 0; height: 100%; width: min(440px, 100%); background: white; border-left: 1px solid #e2e8f0; z-index: 50; display: flex; flex-direction: column; box-shadow: -8px 0 24px rgba(15,23,42,.08); transform: translateX(0); animation: slideIn .2s ease; }
+    @keyframes slideIn { from { transform: translateX(24px); opacity: .6; } to { transform: translateX(0); opacity: 1; } }
+    .drawer-tab { padding: 10px 12px; font-size: 13px; font-weight: 600; color: #64748b; border-bottom: 2px solid transparent; cursor: pointer; }
+    .drawer-tab.active { color: #4f46e5; border-color: #4f46e5; }
+    .timeline-item { display: flex; gap: 10px; padding: 10px 0; border-bottom: 1px solid #f1f5f9; }
+    .timeline-dot { width: 8px; height: 8px; border-radius: 999px; background: #6366f1; margin-top: 6px; flex-shrink: 0; }
   </style>
 </head>
 <body class="text-slate-700">
@@ -42,13 +57,16 @@
           <i class="fa-solid fa-bullhorn w-5"></i> Campagnes
         </a>
         <a href="#" onclick="setView('leads')" id="nav-leads" class="nav-link flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-50 transition">
-          <i class="fa-solid fa-users w-5"></i> Leads
+          <i class="fa-solid fa-table-columns w-5"></i> Pipeline
         </a>
         <a href="#" onclick="setView('activity')" id="nav-activity" class="nav-link flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-medium text-slate-600 hover:bg-slate-50 transition">
           <i class="fa-solid fa-chart-line w-5"></i> Activiteit
         </a>
       </nav>
-      <div class="p-4 border-t border-slate-100">
+      <div class="p-4 border-t border-slate-100 space-y-1">
+        <a href="#" onclick="doLogout()" class="flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-medium text-slate-500 hover:bg-slate-50 transition">
+          <i class="fa-solid fa-right-from-bracket w-5"></i> Uitloggen
+        </a>
         <a href="/classic" class="flex items-center gap-3 px-4 py-2.5 rounded-xl text-sm font-medium text-slate-500 hover:bg-slate-50 transition">
           <i class="fa-solid fa-screwdriver-wrench w-5"></i> Geavanceerd
         </a>
@@ -68,7 +86,7 @@
       </header>
 
       <!-- Content -->
-      <div id="content" class="p-8 max-w-6xl mx-auto fade-in">
+      <div id="content" class="p-6 lg:p-8 max-w-none mx-auto fade-in">
         <!-- dynamic -->
       </div>
     </main>
@@ -87,7 +105,11 @@
           <input id="newCampName" type="text" class="w-full px-4 py-3 rounded-xl border border-slate-200 mb-6" placeholder="bijv. Juni outreach">
           <label class="block text-sm font-medium text-slate-700 mb-2">Openingshoek (optioneel)</label>
           <textarea id="newCampAngle" rows="3" class="w-full px-4 py-3 rounded-xl border border-slate-200 mb-2" placeholder="Eén zin die de AI als rode draad gebruikt."></textarea>
-          <p class="text-xs text-slate-400 mb-6">Laat leeg om de AI volledig te laten schrijven.</p>
+          <p class="text-xs text-slate-400 mb-4">Laat leeg om de AI volledig te laten schrijven.</p>
+          <label class="block text-sm font-medium text-slate-700 mb-2">Verzendaccount (optioneel)</label>
+          <select id="newCampAccount" class="w-full px-4 py-3 rounded-xl border border-slate-200 mb-6 text-sm">
+            <option value="">Standaard / automatisch</option>
+          </select>
           <div class="flex justify-end">
             <button onclick="wizardStep2()" class="px-6 py-2.5 rounded-full bg-brand-600 hover:bg-brand-700 text-white text-sm font-semibold">Leads selecteren</button>
           </div>
@@ -114,6 +136,70 @@
     </div>
   </div>
 
+  <!-- Lead detail drawer -->
+  <div id="leadDrawerOverlay" class="drawer-overlay hidden" onclick="closeLeadDrawer()"></div>
+  <aside id="leadDrawer" class="lead-drawer hidden" aria-label="Lead details">
+    <div class="p-5 border-b border-slate-100 flex items-start justify-between gap-3">
+      <div>
+        <div id="drawerStage" class="inline-block px-2 py-0.5 rounded-full text-xs font-semibold bg-slate-100 text-slate-700 mb-2"></div>
+        <h3 id="drawerName" class="text-lg font-semibold text-slate-900"></h3>
+        <p id="drawerSub" class="text-sm text-slate-500 mt-0.5"></p>
+      </div>
+      <button onclick="closeLeadDrawer()" class="text-slate-400 hover:text-slate-600" aria-label="Close"><i class="fa-solid fa-xmark text-xl"></i></button>
+    </div>
+    <div class="flex border-b border-slate-100 px-2">
+      <div class="drawer-tab active" data-tab="overview" onclick="switchDrawerTab('overview')">Overzicht</div>
+      <div class="drawer-tab" data-tab="insight" onclick="switchDrawerTab('insight')">AI-inzicht</div>
+      <div class="drawer-tab" data-tab="notes" onclick="switchDrawerTab('notes')">Notities</div>
+      <div class="drawer-tab" data-tab="timeline" onclick="switchDrawerTab('timeline')">Timeline</div>
+    </div>
+    <div class="flex-1 overflow-y-auto p-5">
+      <div id="drawerTabOverview">
+        <dl class="space-y-3 text-sm">
+          <div class="flex justify-between gap-4"><dt class="text-slate-500">E-mail</dt><dd id="drawerEmail" class="text-slate-900 text-right break-all"></dd></div>
+          <div class="flex justify-between gap-4"><dt class="text-slate-500">Bedrijf</dt><dd id="drawerCompany" class="text-slate-900 text-right"></dd></div>
+          <div class="flex justify-between gap-4"><dt class="text-slate-500">Branche</dt><dd id="drawerIndustry" class="text-slate-900 text-right"></dd></div>
+          <div class="flex justify-between gap-4"><dt class="text-slate-500">Locatie (HQ)</dt><dd id="drawerHq" class="text-slate-900 text-right"></dd></div>
+          <div class="flex justify-between gap-4"><dt class="text-slate-500">Vacatures</dt><dd id="drawerHiring" class="text-slate-900 text-right"></dd></div>
+          <div class="flex justify-between gap-4"><dt class="text-slate-500">Rol</dt><dd id="drawerRole" class="text-slate-900 text-right"></dd></div>
+          <div class="flex justify-between gap-4"><dt class="text-slate-500">Score</dt><dd id="drawerScore" class="text-slate-900 text-right"></dd></div>
+          <div class="flex justify-between gap-4"><dt class="text-slate-500">Prioriteit</dt><dd id="drawerPriority" class="text-slate-900 text-right"></dd></div>
+          <div class="flex justify-between gap-4"><dt class="text-slate-500">Deliverability</dt><dd id="drawerDeliv" class="text-slate-900 text-right"></dd></div>
+          <div class="flex justify-between gap-4"><dt class="text-slate-500">Opportunity</dt><dd id="drawerOpp" class="text-slate-900 text-right"></dd></div>
+          <div class="flex justify-between gap-4"><dt class="text-slate-500">LinkedIn</dt><dd id="drawerLinkedin" class="text-slate-900 text-right break-all"></dd></div>
+          <div class="flex justify-between gap-4"><dt class="text-slate-500">Qualificatie</dt><dd id="drawerQual" class="text-slate-900 text-right"></dd></div>
+          <div class="flex justify-between gap-4"><dt class="text-slate-500">Pijnpunt</dt><dd id="drawerPain" class="text-slate-900 text-right break-words"></dd></div>
+          <div class="flex justify-between gap-4"><dt class="text-slate-500">Opgericht</dt><dd id="drawerFounded" class="text-slate-900 text-right"></dd></div>
+          <div class="flex justify-between gap-4"><dt class="text-slate-500">Specialties</dt><dd id="drawerSpecialties" class="text-slate-900 text-right break-words"></dd></div>
+          <div class="flex justify-between gap-4"><dt class="text-slate-500">Laatste activiteit</dt><dd id="drawerLastAct" class="text-slate-900 text-right"></dd></div>
+        </dl>
+        <div id="drawerDraftPreview" class="mt-4 hidden rounded-xl border border-slate-100 bg-slate-50 p-3">
+          <div class="text-[11px] font-semibold uppercase tracking-wide text-slate-400 mb-1">Laatste e-mailconcept</div>
+          <div id="drawerDraftSubject" class="text-sm font-medium text-slate-800"></div>
+          <p id="drawerDraftBody" class="text-xs text-slate-500 mt-1 line-clamp-3 whitespace-pre-wrap"></p>
+        </div>
+        <label class="block text-xs font-medium text-slate-500 mt-6 mb-1">Fase</label>
+        <select id="drawerStageSelect" class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm" onchange="changeStageFromDrawer(this.value)"></select>
+      </div>
+      <div id="drawerTabInsight" class="hidden">
+        <div id="insightBody" class="space-y-4 text-sm text-slate-600">Laden...</div>
+      </div>
+      <div id="drawerTabNotes" class="hidden">
+        <div class="flex gap-2 mb-4">
+          <textarea id="noteInput" rows="2" class="flex-1 px-3 py-2 rounded-xl border border-slate-200 text-sm" placeholder="Notitie over deze lead..."></textarea>
+          <button onclick="saveNote()" class="px-3 py-2 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-semibold">Opslaan</button>
+        </div>
+        <div class="text-[11px] font-semibold uppercase tracking-wide text-slate-400 mb-2">Transcript</div>
+        <div id="transcriptList" class="space-y-2 mb-5"></div>
+        <div class="text-[11px] font-semibold uppercase tracking-wide text-slate-400 mb-2">Notities</div>
+        <div id="notesList" class="space-y-3"></div>
+      </div>
+      <div id="drawerTabTimeline" class="hidden">
+        <div id="timelineList" class="text-sm text-slate-500">Laden...</div>
+      </div>
+    </div>
+  </aside>
+
   <script>
     let view = 'overview';
     let stats = {};
@@ -121,6 +207,37 @@
     let leads = [];
     let selectedLeads = new Set();
     let selectableLeads = [];
+    let activeLeadId = null;
+    let activeDrawerTab = 'overview';
+    let dragLeadId = null;
+
+    const BOARD_COLUMNS = [
+      { id: 'new', label: 'Nieuw', color: 'bg-slate-500', stages: ['INGESTED','RESEARCHED','DELIVERABILITY_VERIFIED','OPPORTUNITY_MAPPED','PRE_QUALIFIED','DISCOVERED','ENRICHING','VERIFYING','READY','CONTACTED'] },
+      { id: 'draft', label: 'Concept', color: 'bg-amber-500', stages: ['OUTREACH_DRAFTED','PENDING_APPROVAL'] },
+      { id: 'active', label: 'Actief', color: 'bg-blue-500', stages: ['ACTIVE_OUTREACH','EMAIL_SENT','BOUNCED','BLOCKED'] },
+      { id: 'replied', label: 'Reactie', color: 'bg-emerald-500', stages: ['REPLIED','INTERESTED','OBJECTION'] },
+      { id: 'meeting', label: 'Meeting', color: 'bg-violet-500', stages: ['MEETING_BOOKED','MEETING_SCHEDULED'] },
+      { id: 'closed', label: 'Einde', color: 'bg-slate-700', stages: ['CLOSED_WON','CLOSED_LOST','OPT_OUT','NURTURE'] },
+    ];
+
+    const ALL_STAGES = [
+      'INGESTED','RESEARCHED','DELIVERABILITY_VERIFIED','OPPORTUNITY_MAPPED','PRE_QUALIFIED',
+      'OUTREACH_DRAFTED','PENDING_APPROVAL','ACTIVE_OUTREACH','EMAIL_SENT','REPLIED','INTERESTED',
+      'OBJECTION','MEETING_BOOKED','MEETING_SCHEDULED','CLOSED_WON','CLOSED_LOST','BOUNCED',
+      'BLOCKED','OPT_OUT','NURTURE','DISCOVERED','ENRICHING','VERIFYING','READY','CONTACTED'
+    ];
+
+    const STAGE_BADGE = {
+      PENDING_APPROVAL: 'bg-amber-50 text-amber-700',
+      ACTIVE_OUTREACH: 'bg-blue-50 text-blue-700',
+      REPLIED: 'bg-emerald-50 text-emerald-700',
+      MEETING_BOOKED: 'bg-violet-50 text-violet-700',
+      MEETING_SCHEDULED: 'bg-violet-50 text-violet-700',
+      CLOSED_WON: 'bg-emerald-50 text-emerald-700',
+      CLOSED_LOST: 'bg-slate-100 text-slate-600',
+      BOUNCED: 'bg-red-50 text-red-700',
+      BLOCKED: 'bg-red-50 text-red-700',
+    };
 
     async function init() {
       loadView();
@@ -137,13 +254,19 @@
 
     function updateStatusPill() {
       const el = document.getElementById('status-pill');
-      if (stats.healthy) {
+      const sending = !!(stats.really_sending || stats.healthy);
+      if (sending) {
         el.className = 'flex items-center gap-2 px-3 py-1.5 rounded-full bg-emerald-50 text-emerald-700 text-xs font-medium';
         el.innerHTML = '<span class="w-2 h-2 rounded-full bg-emerald-500"></span> Outreach draait';
       } else {
         el.className = 'flex items-center gap-2 px-3 py-1.5 rounded-full bg-amber-50 text-amber-700 text-xs font-medium';
         el.innerHTML = '<span class="w-2 h-2 rounded-full bg-amber-500"></span> Wacht op eerste activiteit';
       }
+    }
+
+    async function doLogout() {
+      try { await fetch('/api/auth/logout', { method: 'POST' }); } catch (e) {}
+      window.location.href = '/login';
     }
 
     function setView(v) {
@@ -168,9 +291,11 @@
       campaigns = (await campRes.json()).campaigns || [];
       updateStatusPill();
       const c = campaigns[0] || {};
+      const h = new Date().getHours();
+      const greet = h < 12 ? 'Goedemorgen' : (h < 18 ? 'Goedemiddag' : 'Goedenavond');
       document.getElementById('content').innerHTML = `
         <div class="mb-6">
-          <h1 class="text-2xl font-semibold text-slate-900">Goedemorgen</h1>
+          <h1 class="text-2xl font-semibold text-slate-900">${greet}</h1>
           <p class="text-slate-500">Je outbound draait op de achtergrond. Hier is de stand van zaken.</p>
         </div>
         <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
@@ -195,14 +320,58 @@
     }
 
     function renderCampaignCard(c) {
+      const allowed = ['active', 'paused', 'draft', 'completed', 'archived'];
+      const status = allowed.includes(c.status) ? c.status : 'draft';
+      const badge = status === 'active'
+        ? 'bg-emerald-50 text-emerald-700'
+        : (status === 'paused' ? 'bg-amber-50 text-amber-700' : 'bg-slate-100 text-slate-600');
+      const pauseBtn = status === 'active'
+        ? `<button data-cid="${esc(c.campaign_id)}" onclick="toggleCampaignStatus(this.dataset.cid,'paused')" class="text-xs font-medium text-amber-700 hover:text-amber-800 px-2 py-1 rounded-lg hover:bg-amber-50">Pauzeren</button>`
+        : (status === 'paused'
+          ? `<button data-cid="${esc(c.campaign_id)}" onclick="toggleCampaignStatus(this.dataset.cid,'active')" class="text-xs font-medium text-emerald-700 hover:text-emerald-800 px-2 py-1 rounded-lg hover:bg-emerald-50">Hervatten</button>`
+          : '');
+      const delBtn = `<button data-cid="${esc(c.campaign_id)}" data-cname="${esc(c.name)}" onclick="deleteCampaign(this.dataset.cid, this.dataset.cname)" class="text-xs font-medium text-red-600 hover:text-red-700 px-2 py-1 rounded-lg hover:bg-red-50">Verwijderen</button>`;
       return `
-        <div class="flex items-center justify-between border border-slate-100 rounded-xl p-4 hover:border-brand-200 transition">
-          <div>
-            <div class="font-semibold text-slate-900">${esc(c.name)}</div>
+        <div class="flex items-center justify-between border border-slate-100 rounded-xl p-4 hover:border-brand-200 transition gap-3">
+          <div class="min-w-0">
+            <div class="font-semibold text-slate-900 truncate">${esc(c.name)}</div>
             <div class="text-xs text-slate-500 mt-1">${c.lead_count || 0} leads · ${c.sent_count || 0} verstuurd · ${c.reply_count || 0} reacties</div>
           </div>
-          <span class="px-2.5 py-1 rounded-full text-xs font-medium ${c.status === 'active' ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-600'}">${c.status || 'draft'}</span>
+          <div class="flex items-center gap-2 shrink-0">
+            <span class="px-2.5 py-1 rounded-full text-xs font-medium ${badge}">${esc(status)}</span>
+            ${pauseBtn}
+            ${delBtn}
+          </div>
         </div>`;
+    }
+
+    async function toggleCampaignStatus(id, status) {
+      if (!id) return;
+      try {
+        const res = await fetch(`/api/campaigns/${encodeURIComponent(id)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status }),
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        await loadCampaigns();
+        await refreshStats();
+      } catch (e) {
+        alert('Status wijzigen mislukt: ' + e.message);
+      }
+    }
+
+    async function deleteCampaign(id, name) {
+      if (!id) return;
+      if (!confirm(`Campagne "${name || ''}" verwijderen? Dit stopt ook de sequence.`)) return;
+      try {
+        const res = await fetch(`/api/campaigns/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        await loadCampaigns();
+        await refreshStats();
+      } catch (e) {
+        alert('Verwijderen mislukt: ' + e.message);
+      }
     }
 
     async function loadCampaigns() {
@@ -220,21 +389,536 @@
     async function loadLeads() {
       const res = await fetch('/api/leads');
       leads = await res.json();
-      const rows = leads.slice(0, 50).map(l => `
-        <tr class="border-b border-slate-100 hover:bg-slate-50">
-          <td class="py-3 px-4 text-sm font-medium text-slate-900">${esc(l.first_name || '')} ${esc(l.last_name || '')}</td>
-          <td class="py-3 px-4 text-sm text-slate-600">${esc(l.company_name || l.company_domain || '')}</td>
-          <td class="py-3 px-4 text-sm text-slate-600">${esc(l.role || '')}</td>
-          <td class="py-3 px-4"><span class="px-2 py-1 rounded-full text-xs font-medium bg-slate-100 text-slate-700">${esc(l.current_stage || '')}</span></td>
-        </tr>`).join('');
+      renderBoard();
+    }
+
+    function columnForStage(stage) {
+      return BOARD_COLUMNS.find(c => c.stages.includes(stage)) || BOARD_COLUMNS[0];
+    }
+
+    function stageBadgeClass(stage) {
+      return STAGE_BADGE[stage] || 'bg-slate-100 text-slate-700';
+    }
+
+    function leadCardHtml(l) {
+      const badge = stageBadgeClass(l.current_stage);
+      const name = `${l.first_name || ''} ${l.last_name || ''}`.trim() || l.email || 'Onbekend';
+      const sub = [l.role, l.company_name || l.company_domain].filter(Boolean).join(' · ');
+      const score = Number(l.lead_score) || 0;
+      const scoreColor = score >= 70 ? 'text-emerald-600' : (score >= 40 ? 'text-amber-600' : 'text-slate-400');
+      const pri = String(l.priority || '').toUpperCase();
+      const priDot = pri === 'HOT' ? 'bg-red-500' : (pri === 'WARM' ? 'bg-amber-500' : (pri === 'NURTURE' ? 'bg-sky-500' : ''));
+      const draft = asObj(l.outreach_draft);
+      const deliv = asObj(l.deliverability_audit);
+      const opp = asObj(l.opportunity_mapping);
+      const qual = asObj(l.qualification_assessment);
+      const conf = deliv && deliv.confidence_score != null ? Number(deliv.confidence_score) : null;
+      const oppScore = opp && opp.opportunity_score != null ? Number(opp.opportunity_score) : null;
+      const pain = firstPain(opp && opp.pain_points);
+      const qualScore = qual && qual.lead_score != null ? Number(qual.lead_score) : null;
+      const emailBits = [];
+      if (draft && draft.subject) emailBits.push(`<span class="inline-flex items-center gap-1 text-[10px] text-slate-500" title="${esc(String(draft.subject).slice(0,120))}"><i class="fa-regular fa-envelope"></i> concept</span>`);
+      if (l.current_stage === 'EMAIL_SENT' || l.current_stage === 'ACTIVE_OUTREACH') emailBits.push('<span class="text-[10px] text-blue-600 font-medium">verstuurd</span>');
+      if (l.current_stage === 'REPLIED' || l.current_stage === 'INTERESTED' || l.current_stage === 'MEETING_BOOKED') emailBits.push('<span class="text-[10px] text-emerald-600 font-medium">reactie</span>');
+      if (l.current_stage === 'BOUNCED') emailBits.push('<span class="text-[10px] text-red-600 font-medium">bounce</span>');
+      const firmBits = [];
+      if (l.company_industry) firmBits.push(`<span class="inline-flex items-center gap-0.5 truncate max-w-[110px]" title="Branche"><i class="fa-solid fa-building text-slate-400"></i>${esc(String(l.company_industry))}</span>`);
+      if (l.company_size) firmBits.push(`<span class="inline-flex items-center gap-0.5" title="Bedrijfsgrootte"><i class="fa-solid fa-users text-slate-400"></i>${esc(String(l.company_size))}</span>`);
+      if (l.company_headquarters) firmBits.push(`<span class="inline-flex items-center gap-0.5 truncate max-w-[120px]" title="Hoofdkantoor"><i class="fa-solid fa-location-dot text-slate-400"></i>${esc(String(l.company_headquarters))}</span>`);
+      if (l.company_hiring_count != null && l.company_hiring_count !== '' && Number(l.company_hiring_count) > 0) firmBits.push(`<span class="inline-flex items-center gap-0.5" title="Openstaande vacatures"><i class="fa-solid fa-flag text-emerald-500"></i>${esc(String(l.company_hiring_count))}</span>`);
+      if (l.email) {
+        const domain = String(l.email).split('@')[1] || '';
+        if (domain) firmBits.push(`<span class="inline-flex items-center gap-0.5 truncate max-w-[110px]" title="${esc(l.email)}"><i class="fa-solid fa-at text-slate-400"></i>${esc(domain)}</span>`);
+      }
+      const liBits = [];
+      if (l.linkedin_url) liBits.push(`<span class="inline-flex items-center gap-0.5" title="LinkedIn"><i class="fa-brands fa-linkedin text-slate-400"></i></span>`);
+      const research = asObj(l.research_result);
+      const hook = research && (research.strongest_hook || research.summary) ? String(research.strongest_hook || research.summary).slice(0, 90) : '';
+      const showMeta = (pain || conf != null || oppScore != null || qualScore != null || firmBits.length || hook);
+      return `
+        <article class="kanban-card" draggable="true" data-id="${esc(l.contact_id)}" onclick="openLeadDrawer('${esc(l.contact_id)}')">
+          <div class="flex items-start justify-between gap-2">
+            <div class="min-w-0 flex-1">
+              <div class="text-sm font-semibold text-slate-900 leading-snug flex items-center gap-1.5">
+                ${priDot ? `<span class="w-1.5 h-1.5 rounded-full ${priDot} shrink-0" title="${esc(pri)}"></span>` : ''}
+                <span class="truncate">${esc(name)}</span>
+              </div>
+              <div class="text-xs text-slate-500 mt-0.5 line-clamp-2">${esc(sub)}</div>
+            </div>
+            ${score ? `<span class="text-[11px] font-semibold ${scoreColor} shrink-0" title="Lead score">${score}</span>` : ''}
+          </div>
+          ${showMeta ? `
+          <div class="mt-1.5 flex flex-wrap gap-x-2 gap-y-0.5 text-[10px] text-slate-500">
+            ${firmBits.join('')}
+            ${conf != null ? `<span class="inline-flex items-center gap-0.5" title="Deliverability confidence"><i class="fa-solid fa-shield-halved ${conf>=80?'text-emerald-500':(conf>=50?'text-amber-500':'text-red-400')}"></i>${conf}%</span>` : ''}
+            ${oppScore != null ? `<span class="inline-flex items-center gap-0.5" title="Opportunity score"><i class="fa-solid fa-bullseye text-brand-500"></i>${oppScore}/10</span>` : ''}
+            ${qualScore != null ? `<span class="inline-flex items-center gap-0.5" title="Qualification score"><i class="fa-solid fa-clipboard-check text-violet-500"></i>${qualScore}</span>` : ''}
+            ${pain ? `<span class="truncate max-w-[140px]" title="${esc(pain)}">${esc(pain)}</span>` : ''}
+            ${hook && !pain ? `<span class="truncate max-w-[160px] text-slate-400" title="${esc(hook)}">${esc(hook)}</span>` : ''}
+            ${liBits.join('')}
+          </div>` : ''}
+          <div class="flex items-center justify-between mt-2 gap-2">
+            <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase tracking-wide ${badge}">${esc(l.current_stage || '')}</span>
+            <span class="flex items-center gap-2">${emailBits.join('')}</span>
+          </div>
+        </article>`;
+    }
+
+    function firstPain(list) {
+      if (!list || !list.length) return '';
+      const p = list[0];
+      if (typeof p === 'string') return p;
+      if (p && typeof p === 'object') return p.problem || p.pain || p.text || '';
+      return '';
+    }
+
+    function painList(list) {
+      if (!Array.isArray(list)) return [];
+      return list.map(p => (typeof p === 'string' ? p : (p && (p.problem || p.pain || p.text)) || '')).filter(Boolean);
+    }
+
+    function renderBoard() {
+      const buckets = {};
+      BOARD_COLUMNS.forEach(c => { buckets[c.id] = []; });
+      leads.forEach(l => {
+        const col = columnForStage(l.current_stage || 'INGESTED');
+        buckets[col.id].push(l);
+      });
+      // Sort within columns: score desc, then name
+      Object.values(buckets).forEach(arr => arr.sort((a, b) => (Number(b.lead_score)||0) - (Number(a.lead_score)||0)));
+      const html = BOARD_COLUMNS.map(col => {
+        const cards = buckets[col.id];
+        const avg = cards.length ? Math.round(cards.reduce((s, c) => s + (Number(c.lead_score)||0), 0) / cards.length) : null;
+        return `
+          <section class="kanban-col" data-col="${col.id}" ondragover="onDragOver(event)" ondragleave="onDragLeave(event)" ondrop="onDrop(event, '${col.id}')">
+            <div class="kanban-col-head">
+              <div class="flex items-center gap-2 min-w-0">
+                <span class="w-2 h-2 rounded-full ${col.color}"></span>
+                <span class="text-sm font-semibold text-slate-800 truncate">${col.label}</span>
+              </div>
+              <div class="flex items-center gap-1.5">
+                ${avg != null && cards.length ? `<span class="text-[10px] text-slate-400" title="Gem. score">⌀${avg}</span>` : ''}
+                <span class="text-xs font-medium text-slate-500 bg-white border border-slate-200 rounded-full px-2 py-0.5">${cards.length}</span>
+              </div>
+            </div>
+            <div class="kanban-col-body" data-col-body="${col.id}">
+              ${cards.length ? cards.map(leadCardHtml).join('') : '<p class="text-xs text-slate-400 px-2 py-3">Sleep leads hierheen</p>'}
+            </div>
+          </section>`;
+      }).join('');
+
+      const stageCounts = {};
+      leads.forEach(l => { const s = l.current_stage || 'INGESTED'; stageCounts[s] = (stageCounts[s]||0)+1; });
+      const topStages = Object.entries(stageCounts).sort((a,b)=>b[1]-a[1]).slice(0,6)
+        .map(([s,c]) => `<span class="px-2 py-0.5 rounded-full text-[10px] font-medium bg-slate-100 text-slate-600">${esc(s)} ${c}</span>`).join('');
+
       document.getElementById('content').innerHTML = `
-        <div class="mb-6"><h1 class="text-2xl font-semibold text-slate-900">Leads</h1><p class="text-slate-500 text-sm">Recent toegevoegde contacten.</p></div>
-        <div class="card overflow-hidden">
-          <table class="w-full text-left">
-            <thead class="bg-slate-50 text-xs font-semibold text-slate-500 uppercase"><tr><th class="py-3 px-4">Naam</th><th class="py-3 px-4">Bedrijf</th><th class="py-3 px-4">Rol</th><th class="py-3 px-4">Fase</th></tr></thead>
-            <tbody>${rows}</tbody>
-          </table>
-        </div>`;
+        <div class="mb-6 flex items-end justify-between gap-4 flex-wrap">
+          <div>
+            <h1 class="text-2xl font-semibold text-slate-900">Pipeline</h1>
+            <p class="text-slate-500 text-sm">Sleep een lead naar een andere kolom. Klik voor research, deliverability, outreach en timeline.</p>
+          </div>
+          <div class="flex items-center gap-3 flex-wrap">
+            <div class="bg-slate-50 rounded-xl px-3 py-2 flex items-center gap-2 border border-slate-200">
+              <i class="fa-solid fa-search text-slate-400 text-xs"></i>
+              <input id="pipelineSearch" type="text" oninput="filterBoard(this.value)" class="bg-transparent text-sm focus:outline-none w-40" placeholder="Zoek naam, bedrijf, e-mail...">
+            </div>
+            <span class="text-xs text-slate-500">${leads.length} leads</span>
+          </div>
+        </div>
+        <div class="flex flex-wrap gap-1.5 mb-4">${topStages}</div>
+        <div class="kanban" id="kanbanBoard">${html}</div>`;
+
+      bindDragHandlers();
+    }
+
+    let boardFilter = '';
+    function filterBoard(q) {
+      boardFilter = (q || '').toLowerCase();
+      document.querySelectorAll('.kanban-card').forEach(card => {
+        const id = card.dataset.id;
+        const l = leads.find(x => x.contact_id === id);
+        if (!l) return;
+        const hay = `${l.first_name||''} ${l.last_name||''} ${l.email||''} ${l.company_name||''} ${l.company_domain||''} ${l.role||''} ${l.current_stage||''}`.toLowerCase();
+        card.style.display = !boardFilter || hay.includes(boardFilter) ? '' : 'none';
+      });
+    }
+
+    function bindDragHandlers() {
+      document.querySelectorAll('.kanban-card').forEach(card => {
+        card.addEventListener('dragstart', e => {
+          dragLeadId = card.dataset.id;
+          card.classList.add('dragging');
+          e.dataTransfer.effectAllowed = 'move';
+          e.dataTransfer.setData('text/plain', dragLeadId);
+          e.stopPropagation();
+        });
+        card.addEventListener('dragend', () => {
+          card.classList.remove('dragging');
+          dragLeadId = null;
+          document.querySelectorAll('.kanban-col').forEach(c => c.classList.remove('drag-over'));
+        });
+        card.addEventListener('click', e => {
+          e.stopPropagation();
+          openLeadDrawer(card.dataset.id);
+        });
+      });
+    }
+
+    function onDragOver(e) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      const col = e.currentTarget.closest('.kanban-col') || e.currentTarget;
+      if (col && col.classList) col.classList.add('drag-over');
+    }
+
+    function onDragLeave(e) {
+      const col = e.currentTarget.closest('.kanban-col') || e.currentTarget;
+      if (col && col.classList) col.classList.remove('drag-over');
+    }
+
+    async function onDrop(e, colId) {
+      e.preventDefault();
+      const col = document.querySelector(`.kanban-col[data-col="${colId}"]`);
+      if (col) col.classList.remove('drag-over');
+      const id = e.dataTransfer.getData('text/plain') || dragLeadId;
+      if (!id) return;
+      const lead = leads.find(l => l.contact_id === id);
+      if (!lead) return;
+      const target = BOARD_COLUMNS.find(c => c.id === colId);
+      if (!target) return;
+      const currentCol = columnForStage(lead.current_stage || 'INGESTED');
+      if (currentCol.id === target.id) return;
+      const nextStage = lead.current_stage && target.stages.includes(lead.current_stage)
+        ? lead.current_stage
+        : target.stages[0];
+      const prevStage = lead.current_stage;
+      lead.current_stage = nextStage;
+      renderBoard();
+      try {
+        const res = await fetch(`/api/leads/${encodeURIComponent(id)}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ current_stage: nextStage }),
+        });
+        if (!res.ok) throw new Error(await res.text());
+      } catch (err) {
+        lead.current_stage = prevStage;
+        renderBoard();
+        alert('Stage bijwerken mislukt. Probeer opnieuw.');
+      }
+    }
+
+    async function changeStageFromDrawer(stage) {
+      if (!activeLeadId || !stage) return;
+      const lead = leads.find(l => l.contact_id === activeLeadId);
+      const prev = lead ? lead.current_stage : null;
+      if (lead) lead.current_stage = stage;
+      try {
+        const res = await fetch(`/api/leads/${encodeURIComponent(activeLeadId)}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ current_stage: stage }),
+        });
+        if (!res.ok) throw new Error('bad response');
+        document.getElementById('drawerStage').textContent = stage;
+        document.getElementById('drawerStage').className = `inline-block px-2 py-0.5 rounded-full text-xs font-semibold mb-2 ${stageBadgeClass(stage)}`;
+        renderBoard();
+      } catch (e) {
+        if (lead) lead.current_stage = prev;
+        document.getElementById('drawerStageSelect').value = prev || stage;
+        alert('Stage bijwerken mislukt.');
+      }
+    }
+
+    async function openLeadDrawer(id) {
+      activeLeadId = id;
+      const lead = leads.find(l => l.contact_id === id);
+      if (!lead) return;
+      document.getElementById('drawerName').textContent = `${lead.first_name || ''} ${lead.last_name || ''}`.trim() || lead.email || 'Lead';
+      document.getElementById('drawerSub').textContent = [lead.role, lead.company_name || lead.company_domain].filter(Boolean).join(' at ') || '';
+      const badge = document.getElementById('drawerStage');
+      badge.textContent = lead.current_stage || '';
+      badge.className = `inline-block px-2 py-0.5 rounded-full text-xs font-semibold mb-2 ${stageBadgeClass(lead.current_stage)}`;
+      document.getElementById('drawerEmail').textContent = lead.email || '—';
+      document.getElementById('drawerCompany').textContent = lead.company_name || lead.company_domain || '—';
+      document.getElementById('drawerIndustry').textContent = [lead.company_industry, lead.company_size].filter(Boolean).join(' · ') || '—';
+      document.getElementById('drawerHq').textContent = lead.company_headquarters || '—';
+      const hc = lead.company_hiring_count;
+      document.getElementById('drawerHiring').textContent = (hc != null && hc !== '' && Number(hc) > 0) ? `${hc} open` : '—';
+      document.getElementById('drawerRole').textContent = lead.role || '—';
+      document.getElementById('drawerScore').textContent = lead.lead_score ? `${lead.lead_score}/100` : '—';
+      document.getElementById('drawerPriority').textContent = lead.priority || '—';
+
+      const deliv = asObj(lead.deliverability_audit);
+      const opp = asObj(lead.opportunity_mapping);
+      const delivEl = document.getElementById('drawerDeliv');
+      if (deliv && deliv.confidence_score != null) {
+        const c = Number(deliv.confidence_score);
+        const cls = c >= 80 ? 'text-emerald-600' : (c >= 50 ? 'text-amber-600' : 'text-red-600');
+        delivEl.innerHTML = `<span class="${cls} font-semibold">${c}%</span>`;
+      } else delivEl.textContent = '—';
+      const oppEl = document.getElementById('drawerOpp');
+      if (opp && opp.opportunity_score != null) {
+        oppEl.innerHTML = `<span class="font-semibold">${Number(opp.opportunity_score)}/10</span>`;
+      } else oppEl.textContent = '—';
+
+      const draft = asObj(lead.outreach_draft);
+      const draftBox = document.getElementById('drawerDraftPreview');
+      if (draft && (draft.subject || draft.body)) {
+        draftBox.classList.remove('hidden');
+        document.getElementById('drawerDraftSubject').textContent = draft.subject || '(geen onderwerp)';
+        document.getElementById('drawerDraftBody').textContent = String(draft.body || '').slice(0, 400);
+      } else {
+        draftBox.classList.add('hidden');
+      }
+
+      const li = document.getElementById('drawerLinkedin');
+      if (lead.linkedin_url && /^https?:\/\//i.test(String(lead.linkedin_url))) {
+        li.innerHTML = `<a class="text-brand-600 hover:underline" href="${esc(lead.linkedin_url)}" target="_blank" rel="noopener">Open LinkedIn</a>`;
+      } else {
+        li.textContent = '—';
+      }
+
+      const qual = asObj(lead.qualification_assessment);
+      const qualEl = document.getElementById('drawerQual');
+      if (qual && qual.lead_score != null) {
+        qualEl.innerHTML = `<span class="font-semibold">${Number(qual.lead_score)}/100</span>${qual.priority ? ' · ' + esc(qual.priority) : ''}`;
+      } else qualEl.textContent = '—';
+
+      const painEl = document.getElementById('drawerPain');
+      let painTxt = '';
+      const oppPain = firstPain(opp && opp.pain_points);
+      const resPain = firstPain(asObj(lead.research_result) && asObj(lead.research_result).pain_points);
+      painTxt = oppPain || resPain || '';
+      painEl.textContent = painTxt ? painTxt.slice(0, 120) : '—';
+      painEl.title = painTxt || '';
+
+      document.getElementById('drawerFounded').textContent = lead.company_founded || '—';
+      const spec = lead.company_specialties;
+      const specEl = document.getElementById('drawerSpecialties');
+      let specTxt = '';
+      if (Array.isArray(spec)) specTxt = spec.join(', ');
+      else if (typeof spec === 'string') {
+        try {
+          const p = JSON.parse(spec);
+          specTxt = Array.isArray(p) ? p.join(', ') : spec;
+        } catch (e) { specTxt = spec; }
+      }
+      specEl.textContent = specTxt ? specTxt.slice(0, 160) : '—';
+      specEl.title = specTxt || '';
+
+      const lastActEl = document.getElementById('drawerLastAct');
+      lastActEl.textContent = lead.updated_at ? formatTime(lead.updated_at) : (lead.created_at ? formatTime(lead.created_at) : '—');
+
+      const sel = document.getElementById('drawerStageSelect');
+      sel.innerHTML = ALL_STAGES.map(s => `<option value="${s}" ${s === lead.current_stage ? 'selected' : ''}>${s}</option>`).join('');
+      renderInsightTab(lead);
+      document.getElementById('leadDrawerOverlay').classList.remove('hidden');
+      document.getElementById('leadDrawer').classList.remove('hidden');
+      switchDrawerTab('overview');
+      loadNotes();
+      loadTimeline();
+    }
+
+    function asObj(v) {
+      if (!v) return null;
+      if (typeof v === 'object') return v;
+      try { const p = JSON.parse(v); return p && typeof p === 'object' ? p : null; } catch (e) { return null; }
+    }
+
+    function renderInsightTab(lead) {
+      const research = asObj(lead.research_result);
+      const deliv = asObj(lead.deliverability_audit);
+      const opp = asObj(lead.opportunity_mapping);
+      const qual = asObj(lead.qualification_assessment);
+      const draft = asObj(lead.outreach_draft);
+      const inbox = asObj(lead.inbox_assessment);
+      const sections = [];
+
+      if (research) {
+        const pains = painList(research.pain_points || (research.pain_point ? [research.pain_point] : []));
+        const summary = research.summary || research.description || research.overview || research.company_summary || '';
+        const tech = Array.isArray(research.tech_stack) ? research.tech_stack : (Array.isArray(research.technologies) ? research.technologies : []);
+        const firm = [research.linkedin_size, research.linkedin_headquarters, research.linkedin_specialties]
+          .filter(Boolean).map(esc);
+        const hiring = research.linkedin_hiring_count != null && Number(research.linkedin_hiring_count) > 0
+          ? `${Number(research.linkedin_hiring_count)} vacature(s)` : '';
+        sections.push(`
+          <div class="rounded-xl border border-slate-100 p-3 bg-white">
+            <div class="text-[11px] font-semibold uppercase tracking-wide text-slate-400 mb-1.5"><i class="fa-solid fa-magnifying-glass mr-1"></i>Research</div>
+            ${summary ? `<p class="text-slate-700 mb-2">${esc(String(summary).slice(0, 500))}</p>` : ''}
+            ${firm.length || hiring ? `<div class="flex flex-wrap gap-1 mb-2">${firm.map(f => `<span class="px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 text-[11px]">${f}</span>`).join('')}${hiring ? `<span class="px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 text-[11px]">${esc(hiring)}</span>` : ''}</div>` : ''}
+            ${pains.length ? `<div class="flex flex-wrap gap-1">${pains.slice(0,6).map(p => `<span class="px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 text-[11px]">${esc(String(p).slice(0,80))}</span>`).join('')}</div>` : ''}
+            ${tech.length ? `<div class="mt-2 text-xs text-slate-500">Tech: ${tech.slice(0,6).map(esc).join(', ')}</div>` : ''}
+            ${!summary && !pains.length && !tech.length && !firm.length && !hiring ? '<p class="text-xs text-slate-400">Nog geen research-data.</p>' : ''}
+          </div>`);
+      } else {
+        sections.push(`<div class="rounded-xl border border-slate-100 p-3 bg-white text-xs text-slate-400">Research: nog niet gelopen.</div>`);
+      }
+
+      if (deliv) {
+        const reasons = Array.isArray(deliv.reasons) ? deliv.reasons : [];
+        const conf = deliv.confidence_score;
+        sections.push(`
+          <div class="rounded-xl border border-slate-100 p-3 bg-white">
+            <div class="text-[11px] font-semibold uppercase tracking-wide text-slate-400 mb-1.5"><i class="fa-solid fa-shield-halved mr-1"></i>Deliverability</div>
+            <div class="text-sm text-slate-700 mb-1">${conf != null ? `Score <strong>${esc(conf)}%</strong>` : 'Geen score'}${deliv.verdict ? ' · ' + esc(deliv.verdict) : ''}</div>
+            ${reasons.length ? `<ul class="text-xs text-slate-500 list-disc pl-4 space-y-0.5">${reasons.slice(0,5).map(r => `<li>${esc(r)}</li>`).join('')}</ul>` : ''}
+          </div>`);
+      }
+
+      if (opp) {
+        const pains = painList(opp.pain_points);
+        const sols = (Array.isArray(opp.selected_solutions) ? opp.selected_solutions : (Array.isArray(opp.matched_solutions) ? opp.matched_solutions : []))
+          .map(s => (typeof s === 'string' ? s : (s && s.solution) || '')).filter(Boolean);
+        sections.push(`
+          <div class="rounded-xl border border-slate-100 p-3 bg-white">
+            <div class="text-[11px] font-semibold uppercase tracking-wide text-slate-400 mb-1.5"><i class="fa-solid fa-bullseye mr-1"></i>Opportunity${opp.opportunity_score != null ? ` · ${esc(opp.opportunity_score)}/10` : ''}</div>
+            ${opp.strongest_hook ? `<p class="text-sm text-slate-700 mb-1.5">${esc(opp.strongest_hook)}</p>` : ''}
+            ${pains.length ? `<div class="text-xs text-slate-500 mb-1">Pijnpunten: ${pains.slice(0,4).map(esc).join(' · ')}</div>` : ''}
+            ${sols.length ? `<div class="flex flex-wrap gap-1">${sols.map(s => `<span class="px-2 py-0.5 rounded-full bg-brand-50 text-brand-700 text-[11px]">${esc(s)}</span>`).join('')}</div>` : ''}
+          </div>`);
+      }
+
+      if (qual) {
+        const bant = qual.bant_analysis || {};
+        const rows = [
+          ['Budget', bant.budget], ['Authority', bant.authority],
+          ['Need', bant.need], ['Timeline', bant.timeline],
+        ].filter(([, v]) => v);
+        sections.push(`
+          <div class="rounded-xl border border-slate-100 p-3 bg-white">
+            <div class="text-[11px] font-semibold uppercase tracking-wide text-slate-400 mb-1.5"><i class="fa-solid fa-clipboard-check mr-1"></i>Qualification${qual.lead_score != null ? ` · ${esc(qual.lead_score)}/100` : ''}${qual.priority ? ' · ' + esc(qual.priority) : ''}</div>
+            ${rows.length ? `<dl class="text-xs space-y-1">${rows.map(([k,v]) => `<div class="flex justify-between gap-3"><dt class="text-slate-500">${k}</dt><dd class="text-slate-700 text-right">${esc(v)}</dd></div>`).join('')}</dl>` : (qual.summary ? `<p class="text-xs text-slate-600">${esc(qual.summary)}</p>` : '<p class="text-xs text-slate-400">Geen BANT-detail.</p>')}
+            ${qual.spin_analysis && qual.spin_analysis.problem ? `<p class="text-xs text-slate-500 mt-2">SPIN: ${esc(qual.spin_analysis.problem)}</p>` : ''}
+          </div>`);
+      }
+
+      if (draft) {
+        sections.push(`
+          <div class="rounded-xl border border-slate-100 p-3 bg-white">
+            <div class="text-[11px] font-semibold uppercase tracking-wide text-slate-400 mb-1.5"><i class="fa-regular fa-envelope mr-1"></i>Outreach draft</div>
+            ${draft.subject ? `<div class="text-sm font-medium text-slate-800 mb-1">${esc(draft.subject)}</div>` : ''}
+            ${draft.body ? `<p class="text-xs text-slate-600 whitespace-pre-wrap">${esc(String(draft.body).slice(0, 800))}</p>` : ''}
+            ${!draft.subject && !draft.body ? '<p class="text-xs text-slate-400">Leeg concept.</p>' : ''}
+          </div>`);
+      }
+
+      if (inbox) {
+        const intent = inbox.intent || inbox.classification || inbox.summary || inbox.category || '';
+        const body = intent || (Object.keys(inbox).length ? JSON.stringify(inbox).slice(0, 200) : 'Geen inbox-classificatie.');
+        sections.push(`
+          <div class="rounded-xl border border-slate-100 p-3 bg-white">
+            <div class="text-[11px] font-semibold uppercase tracking-wide text-slate-400 mb-1.5"><i class="fa-solid fa-inbox mr-1"></i>Inbox</div>
+            <p class="text-xs text-slate-600">${esc(body)}</p>
+          </div>`);
+      }
+
+      document.getElementById('insightBody').innerHTML = sections.join('') || '<p class="text-slate-400">Geen AI-inzicht beschikbaar.</p>';
+    }
+
+    function closeLeadDrawer() {
+      activeLeadId = null;
+      document.getElementById('leadDrawerOverlay').classList.add('hidden');
+      document.getElementById('leadDrawer').classList.add('hidden');
+    }
+
+    function switchDrawerTab(tab) {
+      activeDrawerTab = tab;
+      document.querySelectorAll('.drawer-tab').forEach(el => {
+        el.classList.toggle('active', el.dataset.tab === tab);
+      });
+      document.getElementById('drawerTabOverview').classList.toggle('hidden', tab !== 'overview');
+      document.getElementById('drawerTabInsight').classList.toggle('hidden', tab !== 'insight');
+      document.getElementById('drawerTabNotes').classList.toggle('hidden', tab !== 'notes');
+      document.getElementById('drawerTabTimeline').classList.toggle('hidden', tab !== 'timeline');
+      if (tab === 'notes') loadNotes();
+      if (tab === 'timeline') loadTimeline();
+    }
+
+    async function loadNotes() {
+      if (!activeLeadId) return;
+      const el = document.getElementById('notesList');
+      const txEl = document.getElementById('transcriptList');
+      el.innerHTML = '<p class="text-sm text-slate-400">Laden...</p>';
+      if (txEl) txEl.innerHTML = '<p class="text-sm text-slate-400">Laden...</p>';
+      try {
+        const res = await fetch(`/api/leads/${encodeURIComponent(activeLeadId)}/notes?include_transcripts=1`);
+        const data = await res.json();
+        const notes = Array.isArray(data) ? data : (data.notes || []);
+        const transcripts = Array.isArray(data) ? [] : (data.transcripts || []);
+        el.innerHTML = notes.length ? notes.map(n => `
+          <div class="rounded-xl border border-slate-100 p-3 bg-slate-50">
+            <p class="text-sm text-slate-800 whitespace-pre-wrap">${esc(n.body)}</p>
+            <div class="text-xs text-slate-400 mt-1">${formatTime(n.created_at)}</div>
+          </div>`).join('') : '<p class="text-sm text-slate-400">Nog geen notities.</p>';
+        if (txEl) {
+          txEl.innerHTML = transcripts.length ? transcripts.map(t => {
+            const inbound = t.direction === 'inbound' || t.direction === 'in' || t.direction === 'received' || t.direction === 'reply';
+            const dirColor = inbound ? 'bg-emerald-50 text-emerald-700' : 'bg-blue-50 text-blue-700';
+            const dirLabel = inbound ? 'Inbound' : (t.direction ? 'Outbound' : t.kind === 'campaign' ? 'Campagne' : 'E-mail');
+            return `
+            <div class="rounded-xl border border-slate-100 p-3 ${inbound ? 'bg-white' : 'bg-slate-50'}">
+              <div class="flex items-start justify-between gap-2 mb-1">
+                <div class="min-w-0">
+                  <span class="inline-block px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase ${dirColor} mr-1.5">${esc(dirLabel)}</span>
+                  <span class="text-sm font-medium text-slate-800 break-words">${esc(t.title || '')}</span>
+                </div>
+                <div class="text-[11px] text-slate-400 whitespace-nowrap">${formatTime(t.created_at)}</div>
+              </div>
+              ${t.body ? `<p class="text-sm text-slate-600 whitespace-pre-wrap break-words">${esc(t.body)}</p>` : ''}
+            </div>`;
+          }).join('') : '<p class="text-sm text-slate-400">Nog geen transcript.</p>';
+        }
+      } catch (e) {
+        el.innerHTML = '<p class="text-sm text-red-500">Notities konden niet laden.</p>';
+        if (txEl) txEl.innerHTML = '';
+      }
+    }
+
+    async function saveNote() {
+      if (!activeLeadId) return;
+      const input = document.getElementById('noteInput');
+      const body = input.value.trim();
+      if (!body) return;
+      try {
+        const res = await fetch(`/api/leads/${encodeURIComponent(activeLeadId)}/notes`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ body }),
+        });
+        if (!res.ok) throw new Error('save failed');
+        input.value = '';
+        loadNotes();
+      } catch (e) {
+        alert('Notitie opslaan mislukt.');
+      }
+    }
+
+    async function loadTimeline() {
+      if (!activeLeadId) return;
+      const el = document.getElementById('timelineList');
+      el.innerHTML = '<p class="text-sm text-slate-400">Laden...</p>';
+      try {
+        const res = await fetch(`/api/leads/${encodeURIComponent(activeLeadId)}/timeline`);
+        const data = await res.json();
+        const events = data.events || [];
+        el.innerHTML = events.length ? events.map(ev => `
+          <div class="timeline-item">
+            <span class="timeline-dot"></span>
+            <div class="min-w-0 flex-1">
+              <div class="flex items-baseline justify-between gap-2">
+                <div class="text-sm font-medium text-slate-800 truncate">${esc(ev.title || ev.type)}</div>
+                <div class="text-[11px] text-slate-400 whitespace-nowrap">${formatTime(ev.timestamp)}</div>
+              </div>
+              <div class="text-[11px] uppercase tracking-wide text-slate-400 mb-0.5">${esc(ev.type || '')}${ev.actor ? ' · ' + esc(ev.actor) : ''}</div>
+              ${ev.body ? `<p class="text-sm text-slate-600 whitespace-pre-wrap break-words">${esc(ev.body)}</p>` : ''}
+            </div>
+          </div>`).join('') : '<p class="text-sm text-slate-400">Nog geen activiteit voor deze lead.</p>';
+      } catch (e) {
+        el.innerHTML = '<p class="text-sm text-red-500">Timeline konden niet laden.</p>';
+      }
     }
 
     async function loadActivity() {
@@ -259,17 +943,39 @@
       return d.toLocaleString('nl-NL', {day:'numeric', month:'short', hour:'2-digit', minute:'2-digit'});
     }
 
-    function esc(s) { const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; }
+    function esc(s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
 
     // Campaign wizard
-    function openCampaignModal() {
+    async function openCampaignModal() {
       document.getElementById('campaignModal').classList.remove('hidden');
       document.getElementById('newCampName').value = '';
       document.getElementById('newCampAngle').value = '';
       showWizardStep(1);
       loadSelectableLeads();
+      await loadSendAccounts();
     }
     function closeCampaignModal() { document.getElementById('campaignModal').classList.add('hidden'); }
+
+    async function loadSendAccounts() {
+      const sel = document.getElementById('newCampAccount');
+      if (!sel) return;
+      try {
+        const res = await fetch('/api/email-accounts');
+        if (!res.ok) return;
+        const accounts = await res.json();
+        sel.innerHTML = '<option value="">Standaard / automatisch</option>' +
+          (Array.isArray(accounts) ? accounts.filter(a => a.is_active).map(a =>
+            `<option value="${esc(a.account_id)}">${esc(a.email_address)}${a.is_default ? ' (standaard)' : ''}</option>`
+          ).join('') : '');
+      } catch (e) { /* keep default option */ }
+    }
 
     async function loadSelectableLeads() {
       const res = await fetch('/api/simple/contacts/selectable?limit=500');
@@ -334,12 +1040,19 @@
         activation_message: document.getElementById('newCampAngle').value.trim(),
         contact_ids: Array.from(selectedLeads),
       };
+      const accSel = document.getElementById('newCampAccount');
+      if (accSel && accSel.value) payload.account_id = accSel.value;
       try {
-        await fetch('/api/simple/campaigns', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+        const res = await fetch('/api/simple/campaigns', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+        if (!res.ok) {
+          const errText = await res.text().catch(() => '');
+          throw new Error(errText || ('HTTP ' + res.status));
+        }
+        await res.json().catch(() => ({}));
         closeCampaignModal();
         setView('campaigns');
       } catch (e) {
-        alert('Lanceren mislukt.');
+        alert('Lanceren mislukt: ' + (e && e.message ? e.message : 'onbekende fout'));
         btn.disabled = false; btn.textContent = 'Lanceer campagne';
       }
     }

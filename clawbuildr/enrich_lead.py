@@ -105,6 +105,20 @@ def enrich_lead_from_linkedin(profile_url: str, company_name: str = "", company_
 
     result["personalization"] = personalization
 
+    # Persist firmographics + profile when a CRM DB is available
+    if company_name or (result["profile"] and not result["profile"].get("error")):
+        try:
+            from tools import save_linkedin_enrichment
+            save_result = save_linkedin_enrichment(
+                company_name or profile.get("current_company", ""),
+                "",
+                result["profile"] if not result["profile"].get("error") else {},
+                result["company"] if result["company"] and not result["company"].get("error") else {},
+            )
+            result["persisted"] = save_result
+        except Exception as e:
+            result["errors"].append(f"Persist error: {e}")
+
     return result
 
 

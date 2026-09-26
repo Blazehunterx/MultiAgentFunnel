@@ -128,12 +128,13 @@ async def research_company(lead: LeadInput) -> ResearchData:
             except Exception as e:
                 linkedin_data = {"error": str(e)[:100]}
 
-        # Persist enrichment to DB
-        try:
-            from tools import save_linkedin_enrichment
-            save_linkedin_enrichment(lead.company, lead.domain or "", profile_data, linkedin_data)
-        except Exception as e:
-            logger.warning(f"[Pipeline] Failed to save enrichment: {e}")
+        # Persist enrichment to DB (also when scrape failed — profile_data alone is useful)
+        if profile_data or (linkedin_data and "error" not in linkedin_data and linkedin_data):
+            try:
+                from tools import save_linkedin_enrichment
+                save_linkedin_enrichment(lead.company, lead.domain or "", profile_data or {}, linkedin_data or {})
+            except Exception as e:
+                logger.warning(f"[Pipeline] Failed to save enrichment: {e}")
     
     # Wait for KVK
     try:
@@ -212,6 +213,7 @@ TASK: Analyze this company and return a structured JSON with:
   "target_customers": "Who are their clients?",
   "services_summary": ["Specific service 1", "Specific service 2", ...],
   "tech_stack": ["CRM they use", "Website platform", "Other tools detected"],
+  "customer_cases": ["Named client/case with what was delivered, or empty if none named in sources"],
   "pain_points": [
     "Specific operational challenge 1 (with evidence)",
     "Specific operational challenge 2 (with evidence)"
@@ -233,6 +235,7 @@ RULES:
 - Decision makers from LinkedIn data only — don't guess names
 - Personalization hooks must be UNIQUE to this company (not "jullie bedrijf groeit")
 - Data quality score: 0-100 based on how many sources confirmed the data
+- customer_cases only if a named client/case appears in the sources — never invent names
 """
     
     try:

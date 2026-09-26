@@ -8,9 +8,16 @@ import json
 import sqlite3
 import logging
 import re
-import dns.resolver
+import uuid
+import smtplib
+import imaplib
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
+
+try:
+    import dns_client
+except ImportError:
+    from clawbuildr import dns_client
 
 logger = logging.getLogger("ClawBuildr.Onboarding")
 
@@ -55,27 +62,34 @@ def _ensure_onboarding_tables():
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Real schema — must match tools.resolve_send_kwargs / dashboard expectations.
         db.execute("""
             CREATE TABLE IF NOT EXISTS email_accounts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                workspace_id INTEGER NOT NULL,
-                email TEXT NOT NULL,
-                provider TEXT NOT NULL DEFAULT 'gmail',
-                imap_host TEXT,
-                imap_port INTEGER DEFAULT 993,
+                account_id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                email_address TEXT NOT NULL UNIQUE,
+                provider TEXT DEFAULT 'gmail',
                 smtp_host TEXT,
                 smtp_port INTEGER DEFAULT 587,
-                username TEXT,
-                password_encrypted TEXT,
-                is_verified INTEGER NOT NULL DEFAULT 0,
-                is_active INTEGER NOT NULL DEFAULT 1,
-                daily_limit INTEGER DEFAULT 50,
-                sent_today INTEGER DEFAULT 0,
+                smtp_user TEXT,
+                smtp_password TEXT,
+                is_active INTEGER DEFAULT 1,
+                is_default INTEGER DEFAULT 0,
+                daily_send_limit INTEGER DEFAULT 50,
+                sends_today INTEGER DEFAULT 0,
+                last_send_at TEXT,
                 warmup_days INTEGER DEFAULT 0,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(workspace_id, email)
+                signature TEXT,
+                reply_to TEXT,
+                tenant_id TEXT DEFAULT '',
+                created_at TEXT,
+                updated_at TEXT
             )
         """)
+        try:
+            db.execute("ALTER TABLE email_accounts ADD COLUMN tenant_id TEXT DEFAULT ''")
+        except Exception:
+            pass
         db.execute("""
             CREATE TABLE IF NOT EXISTS domain_configs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -170,25 +184,144 @@ def get_onboarding_status(workspace_id: int) -> Dict[str, Any]:
         db.close()
 
 
-def connect_email_account(workspace_id: int, email: str, provider: str = "gmail", credentials: Dict = None) -> Dict[str, Any]:
+def _verify_smtp(email: str, password: str, smtp_host: str = "smtp.gmail.com", smtp_port: int = 587) -> None:
+    """Login-test a mailbox over SMTP. Raises on failure."""
+    with smtplib.SMTP(smtp_host, int(smtp_port), timeout=15) as server:
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(email, password)
+
+
+def _verify_imap(email: str, password: str, imap_host: str = "imap.gmail.com") -> bool:
+    """Login-test a mailbox over IMAP. Returns False instead of raising."""
+    server = None
+    try:
+        server = imaplib.IMAP4_SSL(imap_host, timeout=15)
+        server.login(email, password)
+        return True
+    except Exception:
+        return False
+    finally:
+        if server is not None:
+            try:
+                server.logout()
+            except Exception:
+                pass
+
+
+def connect_email_account(
+    tenant_id: str,
+    email: str,
+    password: str,
+    provider: str = "gmail",
+    display_name: str = "",
+    verify: bool = True,
+    daily_send_limit: int = 50,
+    smtp_host: str = "smtp.gmail.com",
+    smtp_port: int = 587,
+) -> Dict[str, Any]:
+    """Connect (upsert) a sending mailbox for a tenant.
+
+    Verifies SMTP login first (unless verify=False), stores the account as the
+    tenant's default sender and updates tenant_config.sending_email.
+    Returns {"ok": True, ...} or {"ok": False, "stage": ..., "error": ...}.
+    """
+    email = (email or "").strip().lower()
+    if not email or "@" not in email or email.startswith("@") or email.endswith("@"):
+        return {"ok": False, "stage": "input", "error": "Ongeldig e-mailadres."}
+    if not password:
+        return {"ok": False, "stage": "input", "error": "App-wachtwoord ontbreekt."}
+    tenant_id = tenant_id or "default"
+
+    imap_ok = False
+    if verify:
+        try:
+            _verify_smtp(email, password, smtp_host, smtp_port)
+        except smtplib.SMTPAuthenticationError:
+            return {
+                "ok": False,
+                "stage": "smtp",
+                "error": "SMTP inloggen mislukt — controleer e-mailadres en app-wachtwoord "
+                         "(2-stapsverificatie aan + app-wachtwoord genereren).",
+            }
+        except Exception as e:
+            return {"ok": False, "stage": "smtp", "error": f"SMTP verbinding mislukt: {e}"}
+        imap_ok = _verify_imap(email, password)
+
     _ensure_onboarding_tables()
     db = _get_db()
     try:
-        imap_host = credentials.get("imap_host", "imap.gmail.com") if credentials else "imap.gmail.com"
-        smtp_host = credentials.get("smtp_host", "smtp.gmail.com") if credentials else "smtp.gmail.com"
+        now = datetime.now(timezone.utc).isoformat()
+        domain = email.split("@")[1]
+        existing = db.execute(
+            "SELECT account_id, tenant_id FROM email_accounts WHERE email_address = ?",
+            (email,),
+        ).fetchone()
 
-        cursor = db.execute(
-            """INSERT INTO email_accounts
-               (workspace_id, email, provider, imap_host, smtp_host, username, password_encrypted)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (workspace_id, email, provider, imap_host, smtp_host,
-             credentials.get("username", email) if credentials else email,
-             credentials.get("password", "") if credentials else ""),
+        if existing:
+            owner = existing["tenant_id"] or ""
+            if owner and owner != tenant_id:
+                return {
+                    "ok": False,
+                    "stage": "input",
+                    "error": f"Dit mailbox is al gekoppeld aan een ander account ({owner}).",
+                }
+            account_id = existing["account_id"]
+            db.execute(
+                """UPDATE email_accounts
+                   SET tenant_id = ?, provider = ?, smtp_host = ?, smtp_port = ?,
+                       smtp_user = ?, smtp_password = ?, display_name = ?,
+                       is_active = 1, updated_at = ?
+                   WHERE account_id = ?""",
+                (tenant_id, provider, smtp_host, int(smtp_port), email, password,
+                 display_name or email.split("@")[0], now, account_id),
+            )
+            was_update = True
+        else:
+            account_id = str(uuid.uuid4())
+            db.execute(
+                """INSERT INTO email_accounts
+                   (account_id, display_name, email_address, provider, smtp_host, smtp_port,
+                    smtp_user, smtp_password, is_active, is_default, daily_send_limit,
+                    tenant_id, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?)""",
+                (account_id, display_name or email.split("@")[0], email, provider,
+                 smtp_host, int(smtp_port), email, password, int(daily_send_limit),
+                 tenant_id, now, now),
+            )
+            was_update = False
+
+        # Exactly one default per tenant — demote the others, keep/raise this one.
+        db.execute(
+            "UPDATE email_accounts SET is_default = 0, updated_at = ? WHERE tenant_id = ? AND account_id != ?",
+            (now, tenant_id, account_id),
         )
+        db.execute(
+            "UPDATE email_accounts SET is_default = 1, is_active = 1, updated_at = ? WHERE account_id = ?",
+            (now, account_id),
+        )
+
+        try:
+            db.execute(
+                "UPDATE tenant_config SET sending_email = ?, sending_domain = ? WHERE tenant_id = ?",
+                (email, domain, tenant_id),
+            )
+        except Exception:
+            pass
+
         db.commit()
-        return {"account_id": cursor.lastrowid, "email": email, "provider": provider}
     finally:
         db.close()
+
+    logger.info(f"[Onboarding] Email connected for tenant '{tenant_id}': {email} (imap_ok={imap_ok})")
+    return {
+        "ok": True,
+        "account_id": account_id,
+        "email": email,
+        "imap_ok": imap_ok,
+        "was_update": was_update,
+    }
 
 
 def create_icp(workspace_id: int, name: str, description: str = "",
@@ -232,26 +365,26 @@ def verify_domain(workspace_id: int, domain: str) -> Dict[str, Any]:
     results = {"domain": domain, "checks": {}}
 
     try:
-        mx_records = dns.resolver.resolve(domain, "MX")
+        mx_records = dns_client.resolve(domain, "MX")
         results["checks"]["mx"] = {"valid": True, "records": [str(r.exchange) for r in mx_records]}
     except Exception as e:
         results["checks"]["mx"] = {"valid": False, "error": str(e)}
 
     try:
-        txt_records = dns.resolver.resolve(domain, "TXT")
+        txt_records = dns_client.resolve(domain, "TXT")
         spf_found = any("v=spf1" in str(r) for r in txt_records)
         results["checks"]["spf"] = {"valid": spf_found}
     except Exception as e:
         results["checks"]["spf"] = {"valid": False, "error": str(e)}
 
     try:
-        dkim_records = dns.resolver.resolve(f"google._domainkey.{domain}", "TXT")
+        dkim_records = dns_client.resolve(f"google._domainkey.{domain}", "TXT")
         results["checks"]["dkim"] = {"valid": len(list(dkim_records)) > 0}
     except Exception:
         results["checks"]["dkim"] = {"valid": False}
 
     try:
-        dmarc_records = dns.resolver.resolve(f"_dmarc.{domain}", "TXT")
+        dmarc_records = dns_client.resolve(f"_dmarc.{domain}", "TXT")
         results["checks"]["dmarc"] = {"valid": any("v=DMARC1" in str(r) for r in dmarc_records)}
     except Exception:
         results["checks"]["dmarc"] = {"valid": False}
@@ -285,18 +418,26 @@ def verify_domain(workspace_id: int, domain: str) -> Dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 ONBOARDING_FLOW = [
-    "welcome",
-    "profile",
-    "channels",
-    "gmail",
-    "icp",
-    "message",
+    "campaign_info",
+    "settings",
     "sequence",
-    "sources",
-    "search",
     "review",
     "running",
 ]
+
+LEGACY_ONBOARDING_STEPS = {
+    "welcome": "campaign_info",
+    "channels": "settings",
+    "gmail": "settings",
+    "profile": "campaign_info",
+    "icp": "settings",
+    "message": "campaign_info",
+    "sources": "settings",
+    "search": "settings",
+    "review": "review",
+    "goal": "campaign_info",
+    "company": "campaign_info",
+}
 
 
 def _ensure_onboarding_state_table():
@@ -306,7 +447,7 @@ def _ensure_onboarding_state_table():
             CREATE TABLE IF NOT EXISTS onboarding_state (
                 tenant_id TEXT PRIMARY KEY,
                 completed INTEGER NOT NULL DEFAULT 0,
-                current_step TEXT NOT NULL DEFAULT 'welcome',
+                current_step TEXT NOT NULL DEFAULT 'campaign_info',
                 data TEXT NOT NULL DEFAULT '{}',
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
@@ -316,6 +457,24 @@ def _ensure_onboarding_state_table():
         db.close()
 
 
+def _normalize_step(step: str) -> str:
+    step = LEGACY_ONBOARDING_STEPS.get(step, step)
+    if step not in ONBOARDING_FLOW:
+        return ONBOARDING_FLOW[0]
+    return step
+
+
+def _normalize_completed(steps: Any) -> List[str]:
+    normalized: List[str] = []
+    for s in steps or []:
+        if not isinstance(s, str):
+            continue
+        mapped = LEGACY_ONBOARDING_STEPS.get(s, s)
+        if mapped in ONBOARDING_FLOW and mapped not in normalized:
+            normalized.append(mapped)
+    return normalized
+
+
 def _parse_state(row: sqlite3.Row) -> Dict[str, Any]:
     data = {}
     if row["data"]:
@@ -323,11 +482,13 @@ def _parse_state(row: sqlite3.Row) -> Dict[str, Any]:
             data = json.loads(row["data"])
         except Exception:
             data = {}
-    completed_steps = set(data.get("completed_steps", []))
+    completed_steps = _normalize_completed(data.get("completed_steps", []))
+    data["completed_steps"] = completed_steps
+    current_step = _normalize_step(row["current_step"])
     return {
         "tenant_id": row["tenant_id"],
         "completed": bool(row["completed"]),
-        "current_step": row["current_step"],
+        "current_step": current_step,
         "data": data,
         "steps": [
             {"step": s, "completed": s in completed_steps}
@@ -360,7 +521,7 @@ def _create_onboarding_state(tenant_id: str) -> Dict[str, Any]:
     try:
         db.execute(
             """INSERT INTO onboarding_state (tenant_id, completed, current_step, data, updated_at)
-               VALUES (?, 0, 'welcome', '{}', ?)""",
+               VALUES (?, 0, 'campaign_info', '{}', ?)""",
             (tenant_id, now),
         )
         db.commit()
@@ -375,6 +536,7 @@ def save_onboarding_step(tenant_id: str, step: str, data: Dict[str, Any] = None)
     db = _get_db()
     try:
         now = datetime.now(timezone.utc).isoformat()
+        step = _normalize_step(step)
         state = get_onboarding_state(tenant_id)
         merged = state["data"]
         merged.setdefault("completed_steps", [])

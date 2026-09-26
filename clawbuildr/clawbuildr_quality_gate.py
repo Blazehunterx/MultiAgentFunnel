@@ -288,6 +288,58 @@ def _check_structure(subject: str, body: str) -> Tuple[float, List[str]]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# RESEARCH THINNESS (shared predicate — import from pipeline_runner / dashboard)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+MIN_SUMMARY_LEN = 80
+MIN_DATA_QUALITY = 40
+
+
+def is_research_thin(research_raw) -> bool:
+    """True when research is missing or too thin to personalize an email safely.
+
+    Accepts a JSON string or already-parsed dict. Empty / short summary or
+    data_quality_score < MIN_DATA_QUALITY counts as thin.
+    """
+    if research_raw is None:
+        return True
+    data = research_raw
+    if isinstance(data, (bytes, bytearray)):
+        try:
+            data = data.decode("utf-8")
+        except Exception:
+            return True
+    if isinstance(data, str):
+        s = data.strip()
+        if not s:
+            return True
+        try:
+            data = json.loads(s)
+        except Exception:
+            # Non-JSON blob: only keep if long enough to be real research text
+            return len(s) < MIN_SUMMARY_LEN
+    if not isinstance(data, dict):
+        return True
+    summary = (
+        data.get("summary")
+        or data.get("description")
+        or data.get("overview")
+        or data.get("company_summary")
+        or ""
+    )
+    if isinstance(summary, list):
+        summary = " ".join(str(x) for x in summary)
+    summary = str(summary).strip()
+    try:
+        quality = float(data.get("data_quality_score") or 0)
+    except (TypeError, ValueError):
+        quality = 0.0
+    if quality and quality < MIN_DATA_QUALITY:
+        return True
+    return len(summary) < MIN_SUMMARY_LEN
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN QUALITY GATE
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -311,6 +363,16 @@ def review_email_quality(contact_id: str) -> Dict[str, Any]:
         draft_raw = contact["outreach_draft"]
         if not draft_raw:
             return {"passed": False, "error": "No draft found"}
+
+        # Thin research must not pass to approval — force regeneration / richer research
+        if is_research_thin(contact["research_result"]):
+            return {
+                "passed": False,
+                "error": "Research too thin for personalized outreach",
+                "score": 0,
+                "breakdown": {},
+                "all_issues": ["research_thin: summary too short or data_quality_score too low"],
+            }
 
         # Parse draft JSON
         try:

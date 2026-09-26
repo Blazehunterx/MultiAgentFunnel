@@ -9,6 +9,7 @@ ALTER TABLE contacts ADD COLUMN mutual_connections_text TEXT;
 ALTER TABLE contacts ADD COLUMN linkedin_last_enriched_at TEXT;
 
 -- Company enrichment
+-- NOTE: writers use estimated_size (pre-existing column), not this legacy `size` alias.
 ALTER TABLE companies ADD COLUMN size TEXT;
 ALTER TABLE companies ADD COLUMN headquarters TEXT;
 ALTER TABLE companies ADD COLUMN founded TEXT;

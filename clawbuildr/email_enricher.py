@@ -26,7 +26,8 @@ GENERIC_PREFIXES = {
     "info", "contact", "hello", "hallo", "sales", "support", "admin", "office",
     "team", "mail", "service", "help", "webmaster", "postmaster", "noreply",
     "no-reply", "marketing", "hr", "recruitment", "jobs", "careers", "info2",
-    "klantenservice", "klantendienst", "aanmelden", "afspraak", "secretariaat"
+    "klantenservice", "klantendienst", "aanmelden", "afspraak", "secretariaat",
+    "privacy", "legal", "compliance", "dpo", "security", "billing", "press",
 }
 
 
@@ -34,6 +35,11 @@ def is_generic_email(email: str) -> bool:
     """Check if email uses a generic prefix."""
     if not email or "@" not in email:
         return True
+    try:
+        from lead_quality import is_generic_email as _is_generic
+        return _is_generic(email)
+    except Exception:
+        pass
     prefix = email.split("@")[0].lower().split("+")[0]
     # Remove trailing digits
     prefix_no_digits = re.sub(r'\d+$', '', prefix)

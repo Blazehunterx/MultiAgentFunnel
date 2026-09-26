@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ClawBuildr — Inloggen</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: { sans: ['Inter', 'sans-serif'] },
+          colors: { brand: { 50: '#eef2ff', 100: '#e0e7ff', 500: '#6366f1', 600: '#4f46e5', 700: '#4338ca' } }
+        }
+      }
+    }
+  </script>
+  <style>
+    body { background: #f8fafc; }
+    input:focus { box-shadow: 0 0 0 3px rgba(99,102,241,0.18); }
+  </style>
+</head>
+<body class="min-h-screen text-slate-700 flex items-center justify-center px-6">
+  <div class="w-full max-w-md">
+    <div class="text-center mb-8">
+      <div class="inline-flex items-center justify-center w-12 h-12 rounded-xl bg-brand-600 text-white text-xl font-bold mb-4">CB</div>
+      <h1 class="text-2xl font-semibold text-slate-900">Inloggen</h1>
+      <p class="text-slate-500 mt-1">Welkom terug bij ClawBuildr.</p>
+    </div>
+
+    <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-8">
+      <form id="loginForm" class="space-y-4">
+        <label class="block text-sm font-medium text-slate-700">
+          E-mail
+          <input id="email" type="email" autocomplete="email" required placeholder="jij@bedrijf.nl"
+            class="w-full mt-2 px-4 py-3 rounded-xl border border-slate-200 text-slate-800 placeholder-slate-400 focus:outline-none focus:border-brand-500 transition">
+        </label>
+        <label class="block text-sm font-medium text-slate-700">
+          Wachtwoord
+          <input id="password" type="password" autocomplete="current-password" required placeholder="••••••••"
+            class="w-full mt-2 px-4 py-3 rounded-xl border border-slate-200 text-slate-800 placeholder-slate-400 focus:outline-none focus:border-brand-500 transition">
+        </label>
+        <div id="error" class="hidden text-sm text-rose-600 bg-rose-50 rounded-lg px-4 py-3"></div>
+        <button id="submitBtn" type="submit" class="w-full px-8 py-3 rounded-full text-sm font-semibold bg-brand-600 hover:bg-brand-700 text-white shadow-md transition">
+          Inloggen
+        </button>
+      </form>
+      <p class="text-center text-sm text-slate-500 mt-6">
+        Nog geen account? <a href="/register" class="text-brand-600 font-semibold hover:text-brand-700">Registreren</a>
+      </p>
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById('loginForm');
+    const errorEl = document.getElementById('error');
+    const btn = document.getElementById('submitBtn');
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      errorEl.classList.add('hidden');
+      btn.disabled = true;
+      btn.textContent = 'Bezig...';
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: document.getElementById('email').value.trim(),
+            password: document.getElementById('password').value,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(data.detail || 'Inloggen mislukt.');
+        }
+        window.location.href = '/';
+      } catch (err) {
+        errorEl.textContent = err.message || 'Inloggen mislukt.';
+        errorEl.classList.remove('hidden');
+        btn.disabled = false;
+        btn.textContent = 'Inloggen';
+      }
+    });
+  </script>
+</body>
+</html>

@@ -179,9 +179,9 @@ def complete_onboarding_step(workspace_id: int, step: str, data: Dict = {}):
     return {"ok": True}
 
 @app.post("/onboarding/connect-email")
-def connect_email(workspace_id: int, email: str, provider: str = "gmail"):
+def connect_email(workspace_id: int, email: str, password: str = "", provider: str = "gmail"):
     from clawbuildr_onboarding import connect_email_account
-    return connect_email_account(workspace_id, email, provider)
+    return connect_email_account(str(workspace_id), email, password, provider=provider)
 
 @app.post("/onboarding/verify-domain")
 def verify_domain(workspace_id: int, domain: str):
@@ -253,21 +253,21 @@ class LeadGenRequest(BaseModel):
 def generate_leads_endpoint(req: LeadGenRequest):
     from clawbuildr_lead_generator import generate_leads
     import asyncio
-    result = asyncio.run(generate_leads(
-        queries=req.queries or None,
+    # generate_leads takes domains=; map free-text queries → domain-ish tokens is wrong —
+    # if only queries given, fall back to default domain pool and let caller pass domains.
+    kwargs = dict(
         max_leads=req.max_leads,
         use_hunter=req.use_hunter,
-        use_web_search=req.use_web_search,
         use_website_scrape=req.use_website_scrape,
-    ))
+    )
+    result = asyncio.run(generate_leads(**kwargs))
     return result
 
 @app.post("/leads/generate/sync")
 def generate_leads_sync(queries: str = "", max_leads: int = 20):
     from clawbuildr_lead_generator import generate_leads
     import asyncio
-    query_list = [q.strip() for q in queries.split(",") if q.strip()] if queries else None
-    result = asyncio.run(generate_leads(queries=query_list, max_leads=max_leads))
+    result = asyncio.run(generate_leads(max_leads=max_leads))
     return result
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -308,8 +308,20 @@ def send_email(contact_id: int, subject: str, body: str):
         if not contact or not contact["email"]:
             raise HTTPException(404, "Contact not found or no email")
 
-        from tools import gmail_send
-        success = gmail_send(contact["email"], subject, body)
+        from tools import gmail_send, resolve_send_kwargs, record_account_send
+        import asyncio as _asyncio
+        acc = resolve_send_kwargs(contact_id=contact_id)
+        result = _asyncio.run(gmail_send(
+            contact["email"], subject, body,
+            from_addr=acc.get("email_address"),
+            smtp_host=acc.get("smtp_host"),
+            smtp_port=acc.get("smtp_port"),
+            smtp_user=acc.get("smtp_user"),
+            smtp_password=acc.get("smtp_password"),
+        ))
+        success = result.get("status") == "sent"
+        if success and acc.get("account_id"):
+            record_account_send(acc["account_id"])
 
         email_id = save_generated_email(contact_id, subject, body, "outbound")
 

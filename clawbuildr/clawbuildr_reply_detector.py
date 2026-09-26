@@ -7,6 +7,7 @@ Classifies sentiment and updates contact stages automatically.
 import os
 import imaplib
 import email
+import email.message
 from email.header import decode_header
 import sqlite3
 import json
@@ -52,6 +53,28 @@ _OBJECTION_KEYWORDS = [
     "maar", "echter", "probleem", "kosten", "duur", "twijfel",
     "however", "but", "concern", "worry", "expensive", "price",
 ]
+
+# Auto-replies must never be classified as real replies (they used to hit
+# the positive keywords and wrongly flip contacts to REPLIED).
+_OOO_SUBJECT_PREFIXES = (
+    "automatic reply", "auto-reply", "autoreply", "out of office",
+    "out-of-office", "vacation", "automatisch antwoord", "afwezig",
+    "autoreply:", "auto:", "oof:",
+)
+_OOO_BODY_KEYWORDS = (
+    "out of office", "out-of-office", "automatisch antwoord",
+    "ik ben afwezig", "on vacation", "away from my desk",
+    "will be back", "terug op", "do not reply to this email",
+    "niet op deze e-mail reageren", "vacation reply",
+)
+
+
+def _is_auto_reply(subject: str, body: str) -> bool:
+    subj_l = (subject or "").lower().strip()
+    if any(subj_l.startswith(p) for p in _OOO_SUBJECT_PREFIXES):
+        return True
+    check_l = (subj_l + " " + (body or "")[:2000].lower())
+    return any(kw in check_l for kw in _OOO_BODY_KEYWORDS)
 
 
 def _get_db() -> sqlite3.Connection:
@@ -119,16 +142,65 @@ def _extract_body(msg: email.message.Message) -> str:
     return body.strip()
 
 
-def check_replies(since_hours: int = 24) -> List[Dict[str, Any]]:
-    """Poll IMAP for new replies. Returns list of processed replies."""
-    if not _GMAIL_USER or not _GMAIL_PASSWORD:
-        logger.warning("Gmail credentials not configured. Cannot check replies.")
-        return []
+def get_imap_accounts(tenant_id: Optional[str] = None) -> List[Dict[str, str]]:
+    """IMAP credentials for connected mailboxes.
 
-    processed = []
+    tenant_id=None → ALL connected mailboxes (reply detection must keep
+    working for every tenant, regardless of which tenant is active).
+    An explicit tenant_id scopes the result to that tenant.
+    Uses email_accounts rows (smtp_user/smtp_password double as Gmail IMAP
+    credentials). Falls back to .env credentials when nothing is connected.
+    """
+    accounts: List[Dict[str, str]] = []
     try:
-        mail = imaplib.IMAP4_SSL(_GMAIL_IMAP)
-        mail.login(_GMAIL_USER, _GMAIL_PASSWORD)
+        db = _get_db()
+        try:
+            sql = """SELECT email_address, smtp_user, smtp_password, provider
+                     FROM email_accounts
+                     WHERE is_active = 1
+                       AND smtp_user IS NOT NULL AND smtp_user != ''
+                       AND smtp_password IS NOT NULL AND smtp_password != ''"""
+            params: tuple = ()
+            if tenant_id:
+                sql += " AND (tenant_id = ? OR tenant_id IS NULL OR tenant_id = '')"
+                params = (tenant_id,)
+            for r in db.execute(sql, params).fetchall():
+                if (r["provider"] or "gmail").lower() != "gmail":
+                    continue  # IMAP host is only known for Gmail accounts
+                accounts.append({
+                    "user": r["smtp_user"] or r["email_address"],
+                    "password": r["smtp_password"],
+                    "host": _GMAIL_IMAP,
+                })
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"get_imap_accounts failed: {e}")
+
+    if not accounts and _GMAIL_USER and _GMAIL_PASSWORD:
+        accounts.append({"user": _GMAIL_USER, "password": _GMAIL_PASSWORD, "host": _GMAIL_IMAP})
+    return accounts
+
+
+def check_replies(since_hours: int = 24) -> List[Dict[str, Any]]:
+    """Poll IMAP for new replies on every connected mailbox. Returns processed replies."""
+    accounts = get_imap_accounts()
+    if not accounts:
+        logger.warning("No IMAP credentials configured. Cannot check replies.")
+        return []
+    processed: List[Dict[str, Any]] = []
+    for account in accounts:
+        processed.extend(_poll_account(account, since_hours))
+    return processed
+
+
+def _poll_account(account: Dict[str, str], since_hours: int = 24) -> List[Dict[str, Any]]:
+    """Poll one mailbox. `account` = {user, password, host}."""
+    imap_user = account["user"]
+    processed: List[Dict[str, Any]] = []
+    try:
+        mail = imaplib.IMAP4_SSL(account["host"])
+        mail.login(imap_user, account["password"])
         mail.select("INBOX")
 
         since_date = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0)
@@ -151,7 +223,7 @@ def check_replies(since_hours: int = 24) -> List[Dict[str, Any]]:
         # Also collect recently sent message IDs from emails table to avoid self-matching
         sent_subjects = set()
         try:
-            rows = db.execute("SELECT subject FROM emails WHERE direction = 'outbound' AND sent_at IS NOT NULL").fetchall()
+            rows = db.execute("SELECT subject FROM emails WHERE UPPER(direction) = 'OUTBOUND' AND sent_at IS NOT NULL").fetchall()
             sent_subjects = {r["subject"] for r in rows if r["subject"]}
         except Exception:
             pass
@@ -175,7 +247,7 @@ def check_replies(since_hours: int = 24) -> List[Dict[str, Any]]:
                 if message_id in known_message_ids:
                     continue
 
-                if _GMAIL_USER.split("@")[0] not in to_addr:
+                if imap_user.split("@")[0] not in to_addr:
                     continue
 
                 body = _extract_body(msg)
@@ -192,7 +264,7 @@ def check_replies(since_hours: int = 24) -> List[Dict[str, Any]]:
                 if not contact:
                     continue
 
-                sentiment = classify_sentiment(body)
+                sentiment = "ooo" if _is_auto_reply(subject, body) else classify_sentiment(body)
                 now = datetime.now(timezone.utc).isoformat()
 
                 db.execute(
@@ -217,8 +289,9 @@ def check_replies(since_hours: int = 24) -> List[Dict[str, Any]]:
 
                 db.execute(
                     """INSERT INTO activity_log (contact_id, activity_type, description, metadata, created_at)
-                       VALUES (?, 'reply_detected', ?, ?, ?)""",
-                    (contact["contact_id"], subject, json.dumps({
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (contact["contact_id"], "ooo_detected" if sentiment == "ooo" else "reply_detected",
+                     subject, json.dumps({
                         "sentiment": sentiment,
                         "subject": subject,
                         "preview": body[:200],
@@ -246,7 +319,7 @@ def check_replies(since_hours: int = 24) -> List[Dict[str, Any]]:
         mail.logout()
 
     except Exception as e:
-        logger.error(f"IMAP connection error: {e}")
+        logger.error(f"IMAP connection error for {imap_user}: {e}")
 
     return processed
 
@@ -255,10 +328,10 @@ def get_reply_stats() -> Dict[str, Any]:
     """Get reply statistics from the database."""
     db = _get_db()
     try:
-        total = db.execute("SELECT COUNT(*) FROM emails WHERE direction = 'inbound'").fetchone()[0]
+        total = db.execute("SELECT COUNT(*) FROM emails WHERE UPPER(direction) = 'INBOUND'").fetchone()[0]
         by_sentiment = {}
         for row in db.execute(
-            "SELECT status, COUNT(*) as cnt FROM emails WHERE direction = 'inbound' GROUP BY status"
+            "SELECT status, COUNT(*) as cnt FROM emails WHERE UPPER(direction) = 'INBOUND' GROUP BY status"
         ).fetchall():
             by_sentiment[row["status"]] = row["cnt"]
 
@@ -299,20 +372,22 @@ def check_bounces(since_hours: int = 48) -> List[Dict[str, Any]]:
                 msg = email.message_from_bytes(raw)
                 body = _extract_body(msg)
 
-                # Extract the original recipient from bounce message
-                # Bounces contain "Final-Recipient: rfc822; email@domain.com"
-                recipient_match = re.search(r'Final-Recipient:\s*rfc822;\s*(\S+)', body)
+                # Prefer structured NDR fields; never grab an arbitrary address from free text
+                # (generic regex matched marketing addresses inside quoted outbound copy).
+                recipient_match = re.search(r'Final-Recipient:\s*rfc822;\s*([^\s,;]+)', body, re.IGNORECASE)
                 if not recipient_match:
-                    # Try alternative pattern
-                    recipient_match = re.search(r'original recipient.*?(\S+@\S+)', body, re.IGNORECASE)
+                    recipient_match = re.search(r'X-Failed-Recipients:\s*([^\s,;]+)', body, re.IGNORECASE)
                 if not recipient_match:
-                    # Try to find email in subject or body
-                    recipient_match = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', body)
+                    recipient_match = re.search(
+                        r'(?:original\s+recipient|Action:\s*failed).*?([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})',
+                        body,
+                        re.IGNORECASE | re.DOTALL,
+                    )
 
                 if not recipient_match:
                     continue
 
-                bounced_email = recipient_match.group(1).lower().strip()
+                bounced_email = recipient_match.group(1).lower().strip().strip('<>')
 
                 # Find the contact
                 contact = db.execute(
@@ -325,7 +400,7 @@ def check_bounces(since_hours: int = 48) -> List[Dict[str, Any]]:
 
                 # Check if already marked as bounced
                 already = db.execute(
-                    "SELECT 1 FROM emails WHERE contact_id = ? AND status = 'bounced'",
+                    "SELECT 1 FROM emails WHERE contact_id = ? AND UPPER(status) = 'BOUNCED'",
                     (contact["contact_id"],)
                 ).fetchone()
                 if already:
@@ -351,12 +426,17 @@ def check_bounces(since_hours: int = 48) -> List[Dict[str, Any]]:
 
                 now = datetime.now(timezone.utc).isoformat()
 
-                # Record bounce
-                db.execute(
-                    """INSERT INTO emails (contact_id, direction, status, subject, body, bounce_reason, sent_at, created_at)
-                       VALUES (?, 'outbound', 'bounced', 'Bounce notification', ?, ?, ?, ?)""",
-                    (contact["contact_id"], body[:2000], reason, now, now),
-                )
+                # Record bounce as a dedicated notification row — do not flip historical sends
+                already_note = db.execute(
+                    "SELECT 1 FROM emails WHERE contact_id = ? AND subject = 'Bounce notification' AND UPPER(status) = 'BOUNCED'",
+                    (contact["contact_id"],),
+                ).fetchone()
+                if not already_note:
+                    db.execute(
+                        """INSERT INTO emails (contact_id, direction, status, subject, body, bounce_reason, sent_at, created_at)
+                           VALUES (?, 'outbound', 'BOUNCED', 'Bounce notification', ?, ?, ?, ?)""",
+                        (contact["contact_id"], body[:2000], reason, now, now),
+                    )
 
                 # Update contact stage
                 db.execute(

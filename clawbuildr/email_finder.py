@@ -5,6 +5,7 @@ Uses pattern matching, common email formats, MX verification, and Hunter.io.
 
 import re
 import os
+import json
 import sqlite3
 import logging
 import asyncio
@@ -55,6 +56,38 @@ def _peek_hunter_key():
         return ""
     return _HUNTER_API_KEYS[_HUNTER_KEY_INDEX % len(_HUNTER_API_KEYS)]
 
+
+# Gemini keys + feature flag for the AI email-guess step
+_GEMINI_API_KEYS: List[str] = []
+_GEMINI_EMAIL_GUESS_ENABLED = True
+_GEMINI_GUESS_CACHE: Dict[str, Dict[str, Any]] = {}
+# Models tried in order (flash-lite first, flash as fallback when overloaded)
+GEMINI_EMAIL_MODELS = ("gemini-3.1-flash-lite", "gemini-3.6-flash")
+# Keys permanently rejected by Google (403) — skipped for the rest of the process
+_GEMINI_DEAD_KEYS: set = set()
+
+
+def _load_gemini_keys():
+    global _GEMINI_API_KEYS, _GEMINI_EMAIL_GUESS_ENABLED
+    try:
+        _env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+        if not os.path.exists(_env_path):
+            return
+        with open(_env_path) as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if _line.startswith("GEMINI_API_KEYS="):
+                    _GEMINI_API_KEYS = [k.strip() for k in _line.split("=", 1)[1].replace("\n", ",").split(",") if k.strip()]
+                elif _line.startswith("GEMINI_API_KEY=") and not _GEMINI_API_KEYS:
+                    _GEMINI_API_KEYS = [_line.split("=", 1)[1].strip()]
+                elif _line.startswith("GEMINI_EMAIL_GUESS="):
+                    _GEMINI_EMAIL_GUESS_ENABLED = _line.split("=", 1)[1].strip().lower() not in ("0", "false", "no", "off")
+    except Exception:
+        pass
+
+
+_load_gemini_keys()
+
 # Common email patterns
 EMAIL_REGEX = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
 
@@ -78,6 +111,319 @@ DISPOSABLE = {
     "fakeinbox.com", "sharklasers.com", "guerrillamailblock.com",
     "grr.la", "dispostable.com", "maildrop.cc"
 }
+
+GEMINI_EMAIL_SYSTEM_PROMPT = (
+    "You infer professional email addresses for B2B outreach. "
+    "Reply with STRICT JSON only — no markdown fences, no commentary. "
+    "Never suggest an address on another domain and never suggest a role mailbox "
+    "(info@, contact@, sales@, hello@ ...). Only suggest an address when the pattern "
+    "is highly plausible for the given domain."
+)
+
+
+def _extract_json_obj(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    text = text.strip()
+    for attempt in (text,
+                    re.sub(r'^```[a-zA-Z]*\s*', '', text),
+                    re.sub(r'\s*```$', '', re.sub(r'^```[a-zA-Z]*\s*', '', text))):
+        try:
+            obj = json.loads(attempt)
+            if isinstance(obj, dict):
+                return obj
+        except (json.JSONDecodeError, ValueError):
+            pass
+    brace = re.search(r'\{.*\}', text, re.DOTALL)
+    if brace:
+        try:
+            obj = json.loads(brace.group(0))
+            if isinstance(obj, dict):
+                return obj
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return None
+
+
+def _call_gemini_sync(prompt: str, system_prompt: str = "", model: str = None,
+                      max_tokens: int = 512, timeout: float = 12.0) -> Optional[str]:
+    """Synchronous Gemini call with key rotation + model fallback.
+
+    Tries each model in GEMINI_EMAIL_MODELS against each live key.
+    Keys that answer 403 (e.g. reported leaked) are marked dead and skipped
+    for the rest of the process. Returns response text or None.
+    """
+    if not _GEMINI_API_KEYS:
+        return None
+    models = (model,) if model else GEMINI_EMAIL_MODELS
+    headers = {"Content-Type": "application/json"}
+    contents = []
+    if system_prompt:
+        contents.append({"role": "user", "parts": [{"text": system_prompt}]})
+        contents.append({"role": "model", "parts": [{"text": "Understood. I will follow the instructions."}]})
+    contents.append({"role": "user", "parts": [{"text": prompt}]})
+    payload = {
+        "contents": contents,
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": max_tokens, "topP": 0.9},
+    }
+    last_error = None
+    attempts = 0
+    for m in models:
+        for key in _GEMINI_API_KEYS:
+            if key in _GEMINI_DEAD_KEYS:
+                continue
+            if attempts >= 8:
+                break
+            attempts += 1
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={key}"
+            try:
+                with httpx.Client(timeout=timeout) as client:
+                    r = client.post(url, headers=headers, json=payload)
+                if r.status_code == 200:
+                    data = r.json()
+                    candidates = data.get("candidates") or []
+                    if candidates:
+                        parts = (candidates[0].get("content") or {}).get("parts") or []
+                        text = "".join(p.get("text", "") for p in parts if isinstance(p, dict))
+                        if text.strip():
+                            return text
+                    last_error = f"{m}: empty response"
+                    continue
+                body = (r.text or "").replace("\n", " ")[:150]
+                last_error = f"{m}: HTTP {r.status_code} {body}"
+                if r.status_code == 403:
+                    _GEMINI_DEAD_KEYS.add(key)
+                    logger.warning(f"[GeminiEmail] key ...{key[-4:]} rejected (403), marking dead")
+                if r.status_code == 404:
+                    break  # model unavailable — stop trying it on other keys
+            except Exception as e:
+                last_error = f"{m}: {str(e)[:120]}"
+                continue
+        else:
+            continue
+        break  # 404 on this model — move to the next model
+    logger.warning(f"[GeminiEmail] all keys failed: {last_error}")
+    return None
+
+
+# Set after a UDP/53 timeout: subsequent MX lookups go straight to DoH
+_DNS_UDP_BROKEN = False
+
+
+def _resolve_mx_host(domain: str) -> Optional[str]:
+    """Highest-priority MX host for a domain, or None.
+
+    Tries local DNS first (fast); if UDP/53 is blocked or timing out —
+    common on some routers/ISPs — falls back to DNS-over-HTTPS (Google,
+    then Cloudflare). A timeout trips a process-wide circuit breaker so
+    later lookups skip the dead UDP path entirely.
+    """
+    global _DNS_UDP_BROKEN
+    domain = (domain or "").strip().rstrip(".").lower()
+    if not domain or not re.fullmatch(r"[a-z0-9.\-]+", domain):
+        return None
+    if not _DNS_UDP_BROKEN:
+        try:
+            import dns.resolver
+            try:
+                answers = dns.resolver.resolve(domain, "MX", lifetime=3)
+            except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+                return None  # authoritative "no MX" / domain doesn't exist
+            best = None
+            for r in answers:
+                host = str(r.exchange).rstrip(".").lower()
+                if host:
+                    prio = int(r.preference)
+                    if best is None or prio < best[0]:
+                        best = (prio, host)
+            return best[1] if best else None
+        except Exception:
+            _DNS_UDP_BROKEN = True  # resolver unreachable — use DoH from now on
+    for url in (f"https://dns.google/resolve?name={domain}&type=MX",
+                f"https://cloudflare-dns.com/dns-query?name={domain}&type=MX"):
+        try:
+            with httpx.Client(timeout=6.0, follow_redirects=True) as client:
+                r = client.get(url, headers={"Accept": "application/dns-json"})
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            status = data.get("Status")
+            if status == 3:
+                return None  # NXDOMAIN — definitive
+            if status != 0:
+                continue  # SERVFAIL etc. — try the next provider
+            mx = []
+            for a in data.get("Answer") or []:
+                if a.get("type") != 15:
+                    continue
+                parts = str(a.get("data", "")).split()
+                try:
+                    prio = int(parts[0])
+                except (ValueError, IndexError):
+                    continue
+                host = parts[1].rstrip(".").lower() if len(parts) > 1 else ""
+                if host:
+                    mx.append((prio, host))
+            if mx:
+                mx.sort()
+                return mx[0][1]
+            return None  # NOERROR but no MX records
+        except Exception:
+            continue
+    return None
+
+
+def _domain_has_mx(domain: str) -> bool:
+    return _resolve_mx_host(domain) is not None
+
+
+def _local_contains_name(local: str, first_name: str, last_name: str) -> bool:
+    blob = re.sub(r"[^a-z]", "", (local or "").lower())
+    if not blob:
+        return False
+    tokens = set()
+    for part in (first_name or "", last_name or ""):
+        for word in re.findall(r"[a-z]{3,}", part.lower()):
+            tokens.add(word)
+        joined = re.sub(r"[^a-z]", "", part.lower())
+        if len(joined) >= 3:
+            tokens.add(joined)
+    if not tokens:
+        return True
+    return any(t in blob for t in tokens)
+
+
+def _candidate_structure_ok(email: str, first_name: str, last_name: str, domain: str) -> bool:
+    """Exact domain match + not disposable + not generic + local part contains the name."""
+    email = (email or "").strip().lower()
+    if not re.fullmatch(EMAIL_REGEX.pattern, email):
+        return False
+    local, _, edom = email.partition("@")
+    d = (domain or "").strip().lower()
+    if d.startswith("www."):
+        d = d[4:]
+    if not d or edom != d:
+        return False
+    if edom in DISPOSABLE:
+        return False
+    try:
+        from lead_quality import is_generic_email as _is_generic
+        if _is_generic(email):
+            return False
+    except Exception:
+        root = re.split(r"[._\-]", local)[0]
+        if root in {"info", "contact", "hello", "hallo", "sales", "support", "admin",
+                    "office", "team", "mail", "service", "help", "privacy", "legal"}:
+            return False
+    return _local_contains_name(local, first_name, last_name)
+
+
+def _gemini_guess_email_impl(first_name: str, last_name: str, domain: str,
+                             hunter_pattern: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    patterns = [p for p in generate_email_patterns(first_name, last_name, domain)
+                if not p["pattern"].startswith("generic_")]
+    pattern_list = ", ".join(p["pattern"] for p in patterns)
+    hint = f"\nKnown pattern at this company (from Hunter.io): {hunter_pattern}" if hunter_pattern else ""
+    prompt = (
+        "Infer the most likely personal (named) email address for a B2B outreach contact.\n\n"
+        f"Contact name: {first_name} {last_name}\n"
+        f"Company domain: {domain}{hint}\n"
+        f"Standard patterns to consider (most frequent first): {pattern_list}\n\n"
+        "Rules:\n"
+        f"- The address must be on @{domain} exactly — never another domain.\n"
+        "- The local part must contain the contact's first or last name.\n"
+        "- Never suggest role addresses (info@, contact@, sales@, hello@ ...).\n"
+        "- confidence = 0-100 that this address really exists.\n"
+        "- If you lack a reasonable basis, return {\"candidates\": []}.\n\n"
+        "Return strict JSON only: "
+        '{"candidates": [{"email": "...", "confidence": 85, "reason": "..."}]} '
+        "with up to 3 candidates, best first."
+    )
+    raw = _call_gemini_sync(prompt, GEMINI_EMAIL_SYSTEM_PROMPT)
+    data = _extract_json_obj(raw or "")
+    if not data:
+        return None
+    raw_cands = data.get("candidates")
+    if not isinstance(raw_cands, list):
+        return None
+    parsed = []
+    for c in raw_cands:
+        if isinstance(c, str):
+            email, conf, reason = c, 70, ""
+        elif isinstance(c, dict):
+            email = str(c.get("email") or "").strip().lower()
+            try:
+                conf = int(c.get("confidence") or 0)
+            except (TypeError, ValueError):
+                conf = 0
+            reason = str(c.get("reason") or "")[:200]
+        else:
+            continue
+        if email:
+            parsed.append((email, conf, reason))
+    if not parsed:
+        return None
+    valid = [(e, c, r) for e, c, r in parsed
+             if _candidate_structure_ok(e, first_name, last_name, domain)]
+    if not valid:
+        return None
+    if not _domain_has_mx(domain):
+        return None
+    standard_emails = {p["email"].lower() for p in generate_email_patterns(first_name, last_name, domain)}
+    smtp_attempts = 0
+    ambiguous_pick = None
+    for email, conf, reason in valid:
+        conf = max(0, min(100, conf))
+        if smtp_attempts < 2:
+            smtp_attempts += 1
+            verdict = smtp_verify_email(email)
+            exists = verdict.get("exists")
+            if exists is True:
+                vreason = verdict.get("reason", "")
+                return {
+                    "email": email,
+                    "confidence": 90,
+                    "source": "gemini_smtp_verified",
+                    "verified": True,
+                    "reason": f"{reason} (SMTP verified: {vreason})".strip(),
+                }
+            if exists is False:
+                continue
+        if ambiguous_pick is None and email in standard_emails and conf >= 70:
+            ambiguous_pick = {
+                "email": email,
+                "confidence": 70,
+                "source": "gemini_pattern_mx",
+                "verified": False,
+                "reason": f"{reason} (MX valid, SMTP blocked; standard pattern)".strip(),
+            }
+    return ambiguous_pick
+
+
+def gemini_guess_email(first_name: str, last_name: str, domain: str,
+                       hunter_pattern: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """AI-assisted email guess, gated by structural checks + MX + SMTP verification.
+
+    Always returns confidence >= 70 (or None). Results — including misses —
+    are cached per (name, domain) so sourcing loops don't repeat the API call.
+    """
+    if not _GEMINI_EMAIL_GUESS_ENABLED or not _GEMINI_API_KEYS:
+        return None
+    if not first_name or not last_name or not domain:
+        return None
+    cache_key = f"{first_name.strip().lower()}|{last_name.strip().lower()}|{domain.strip().lower()}"
+    if cache_key in _GEMINI_GUESS_CACHE:
+        return _GEMINI_GUESS_CACHE[cache_key]
+    result = None
+    try:
+        result = _gemini_guess_email_impl(first_name, last_name, domain, hunter_pattern)
+    except Exception as e:
+        logger.warning(f"[GeminiEmail] guess failed for {first_name} {last_name}@{domain}: {e}")
+        result = None
+    if len(_GEMINI_GUESS_CACHE) > 500:
+        _GEMINI_GUESS_CACHE.clear()
+    _GEMINI_GUESS_CACHE[cache_key] = result
+    return result
 
 
 def extract_emails_from_text(text: str) -> List[str]:
@@ -165,26 +511,15 @@ def generate_email_patterns(first_name: str, last_name: str, domain: str) -> Lis
 
 async def verify_email_mx(email: str) -> Dict[str, Any]:
     """Verify if an email domain has valid MX records."""
-    try:
-        import dns.resolver
-        domain = email.split("@")[1]
-        mx_records = dns.resolver.resolve(domain, "MX")
-        return {
-            "email": email,
-            "domain": domain,
-            "has_mx": True,
-            "mx_records": [str(r.exchange) for r in mx_records],
-            "deliverable": True
-        }
-    except Exception as e:
-        return {
-            "email": email,
-            "domain": email.split("@")[1] if "@" in email else "",
-            "has_mx": False,
-            "mx_records": [],
-            "deliverable": False,
-            "error": str(e)
-        }
+    domain = email.split("@")[1] if "@" in email else ""
+    host = _resolve_mx_host(domain)
+    return {
+        "email": email,
+        "domain": domain,
+        "has_mx": bool(host),
+        "mx_records": [host] if host else [],
+        "deliverable": bool(host),
+    }
 
 
 def smtp_verify_email(email: str, from_email: str = "verify@clawbuildr.com") -> Dict[str, Any]:
@@ -192,23 +527,15 @@ def smtp_verify_email(email: str, from_email: str = "verify@clawbuildr.com") -> 
     Returns dict with email, exists (bool), confidence (0-100), reason (str).
     Note: Many mail servers now block RCPT TO verification, so this may return ambiguous results.
     """
-    import dns.resolver
-    
     if not email or "@" not in email:
         return {"email": email, "exists": False, "confidence": 0, "reason": "Invalid format"}
-    
+
     local, domain = email.split("@", 1)
-    
-    # Get MX records (fast check)
-    try:
-        mx_records = dns.resolver.resolve(domain, "MX", lifetime=5)
-        mx_host = str(mx_records[0].exchange).rstrip(".")
-    except dns.resolver.NoAnswer:
+
+    # Get MX records (UDP DNS with DNS-over-HTTPS fallback)
+    mx_host = _resolve_mx_host(domain)
+    if not mx_host:
         return {"email": email, "exists": False, "confidence": 30, "reason": "No MX records"}
-    except dns.resolver.NXDOMAIN:
-        return {"email": email, "exists": False, "confidence": 10, "reason": "Domain does not exist"}
-    except Exception as e:
-        return {"email": email, "exists": None, "confidence": 20, "reason": f"MX lookup failed: {e}"}
     
     # Try SMTP verification with short timeout
     try:
@@ -324,8 +651,8 @@ def find_personal_email(first_name: str, last_name: str, domain: str) -> Dict[st
         # Hunter found emails but not for this person - use pattern with Hunter's confirmed pattern
         if hunter.get("pattern"):
             # Pattern like "{f}.{last}" means company uses firstname.lastname format
-            first_lower = first_name.lower().strip()
-            last_lower = last_name.lower().strip()
+            first_lower = re.sub(r'[^a-zA-Z]', '', first_name.lower())
+            last_lower = re.sub(r'[^a-zA-Z]', '', last_name.lower())
             pattern_email = f"{first_lower}.{last_lower}@{domain}"
             return {
                 "email": pattern_email,
@@ -333,6 +660,15 @@ def find_personal_email(first_name: str, last_name: str, domain: str) -> Dict[st
                 "source": "hunter_pattern",
                 "verified": False
             }
+
+    # Step 1.5: Gemini guess — structural checks + MX + SMTP verification (conf >= 70 or None)
+    try:
+        gem = gemini_guess_email(first_name, last_name, domain,
+                                 hunter_pattern=(hunter.get("pattern") or None))
+        if gem and gem.get("email"):
+            return gem
+    except Exception as e:
+        logger.warning(f"[GeminiEmail] step skipped for {domain}: {e}")
     
     # Step 2: Generate patterns (personal patterns come first with higher confidence)
     patterns = generate_email_patterns(first_name, last_name, domain)
@@ -348,18 +684,26 @@ def find_personal_email(first_name: str, last_name: str, domain: str) -> Dict[st
         f"{first_initial}.{last_lower}@{domain}",
     ]
     
-    # Get personal emails only (exclude generic info@, contact@, etc.)
-    generic_prefixes = {"info", "contact", "hello", "hallo", "sales", "support", "admin", "office"}
+    # Get personal emails only (exclude generic info@, contact@, privacy@, etc.)
     personal_emails = []
-    
-    # From generate_email_patterns (personal patterns first)
-    for p in patterns:
-        email = p.get("email", "")
-        if email and "@" in email:
-            prefix = email.split("@")[0].lower()
-            if prefix not in generic_prefixes:
+    try:
+        from lead_quality import is_generic_email as _is_generic
+        for p in patterns:
+            email = p.get("email", "")
+            if email and "@" in email and not _is_generic(email):
                 personal_emails.append(email)
-    
+    except Exception:
+        generic_prefixes = {
+            "info", "contact", "hello", "hallo", "sales", "support", "admin",
+            "office", "privacy", "legal", "compliance", "dpo", "security",
+        }
+        for p in patterns:
+            email = p.get("email", "")
+            if email and "@" in email:
+                prefix = email.split("@")[0].lower()
+                if prefix not in generic_prefixes:
+                    personal_emails.append(email)
+
     # Add extra patterns
     for email in extra_patterns:
         if email and "@" in email:
@@ -377,12 +721,7 @@ def find_personal_email(first_name: str, last_name: str, domain: str) -> Dict[st
         return {"email": None, "confidence": 0, "source": "no_personal_patterns", "verified": False}
     
     # Check if domain has valid MX records (fast check)
-    import dns.resolver
-    try:
-        mx_records = dns.resolver.resolve(domain, "MX", lifetime=5)
-        has_mx = True
-    except Exception:
-        has_mx = False
+    has_mx = _domain_has_mx(domain)
     
     # Return most likely personal pattern (firstname.lastname is most common in NL)
     best_email = unique_personal[0]

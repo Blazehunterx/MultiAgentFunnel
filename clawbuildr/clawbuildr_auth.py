@@ -45,6 +45,10 @@ def _ensure_auth_tables():
                 is_active INTEGER NOT NULL DEFAULT 1
             )
         """)
+        try:
+            db.execute("ALTER TABLE users ADD COLUMN tenant_id TEXT DEFAULT ''")
+        except Exception:
+            pass
         db.execute("""
             CREATE TABLE IF NOT EXISTS workspaces (
                 workspace_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -131,14 +135,24 @@ def authenticate_user(email: str, password: str) -> Optional[Dict[str, Any]]:
         db.close()
 
 
-def generate_token(user: sqlite3.Row) -> str:
+def _user_field(user: Any, key: str, default: Any = None) -> Any:
+    try:
+        return user[key]
+    except Exception:
+        return getattr(user, key, default)
+
+
+def generate_token(user: Any) -> str:
+    user_id = _user_field(user, "user_id")
+    email = _user_field(user, "email", "")
+    role = _user_field(user, "role", "client")
     try:
         import jwt
     except ImportError:
         payload = {
-            "user_id": user["user_id"],
-            "email": user["email"],
-            "role": user["role"],
+            "user_id": user_id,
+            "email": email,
+            "role": role,
             "exp": (datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HOURS)).isoformat(),
         }
         import hmac, base64
@@ -149,9 +163,9 @@ def generate_token(user: sqlite3.Row) -> str:
         return f"{header}.{body}.{sig_b64}"
 
     payload = {
-        "user_id": user["user_id"],
-        "email": user["email"],
-        "role": user["role"],
+        "user_id": user_id,
+        "email": email,
+        "role": role,
         "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HOURS),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)

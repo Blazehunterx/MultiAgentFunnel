@@ -161,8 +161,8 @@ def get_pipeline_overview() -> Dict[str, Any]:
 
         total_contacts = sum(stages.values())
 
-        emails_sent = db.execute("SELECT COUNT(*) FROM emails WHERE direction = 'outbound'").fetchone()[0]
-        emails_received = db.execute("SELECT COUNT(*) FROM emails WHERE direction = 'inbound'").fetchone()[0]
+        emails_sent = db.execute("SELECT COUNT(*) FROM emails WHERE UPPER(direction) = 'OUTBOUND'").fetchone()[0]
+        emails_received = db.execute("SELECT COUNT(*) FROM emails WHERE UPPER(direction) = 'INBOUND'").fetchone()[0]
         linkedin_sent = db.execute("SELECT COUNT(*) FROM linkedin_outreach").fetchone()[0]
         linkedin_accepted = db.execute(
             "SELECT COUNT(*) FROM linkedin_outreach WHERE outcome = 'accepted'"

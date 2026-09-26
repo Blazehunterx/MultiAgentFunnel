@@ -290,7 +290,7 @@ async def process_pending_sends():
                     conn = _db()
                     conn.execute(
                         "INSERT INTO emails (contact_id, direction, status, subject, body, sent_at, created_at) "
-                        "VALUES (?, 'outbound', 'sent', ?, ?, ?, ?)",
+                        "VALUES (?, 'outbound', 'SENT', ?, ?, ?, ?)",
                         (lead["contact_id"], personalized.get("subject", ""),
                          personalized["body"], datetime.now(timezone.utc).isoformat())
                     )

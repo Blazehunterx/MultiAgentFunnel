@@ -373,37 +373,45 @@ def _add_to_pipeline(
             VALUES (?, ?, ?, ?, NULL)
         """, (company_id, name, domain, industry))
 
-        # Insert contact (first personal email, or generic)
+        # Insert contact — personal email only; never generic/privacy@/Unknown names
+        from lead_quality import is_personal_email, is_garbage_person_name, validate_lead
+
         contact_id = f"lead_{domain.replace('.', '_')}"
-        personal_email = None
-        generic_email = None
+        final_email = None
         for e in emails:
-            # Skip invalid emails (images, yelp domains, etc.)
             if not e or "@" not in e:
                 continue
-            local_part = e.split("@")[0].lower()
-            domain_part = e.split("@")[1].lower() if "@" in e else ""
-            # Skip junk emails
             if any(x in e.lower() for x in ["yelp:", "40x40", "claim_your_page", ".png", ".jpg", ".gif"]):
                 continue
-            if local_part not in ("info", "contact", "hello", "support", "sales", "admin"):
-                personal_email = e
+            if is_personal_email(e):
+                final_email = e
                 break
-            elif not generic_email:
-                generic_email = e
 
-        final_email = personal_email or generic_email
-
-        # Skip if no valid email found
-        if not final_email or "@" not in final_email or "." not in final_email.split("@")[1]:
-            logger.info(f"  Skipping {name} ({domain}) - no valid email found")
+        if not final_email:
+            logger.info(f"  Skipping {name} ({domain}) - no personal (non-generic) email found")
             conn.close()
             return None
 
-        # Additional validation: email must have valid TLD
-        tld = final_email.split("@")[1].split(".")[-1]
-        if len(tld) < 2 or len(tld) > 10:
-            logger.info(f"  Skipping {name} ({domain}) - invalid email TLD: {final_email}")
+        # Reject page-title / Unknown names — do not invent placeholders
+        extracted_first = ""
+        local = final_email.split("@")[0].lower()
+        parts = re.split(r"[._\-]", local)
+        if len(parts) >= 2 and all(p.isalpha() for p in parts[:2]):
+            extracted_first = parts[0].capitalize()
+        if not extracted_first or is_garbage_person_name(extracted_first, ""):
+            logger.info(f"  Skipping {name} ({domain}) - no real contact name for {final_email}")
+            conn.close()
+            return None
+
+        ok, reason = validate_lead(
+            email=final_email,
+            first_name=extracted_first,
+            last_name="",
+            company_name=name or "",
+            domain=domain,
+        )
+        if not ok:
+            logger.info(f"  Skipping {name} ({domain}) - quality gate: {reason}")
             conn.close()
             return None
 
@@ -412,7 +420,7 @@ def _add_to_pipeline(
             VALUES (?, ?, ?, ?, ?, ?, 'INGESTED', ?)
         """, (
             contact_id, company_id,
-            "Unknown", "", final_email, "Unknown",
+            extracted_first, "", final_email, "Decision Maker",
             int(icp_score)
         ))
 

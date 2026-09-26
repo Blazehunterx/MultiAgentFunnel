@@ -49,6 +49,33 @@ def set_followup_template(name: str) -> bool:
     return False
 
 
+def set_followup_custom(steps: List[Dict[str, Any]]) -> bool:
+    """Install a custom follow-up sequence built from the Skylead-style sequence editor.
+
+    Each step: {"step": int, "delay_hours": int, "subject_prefix": str, "tone": str}
+    """
+    global FOLLOWUP_SEQUENCE
+    normalized: List[Dict[str, Any]] = []
+    for i, raw in enumerate(steps or [], start=1):
+        if not isinstance(raw, dict):
+            continue
+        delay = int(raw.get("delay_hours", 0))
+        if delay < 0:
+            delay = 0
+        normalized.append({
+            "step": int(raw.get("step", i)),
+            "delay_hours": delay,
+            "subject_prefix": str(raw.get("subject_prefix", "Re: ")),
+            "tone": str(raw.get("tone", "gentle")),
+        })
+    if not normalized:
+        logger.warning("[Scheduler] set_followup_custom called with empty steps, keeping current")
+        return False
+    FOLLOWUP_SEQUENCE = normalized
+    logger.info(f"[Scheduler] Custom follow-up sequence installed ({len(normalized)} step(s))")
+    return True
+
+
 _DAILY_LIMIT = 50
 
 

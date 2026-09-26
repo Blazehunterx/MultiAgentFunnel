@@ -151,12 +151,23 @@ def check_bounces(gmail_user, gmail_password, mark_read=True, since_days=7):
 
         if contact:
             contact_id = contact["contact_id"]
-            # Mark email as bounced (if exists)
+            # Mark only the most recent real outbound attempt — never mark-all
+            # (mark-all flipped entire history to BOUNCED and inflated bounce rate).
             cur.execute("""
-                UPDATE emails
-                SET bounced_at = ?, bounce_reason = ?, status = 'BOUNCED'
-                WHERE contact_id = ? AND direction = 'outbound' AND bounced_at IS NULL
-            """, (now, "Bounce detected via IMAP", contact_id))
+                SELECT email_id FROM emails
+                WHERE contact_id = ? AND UPPER(direction) = 'OUTBOUND'
+                  AND (subject IS NULL OR subject != 'Bounce notification')
+                  AND UPPER(status) IN ('SENT', 'draft', 'FAILED')
+                ORDER BY COALESCE(sent_at, created_at, '') DESC
+                LIMIT 1
+            """, (contact_id,))
+            latest = cur.fetchone()
+            if latest:
+                cur.execute("""
+                    UPDATE emails
+                    SET bounced_at = ?, bounce_reason = ?, status = 'BOUNCED'
+                    WHERE email_id = ? AND bounced_at IS NULL
+                """, (now, "Bounce detected via IMAP", latest["email_id"]))
 
             # Mark contact as BOUNCED unless already closed/won/meeting
             if contact["current_stage"] not in ("CLOSED_WON", "MEETING_BOOKED", "BOUNCED"):
@@ -171,7 +182,7 @@ def check_bounces(gmail_user, gmail_password, mark_read=True, since_days=7):
             cur.execute("""
                 INSERT OR IGNORE INTO email_events (event_id, email_id, contact_id, event_type, metadata, created_at)
                 VALUES (?, ?, ?, 'BOUNCED', ?, ?)
-            """, (event_id, None, contact_id, json.dumps({"bounce_email": recipient}), now))
+            """, (event_id, latest["email_id"] if latest else None, contact_id, json.dumps({"bounce_email": recipient}), now))
 
             found_bounces.append({
                 "contact_id": contact_id,

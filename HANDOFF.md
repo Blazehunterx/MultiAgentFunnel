@@ -10,7 +10,7 @@ Multi-tenant outbound GTM engine (Clay-competitive): DM sender, AI auto-responde
 - **Dashboard**: `python -m uvicorn clawbuildr_dashboard:app --host 0.0.0.0 --port 8000` (from `data/`)
 - **New simple UI**: `/` redirects to `/onboarding` first time, then `/dashboard`
 - **Classic dashboard**: still available at `/classic`
-- **Cloudflare tunnel**: `https://deutsche-match-billing-strategy.trycloudflare.com` (temporary)
+- **Cloudflare tunnel**: `https://millennium-standing-warren-suburban.trycloudflare.com` (temporary quick tunnel; named tunnel service still runs separately)
 - **API prefix**: `/api/onboarding/*`, `/api/simple/*`, existing `/api/*`
 - **DB**: `MultiAgentFunnel/data/clawbuildr.db` — SQLite, 34 tables, 68 contacts
 

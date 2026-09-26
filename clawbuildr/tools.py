@@ -37,6 +37,10 @@ def fix_text_encoding(text: str) -> str:
         return text
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+# Active dashboard DB lives in MultiAgentFunnel/data (parent of clawbuildr/)
+CLAWBUILDR_DB = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "clawbuildr.db"
+)
 
 # Load Gmail credentials from .env
 _DOT_ENV = os.path.join(os.path.dirname(__file__), ".env")
@@ -518,14 +522,23 @@ def _extract_ld_json_emails(html: str) -> list:
 
 def _prioritize_emails(emails: list, scraped_text: str) -> list:
     """Sort emails so personal/contact emails come first, generic last."""
+    try:
+        from lead_quality import is_generic_email as _is_generic
+    except Exception:
+        _is_generic = None
     generic_prefixes = {"info", "contact", "hello", "hi", "support", "sales",
-                        "admin", "office", "team", "mail", "enquiries", "help"}
+                        "admin", "office", "team", "mail", "enquiries", "help",
+                        "privacy", "legal", "dpo", "compliance"}
     def score(e):
         local = e.split("@")[0].lower()
         # Emails found in visible text are prioritized
         if local in scraped_text.lower():
             return 0
         # Personal-name emails (not generic)
+        if _is_generic is not None:
+            if not _is_generic(e):
+                return 1
+            return 2
         if local not in generic_prefixes and not any(local.startswith(g) for g in generic_prefixes):
             return 1
         # Generic like info@, contact@
@@ -785,6 +798,10 @@ def verify_email(email: str) -> dict:
     """Verify an email address: placeholder check, MX records, SMTP RCPT TO, disposable domain.
     Returns dict with verified (bool), confidence (0-100), reasons (list)."""
     import dns.resolver
+    try:
+        import dns_client
+    except ImportError:
+        from clawbuildr import dns_client
     reasons = []
     confidence = 50
 
@@ -845,7 +862,7 @@ def verify_email(email: str) -> dict:
     mx_found = False
     mx_records = []
     try:
-        answers = dns.resolver.resolve(domain, "MX", lifetime=10)
+        answers = dns_client.resolve(domain, "MX", lifetime=10)
         mx_records = [str(r.exchange).rstrip(".") for r in answers]
         if mx_records:
             mx_found = True
@@ -974,30 +991,141 @@ async def gmail_send(to: str, subject: str, body: str, from_addr: str = None,
             msg["From"] = from_addr or user
             msg["To"] = to
 
-        with smtplib.SMTP_SSL(host, port, timeout=30) as server:
-            server.login(user, password)
-            server.send_message(msg)
+        if int(port) == 465:
+            with smtplib.SMTP_SSL(host, port, timeout=30) as server:
+                server.login(user, password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(host, port, timeout=30) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(user, password)
+                server.send_message(msg)
 
         return {"status": "sent", "to": to, "subject": subject, "from": from_addr or user}
     except Exception as e:
         return {"status": "failed", "to": to, "subject": subject, "error": str(e)}
 
 
+def _reset_sends_today_if_stale(conn: sqlite3.Connection, today_utc: str) -> None:
+    """Zero sends_today when last_send_at is from a previous UTC day (or never sent)."""
+    try:
+        conn.execute(
+            """UPDATE email_accounts SET sends_today = 0
+               WHERE last_send_at IS NULL
+                  OR substr(last_send_at, 1, 10) < ?""",
+            (today_utc,),
+        )
+        conn.commit()
+    except Exception:
+        logger.debug("reset_sends_today_if_stale failed")
+
+
+def _active_tenant_id(conn: sqlite3.Connection) -> Optional[str]:
+    """Active tenant from tenant_config, or None when unavailable."""
+    try:
+        row = conn.execute("SELECT tenant_id FROM tenant_config WHERE active = 1 LIMIT 1").fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def resolve_send_kwargs(campaign_id: str = None, contact_id: str = None, tenant_id: str = None) -> dict:
+    """Pick an email_accounts row for sending.
+
+    Priority: campaign.account_id → tenant's round-robin under daily
+    limit → tenant's default → {}.
+    tenant_id=None resolves the ACTIVE tenant; an explicit tenant_id scopes
+    the lookup to that tenant (used by sequence sends so each enrollment
+    sends from its own tenant's mailbox regardless of which tenant is active).
+    Empty dict means no usable account for that tenant.
+    """
+    try:
+        conn = sqlite3.connect(CLAWBUILDR_DB, timeout=10.0)
+        conn.row_factory = sqlite3.Row
+    except Exception:
+        return {}
+    try:
+        today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        _reset_sends_today_if_stale(conn, today_utc)
+        tenant = tenant_id or _active_tenant_id(conn)
+        tenant_sql = ""
+        tenant_params: tuple = ()
+        if tenant:
+            tenant_sql = " AND (tenant_id = ? OR tenant_id IS NULL OR tenant_id = '')"
+            tenant_params = (tenant,)
+        if campaign_id:
+            row = conn.execute(
+                "SELECT account_id FROM campaigns WHERE campaign_id = ?", (campaign_id,)
+            ).fetchone()
+            if row and row["account_id"]:
+                acc = conn.execute(
+                    "SELECT * FROM email_accounts WHERE account_id = ? AND is_active = 1",
+                    (row["account_id"],),
+                ).fetchone()
+                if acc:
+                    limit = acc["daily_send_limit"]
+                    if limit is None or int(acc["sends_today"] or 0) < int(limit):
+                        return dict(acc)
+        acc = conn.execute(
+            """SELECT * FROM email_accounts WHERE is_active = 1
+               AND (daily_send_limit IS NULL OR sends_today < daily_send_limit)
+               """ + tenant_sql + """
+               ORDER BY sends_today ASC, is_default DESC, created_at ASC LIMIT 1""",
+            tenant_params,
+        ).fetchone()
+        if acc:
+            return dict(acc)
+        acc = conn.execute(
+            """SELECT * FROM email_accounts WHERE is_active = 1 AND is_default = 1
+               AND (daily_send_limit IS NULL OR sends_today < daily_send_limit)
+               """ + tenant_sql + """
+               LIMIT 1""",
+            tenant_params,
+        ).fetchone()
+        return dict(acc) if acc else {}
+    except Exception:
+        return {}
+    finally:
+        conn.close()
+
+
+def record_account_send(account_id: str) -> None:
+    """Increment sends_today for an account (no-op if missing)."""
+    if not account_id:
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(CLAWBUILDR_DB, timeout=10.0)
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE email_accounts SET sends_today = sends_today + 1, last_send_at = ? WHERE account_id = ?",
+            (now, account_id),
+        )
+        conn.commit()
+    except Exception:
+        logger.debug("record_account_send failed for %s", account_id)
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 async def gmail_send_with_account(to: str, subject: str, body: str, account_id: str) -> dict:
     """Send email using a specific email account from the database."""
-    import sqlite3
-    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "clawbuildr.db")
-    conn = sqlite3.connect(db_path, timeout=10.0)
-    conn.row_factory = sqlite3.Row
-    account = conn.execute(
-        "SELECT * FROM email_accounts WHERE account_id = ? AND is_active = 1",
-        (account_id,)
-    ).fetchone()
-    conn.close()
-    
+    conn = sqlite3.connect(CLAWBUILDR_DB, timeout=10.0)
+    try:
+        conn.row_factory = sqlite3.Row
+        account = conn.execute(
+            "SELECT * FROM email_accounts WHERE account_id = ? AND is_active = 1",
+            (account_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+
     if not account:
         return {"status": "error", "error": f"Account {account_id} not found or inactive"}
-    
+
     acc = dict(account)
     result = await gmail_send(
         to=to, subject=subject, body=body,
@@ -1007,18 +1135,10 @@ async def gmail_send_with_account(to: str, subject: str, body: str, account_id: 
         smtp_user=acc["smtp_user"],
         smtp_password=acc["smtp_password"]
     )
-    
-    # Record the send
-    if result["status"] == "sent":
-        conn2 = sqlite3.connect(db_path, timeout=10.0)
-        now = datetime.now(timezone.utc).isoformat()
-        conn2.execute(
-            "UPDATE email_accounts SET sends_today = sends_today + 1, last_send_at = ? WHERE account_id = ?",
-            (now, account_id)
-        )
-        conn2.commit()
-        conn2.close()
-    
+
+    if result.get("status") == "sent":
+        record_account_send(account_id)
+
     return result
 
 # ---------- Tool 4: db_append ----------
@@ -1106,9 +1226,10 @@ def save_linkedin_enrichment(company_name: str, domain: str, profile_data: dict,
     now = datetime.utcnow().isoformat()
     result = {"profile_updated": False, "company_updated": False}
 
-    # Update company
+    # Update company — match domain first (stable), fall back to name
     if company_data and company_name:
         try:
+            domain_val = (domain or "").strip().lower()
             cur = db.execute(
                 """UPDATE companies SET
                     industry = COALESCE(NULLIF(?, ''), industry),
@@ -1123,7 +1244,7 @@ def save_linkedin_enrichment(company_name: str, domain: str, profile_data: dict,
                     hiring_jobs_json = COALESCE(NULLIF(?, ''), hiring_jobs_json),
                     company_posts_json = COALESCE(NULLIF(?, ''), company_posts_json),
                     linkedin_last_enriched_at = ?
-                WHERE name = ?""",
+                WHERE (domain IS NOT NULL AND LOWER(domain) = ?) OR name = ?""",
                 (
                     company_data.get("industry", ""),
                     company_data.get("size", ""),
@@ -1133,10 +1254,11 @@ def save_linkedin_enrichment(company_name: str, domain: str, profile_data: dict,
                     company_data.get("website", ""),
                     company_data.get("followers", ""),
                     company_data.get("employee_count_text", ""),
-                    company_data.get("hiring_count", 0),
+                    str(company_data.get("hiring_count", "")) if company_data.get("hiring_count") is not None else "",
                     _json.dumps(company_data.get("hiring_jobs", [])) if company_data.get("hiring_jobs") else None,
                     _json.dumps(company_data.get("posts", [])) if company_data.get("posts") else None,
                     now,
+                    domain_val,
                     company_name,
                 )
             )
@@ -1146,10 +1268,9 @@ def save_linkedin_enrichment(company_name: str, domain: str, profile_data: dict,
         except Exception as e:
             result["company_error"] = str(e)[:100]
 
-    # Update contact
+    # Update contact — also backfill linkedin_url when empty
     if profile_data:
         try:
-            # Find contact by LinkedIn URL or name+company
             linkedin_url = profile_data.get("profile_url", "")
             first_name = profile_data.get("name", "").split()[0] if profile_data.get("name") else ""
             cur = db.execute(
@@ -1159,14 +1280,20 @@ def save_linkedin_enrichment(company_name: str, domain: str, profile_data: dict,
                     skills_json = COALESCE(NULLIF(?, ''), skills_json),
                     mutual_connections_count = COALESCE(NULLIF(?, ''), mutual_connections_count),
                     mutual_connections_text = COALESCE(NULLIF(?, ''), mutual_connections_text),
+                    linkedin_url = CASE
+                        WHEN linkedin_url IS NULL OR linkedin_url = '' THEN COALESCE(NULLIF(?, ''), linkedin_url)
+                        ELSE linkedin_url
+                    END,
                     linkedin_last_enriched_at = ?
-                WHERE linkedin_url = ? OR (first_name = ? AND company_id IN (SELECT company_id FROM companies WHERE name = ?))""",
+                WHERE (linkedin_url != '' AND linkedin_url = ?)
+                   OR (first_name = ? AND company_id IN (SELECT company_id FROM companies WHERE name = ?))""",
                 (
                     profile_data.get("current_role", ""),
                     profile_data.get("tenure", ""),
                     _json.dumps(profile_data.get("skills", [])) if profile_data.get("skills") else None,
                     profile_data.get("mutual_connections_count", 0),
                     profile_data.get("mutual_connections_text", ""),
+                    linkedin_url,
                     now,
                     linkedin_url,
                     first_name,

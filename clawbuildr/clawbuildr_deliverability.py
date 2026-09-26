@@ -12,6 +12,11 @@ import dns.reversename
 from datetime import datetime, timezone
 from typing import Dict, Any, List
 
+try:
+    import dns_client
+except ImportError:
+    from clawbuildr import dns_client
+
 logger = logging.getLogger("ClawBuildr.Deliverability")
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
@@ -27,7 +32,7 @@ def _get_db() -> sqlite3.Connection:
 
 def check_spf(domain: str) -> Dict[str, Any]:
     try:
-        txt_records = dns.resolver.resolve(domain, "TXT")
+        txt_records = dns_client.resolve(domain, "TXT")
         for r in txt_records:
             txt = str(r)
             if "v=spf1" in txt:
@@ -42,7 +47,7 @@ def check_spf(domain: str) -> Dict[str, Any]:
 def check_dkim(domain: str, selector: str = "google") -> Dict[str, Any]:
     try:
         query = f"{selector}._domainkey.{domain}"
-        txt_records = dns.resolver.resolve(query, "TXT")
+        txt_records = dns_client.resolve(query, "TXT")
         records = [str(r) for r in txt_records]
         return {"valid": len(records) > 0, "records": records, "domain": domain, "selector": selector}
     except dns.resolver.NXDOMAIN:
@@ -53,7 +58,7 @@ def check_dkim(domain: str, selector: str = "google") -> Dict[str, Any]:
 
 def check_dmarc(domain: str) -> Dict[str, Any]:
     try:
-        txt_records = dns.resolver.resolve(f"_dmarc.{domain}", "TXT")
+        txt_records = dns_client.resolve(f"_dmarc.{domain}", "TXT")
         records = [str(r) for r in txt_records]
         dmarc_found = any("v=DMARC1" in r for r in records)
         return {"valid": dmarc_found, "records": records, "domain": domain}
@@ -65,7 +70,7 @@ def check_dmarc(domain: str) -> Dict[str, Any]:
 
 def check_mx(domain: str) -> Dict[str, Any]:
     try:
-        mx_records = dns.resolver.resolve(domain, "MX")
+        mx_records = dns_client.resolve(domain, "MX")
         records = [{"priority": r.preference, "exchange": str(r.exchange)} for r in mx_records]
         return {"valid": len(records) > 0, "records": records, "domain": domain}
     except dns.resolver.NXDOMAIN:

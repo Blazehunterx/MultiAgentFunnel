@@ -168,12 +168,50 @@ def record_ab_test_result(test_id: int, variant: str, is_reply: bool):
         if test and test["variant_a_sent"] >= 20 and test["variant_b_sent"] >= 20:
             rate_a = test["variant_a_replies"] / max(test["variant_a_sent"], 1)
             rate_b = test["variant_b_replies"] / max(test["variant_b_sent"], 1)
-            winner = "a" if rate_a > rate_b else "b"
-            db.execute(
-                "UPDATE ab_tests SET status = 'completed', winner = ?, ended_at = ? WHERE id = ?",
-                (winner, datetime.now(timezone.utc).isoformat(), test_id),
-            )
+            if rate_a != rate_b:  # ties keep the test running — no evidence yet
+                winner = "a" if rate_a > rate_b else "b"
+                db.execute(
+                    "UPDATE ab_tests SET status = 'completed', winner = ?, ended_at = ? WHERE id = ?",
+                    (winner, datetime.now(timezone.utc).isoformat(), test_id),
+                )
         db.commit()
+    finally:
+        db.close()
+
+
+def get_variant_weights() -> Dict[str, Dict[str, float]]:
+    """Variant preference per A/B test, learned from actual replies.
+
+    - completed test -> 100% winner (the learned outcome feeds every future draft)
+    - running test with >= 10 sends and a reply-rate gap -> 80/20 lean toward
+      the better variant (poor performers get deprioritized before the full
+      20+20 threshold); equal rates or no data -> caller stays random
+    """
+    _ensure_learning_tables()
+    db = _get_db()
+    try:
+        rows = db.execute(
+            """SELECT test_name, status, winner,
+                      variant_a_sent, variant_b_sent,
+                      variant_a_replies, variant_b_replies
+               FROM ab_tests"""
+        ).fetchall()
+        out: Dict[str, Dict[str, float]] = {}
+        for r in rows:
+            name = r["test_name"]
+            if r["status"] == "completed" and r["winner"] in ("a", "b"):
+                out[name] = {"a": 1.0, "b": 0.0} if r["winner"] == "a" else {"a": 0.0, "b": 1.0}
+                continue
+            sent_a = r["variant_a_sent"] or 0
+            sent_b = r["variant_b_sent"] or 0
+            if max(sent_a, sent_b) < 10:
+                continue
+            rate_a = (r["variant_a_replies"] or 0) / max(sent_a, 1)
+            rate_b = (r["variant_b_replies"] or 0) / max(sent_b, 1)
+            if rate_a == rate_b:
+                continue
+            out[name] = {"a": 0.8, "b": 0.2} if rate_a > rate_b else {"a": 0.2, "b": 0.8}
+        return out
     finally:
         db.close()
 

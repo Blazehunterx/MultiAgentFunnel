@@ -42,6 +42,7 @@ if DATA_DIR not in sys.path:
 from models import LeadInput
 from pipeline import research_company, assess_trust, map_opportunity, qualify, generate_email
 from tools import gmail_send, scrape_url
+from lead_quality import validate_lead as _validate_lead_quality, is_garbage_company_name as _is_garbage_company_name
 from linkedin_engine import search_and_connect, get_clawbuildr_linkedin_history, generate_linkedin_note, linkedin_login, linkedin_login_status, get_daily_count_api, get_scheduling_status, extract_firefox_cookies
 
 # New integrated modules (mounted via API sub-app)
@@ -282,6 +283,11 @@ def run_migrations():
         ("sequence_template", "TEXT NOT NULL DEFAULT 'gentle'"),
         ("icp_regions", "TEXT NOT NULL DEFAULT '[\"nl\"]'"),
         ("pain_points", "TEXT NOT NULL DEFAULT '[]'"),
+        ("send_days", "TEXT NOT NULL DEFAULT '[\"mon\",\"tue\",\"wed\",\"thu\",\"fri\"]'"),
+        ("send_hour_from", "INTEGER NOT NULL DEFAULT 9"),
+        ("send_hour_to", "INTEGER NOT NULL DEFAULT 17"),
+        ("followup_custom_json", "TEXT"),
+        ("campaign_goal", "TEXT NOT NULL DEFAULT ''"),
     ]:
         try:
             cursor.execute(f"ALTER TABLE tenant_config ADD COLUMN {col} {typedef}")
@@ -547,6 +553,14 @@ Als {{company_name}} ooit hulp nodig heeft met {{pain_point}}, weet je ons te vi
         created_at TEXT
     );
     """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS lead_notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        contact_id TEXT NOT NULL,
+        body TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    """)
     cursor.execute("PRAGMA table_info(contacts);")
     columns = [col[1] for col in cursor.fetchall()]
     
@@ -603,9 +617,14 @@ Als {{company_name}} ooit hulp nodig heeft met {{pain_point}}, weet je ons te vi
         account_id TEXT,
         created_at TEXT,
         updated_at TEXT,
+        sequence_json TEXT,
         FOREIGN KEY (account_id) REFERENCES email_accounts(account_id)
     );
     """)
+    try:
+        cursor.execute("ALTER TABLE campaigns ADD COLUMN sequence_json TEXT")
+    except Exception:
+        pass
 
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS campaign_leads (
@@ -653,6 +672,7 @@ Als {{company_name}} ooit hulp nodig heeft met {{pain_point}}, weet je ons te vi
         flow_id TEXT,
         lead_id TEXT NOT NULL,
         direction TEXT DEFAULT 'OUTBOUND',
+        channel TEXT DEFAULT 'email',
         message_text TEXT NOT NULL,
         status TEXT DEFAULT 'pending_approval',
         ai_confidence REAL DEFAULT 0.0,
@@ -663,6 +683,10 @@ Als {{company_name}} ooit hulp nodig heeft met {{pain_point}}, weet je ons te vi
         created_at TEXT
     );
     """)
+    try:
+        cursor.execute("ALTER TABLE campaign_message_queue ADD COLUMN channel TEXT DEFAULT 'email'")
+    except Exception:
+        pass
 
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS campaign_conversations (
@@ -735,6 +759,7 @@ Als {{company_name}} ooit hulp nodig heeft met {{pain_point}}, weet je ons te vi
         warmup_days INTEGER DEFAULT 0,
         signature TEXT,
         reply_to TEXT,
+        tenant_id TEXT DEFAULT '',
         created_at TEXT,
         updated_at TEXT
     );
@@ -779,6 +804,75 @@ Als {{company_name}} ooit hulp nodig heeft met {{pain_point}}, weet je ons te vi
                     (str(_uuid.uuid4()), "Marvin (Default)", _gmail_user, _gmail_user, _gmail_pass,
                      datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat())
                 )
+    except Exception:
+        pass
+
+    # NEW: tenant scoping on email accounts (existing rows belong to the active tenant)
+    try:
+        cursor.execute("ALTER TABLE email_accounts ADD COLUMN tenant_id TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        _trow = cursor.execute("SELECT tenant_id FROM tenant_config WHERE active = 1 LIMIT 1").fetchone()
+        _active_t = _trow[0] if _trow else "clawbuildr"
+        cursor.execute(
+            "UPDATE email_accounts SET tenant_id = ? WHERE tenant_id IS NULL OR tenant_id = ''",
+            (_active_t,),
+        )
+    except Exception:
+        pass
+
+    # NEW: tenant scoping on contacts (root of lead/inbox/campaign isolation)
+    try:
+        cursor.execute("ALTER TABLE contacts ADD COLUMN tenant_id TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        cursor.execute(
+            "UPDATE contacts SET tenant_id = ? WHERE tenant_id IS NULL OR tenant_id = ''",
+            (_active_t,),
+        )
+    except Exception:
+        pass
+    # Every newly inserted contact gets the active tenant automatically
+    # (covers all insert sites across dashboard + clawbuildr modules).
+    try:
+        cursor.execute("""
+            CREATE TRIGGER IF NOT EXISTS trg_contacts_tenant_default
+            AFTER INSERT ON contacts
+            WHEN IFNULL(NEW.tenant_id, '') = ''
+            BEGIN
+                UPDATE contacts
+                   SET tenant_id = COALESCE((SELECT tenant_id FROM tenant_config WHERE active = 1 LIMIT 1), '')
+                 WHERE contact_id = NEW.contact_id;
+            END;
+        """)
+    except Exception:
+        pass
+
+    # NEW: tenant scoping on campaigns (list isolation per tenant)
+    try:
+        cursor.execute("ALTER TABLE campaigns ADD COLUMN tenant_id TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        cursor.execute(
+            "UPDATE campaigns SET tenant_id = ? WHERE tenant_id IS NULL OR tenant_id = ''",
+            (_active_t,),
+        )
+    except Exception:
+        pass
+
+    # NEW: users → home tenant (login re-activates it; register provisions a new one)
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN tenant_id TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        cursor.execute(
+            "UPDATE users SET tenant_id = ? WHERE tenant_id IS NULL OR tenant_id = ''",
+            ("clawbuildr",),
+        )
     except Exception:
         pass
 
@@ -1210,7 +1304,7 @@ async def run_pipeline_for_lead(lead_id: str):
         await update_agent_db_status("Deliverability Agent", "RUNNING", f"Scoring trust & deliverability for {domain}...")
         await log_handoff("CentralOrchestrator", "Deliverability Agent", {"action": "trust_assessment", "email": email, "domain": domain})
         
-        audit = d_agent.audit_prospect(email, domain)
+        audit = d_agent.audit_prospect(email, domain, research=res_result)
         deliv_data = audit.model_dump() if hasattr(audit, "model_dump") else audit.dict()
         
         await db_write("UPDATE contacts SET deliverability_audit = ? WHERE contact_id = ?;", (json.dumps(deliv_data), lead_id))
@@ -1575,6 +1669,22 @@ async def strategy_sequence_loop():
 
             from strategy_engine import get_leads_due_for_next_step, advance_sequence, get_strategy_steps
 
+            # Active sequence graph owns outreach — strategy loop must not double-send
+            try:
+                _sg_chk = sqlite3.connect(DB_PATH, timeout=5.0)
+                _has_graph = _sg_chk.execute(
+                    "SELECT 1 FROM sequence_graphs WHERE active = 1 LIMIT 1"
+                ).fetchone()
+                _sg_chk.close()
+                if _has_graph:
+                    await asyncio.sleep(300)
+                    continue
+            except Exception as _sg_chk_err:
+                # Fail closed: if graph state is unreadable, skip this cycle
+                logger.warning(f"[Strategy Engine] graph check failed ({_sg_chk_err}) — skipping cycle")
+                await asyncio.sleep(300)
+                continue
+
             due_leads = get_leads_due_for_next_step()
             if due_leads:
                 logger.info(f"[Strategy Engine] {len(due_leads)} lead(s) due for next step.")
@@ -1678,7 +1788,58 @@ async def strategy_sequence_loop():
 # 4. FASTAPI APP ROUTING & ENDPOINTS
 # =========================================================================
 
-@contextlib.asynccontextmanager
+async def sequence_graph_loop():
+    """Multi-channel sequence graph executor (email / LinkedIn / wait / if-else)."""
+    logger.info("[SeqGraph] Sequence graph loop started — ticking every 60s.")
+    await asyncio.sleep(2)  # start almost immediately so first campaign fires fast
+    while True:
+        try:
+            _cb_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "clawbuildr")
+            if _cb_dir not in sys.path:
+                sys.path.insert(0, _cb_dir)
+            from clawbuildr_sequence_graph import process_due, ensure_tables, enroll_eligible_leads
+            ensure_tables()
+            # Auto-enroll new early-stage leads into active graph each tick
+            enrolled = await asyncio.to_thread(enroll_eligible_leads, 25, tenant_id=_active_tenant_id())
+            if enrolled:
+                logger.info(f"[SeqGraph] Auto-enrolled {enrolled} new lead(s)")
+            stats = await asyncio.to_thread(process_due, 15)
+            if stats.get("processed"):
+                logger.info(f"[SeqGraph] {stats}")
+        except Exception as e:
+            logger.warning(f"[SeqGraph] tick failed: {e}")
+        await asyncio.sleep(60)
+
+
+async def imap_reply_loop():
+    """Poll IMAP for inbound replies (contact-level matching).
+
+    Covers sequence-graph emails: those are sent via SMTP so they have no
+    Gmail thread_id and lowercase direction — the Gmail-API reply loop can
+    never see them. check_replies() matches by sender address and flips
+    contact stages (REPLIED etc.), which the graph's email_replied condition
+    and terminal-stage pre-check then act on.
+    """
+    logger.info("[IMAP Reply] Loop started — polling IMAP every 5 minutes.")
+    await asyncio.sleep(90)  # let server fully boot first
+    while True:
+        try:
+            _cb_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "clawbuildr")
+            if _cb_dir not in sys.path:
+                sys.path.insert(0, _cb_dir)
+            from clawbuildr_reply_detector import check_replies
+            replies = await asyncio.to_thread(check_replies, 24)
+            if replies:
+                summary = ", ".join(
+                    f"{r.get('email')}={r.get('stage_update') or r.get('sentiment')}"
+                    for r in replies[:5]
+                )
+                logger.info(f"[IMAP Reply] {len(replies)} new repl(y/ies): {summary}")
+        except Exception as e:
+            logger.warning(f"[IMAP Reply] tick failed: {e}")
+        await asyncio.sleep(5 * 60)
+
+
 async def lifespan(app: FastAPI) -> AsyncGenerator:
     """Initializes the database schema and starts the background agent loop."""
     run_migrations()
@@ -1697,12 +1858,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         task8 = asyncio.create_task(engagement_scoring_loop()); await asyncio.sleep(0)
         task9 = asyncio.create_task(campaign_email_send_loop()); await asyncio.sleep(0)
         task10 = asyncio.create_task(auto_approve_loop()); await asyncio.sleep(0)
+        task11 = asyncio.create_task(sequence_graph_loop()); await asyncio.sleep(0)
+        task12 = asyncio.create_task(imap_reply_loop()); await asyncio.sleep(0)
         asyncio.create_task(immediate_sourcing_cycle())
         logger.info("[Startup] All background loops started.")
     yield
     if not skip_bg:
         task1.cancel(); task2.cancel(); task3.cancel(); task4.cancel(); task5.cancel()
-        task6.cancel(); task7.cancel(); task8.cancel(); task9.cancel(); task10.cancel()
+        task6.cancel(); task7.cancel(); task8.cancel(); task9.cancel(); task10.cancel(); task11.cancel(); task12.cancel()
         logger.info("[Shutdown] Background tasks cancelled.")
 
 app = FastAPI(title="ClawBuildr Mission Control Dashboard", lifespan=lifespan)
@@ -1856,7 +2019,22 @@ _SKIP_DOMAINS = {
     "architekten.de", "fitness.eu", "fitnessclub.de",
     # Belgian directories
     "goudengids.be", "telenet.be", "page.be", "sprl.be",
+    # Dictionary / thesaurus / encyclopedia / education reference (never companies)
+    "dictionary.com", "thesaurus.com", "merriam-webster.com",
+    "oxfordlearnersdictionaries.com", "dictionary.cambridge.org",
+    "collinsdictionary.com", "wordreference.com", "yourdictionary.com",
+    "vocabulary.com", "synonym.com", "duden.de", "dict.cc", "leo.org",
+    "pons.com", "linguee.com", "bab.la", "britannica.com", "encyclopedia.com",
+    "synonymer.se", "vedantu.com", "simplypsychology.org", "pace.edu",
+    "factohr.com", "codeitbro.com", "latenode.com", "svb.com",
 }
+
+_JUNK_TITLE_PATTERNS = re.compile(
+    r"\b(definitions?|synonyms?|antonyms?|meaning|thesaurus|dictionary|"
+    r"what is|what are|examples? of|adjective|noun|verb|"
+    r"opposite|pronunciation|translation|formula examples)\b",
+    re.IGNORECASE,
+)
 
 def _is_business_hours() -> bool:
     """Check if current time is 09:00-18:00 CET on weekdays."""
@@ -1941,6 +2119,8 @@ async def _search_web_legacy(query: str) -> list:
             domain = parsed.netloc.lower().replace('www.', '')
             if any(skip in domain for skip in _SKIP_DOMAINS):
                 continue
+            if _JUNK_TITLE_PATTERNS.search(title):
+                continue
             if not domain or '.' not in domain:
                 continue
             tld = domain.rsplit('.', 1)[-1]
@@ -1958,7 +2138,9 @@ def _results_to_tld(results: dict) -> str:
     tld = results.get("domain", "").rsplit('.', 1)[-1] if '.' in results.get("domain", "") else ""
     return {"nl": "NL", "be": "BE", "de": "DE", "eu": "EU"}.get(tld, tld.upper())
 
-_SCRAPE_SEMAPHORE = asyncio.Semaphore(5)
+_SCRAPE_SEMAPHORE = asyncio.Semaphore(2)
+# Only one LinkedIn/Selenium lookup at a time (prevents Firefox window pile-up)
+_LINKEDIN_SEMAPHORE = asyncio.Semaphore(1)
 
 _GENERIC_EMAIL_PREFIXES = {"info", "contact", "hello", "hi", "support", "sales", "admin",
                            "webmaster", "noreply", "no-reply", "mail", "office", "team",
@@ -2149,7 +2331,11 @@ async def _find_linkedin_for_company(company_name: str, domain: str) -> dict:
     if not found_names:
         try:
             from linkedin_engine import find_decision_maker_on_linkedin
-            li_result = await asyncio.to_thread(find_decision_maker_on_linkedin, clean_name, domain)
+            async with _LINKEDIN_SEMAPHORE:
+                li_result = await asyncio.wait_for(
+                    asyncio.to_thread(find_decision_maker_on_linkedin, clean_name, domain),
+                    timeout=45,
+                )
             if li_result:
                 fn = li_result.get("first_name", "")
                 ln = li_result.get("last_name", "")
@@ -2160,12 +2346,14 @@ async def _find_linkedin_for_company(company_name: str, domain: str) -> dict:
                         return {"linkedin_url": url, "first_name": fn, "last_name": ln}
                     else:
                         found_names.append((fn, ln))
+        except asyncio.TimeoutError:
+            logger.info(f"[Lead Sourcing] LinkedIn direct search timed out for {domain}")
         except Exception as e:
             logger.info(f"[Lead Sourcing] LinkedIn direct search failed: {e}")
 
     # STEP 2: For each found name, try to find LinkedIn profile
     # Bug #8 fix: Run Selenium in thread to avoid blocking the event loop
-    for first, last in found_names[:3]:
+    for first, last in found_names[:2]:
         full_name = f"{first} {last}".strip()
         try:
             def _run_li_search():
@@ -2173,10 +2361,14 @@ async def _find_linkedin_for_company(company_name: str, domain: str) -> dict:
                 with get_firefox_driver() as (driver, page):
                     profile_url, error = _search_and_find_profile(page, first, last, clean_name)
                     return profile_url
-            profile_url = await asyncio.to_thread(_run_li_search)
+            async with _LINKEDIN_SEMAPHORE:
+                profile_url = await asyncio.wait_for(asyncio.to_thread(_run_li_search), timeout=45)
             if profile_url:
                 logger.info(f"[Lead Sourcing] LinkedIn found: {first} {last} -> {profile_url}")
                 return {"linkedin_url": profile_url, "first_name": first, "last_name": last}
+        except asyncio.TimeoutError:
+            logger.info(f"[Lead Sourcing] LinkedIn profile search timed out for {first} {last}")
+            break
         except Exception as e:
             logger.info(f"[Lead Sourcing] LinkedIn search for {first} {last} failed: {e}")
         await asyncio.sleep(2)
@@ -2204,7 +2396,15 @@ async def _try_query(query: str, current_count: int) -> int:
     seen_domains = set()
     for res in results:
         domain = res["domain"]
+        title = res.get("title") or ""
         if not domain or domain in seen_domains:
+            continue
+        if any(skip in domain for skip in _SKIP_DOMAINS):
+            continue
+        if _JUNK_TITLE_PATTERNS.search(title):
+            continue
+        # Only NL/BE/DE before any scrape or LinkedIn work
+        if not (domain.endswith('.nl') or domain.endswith('.be') or domain.endswith('.de')):
             continue
         seen_domains.add(domain)
         cur2.execute("SELECT company_id FROM companies WHERE domain = ?", (domain,))
@@ -2268,11 +2468,18 @@ async def _try_query(query: str, current_count: int) -> int:
         tld_hint = _results_to_tld(res)
 
         try:
-            li_result = await _find_linkedin_for_company(company_name, domain)
+            li_result = await asyncio.wait_for(
+                _find_linkedin_for_company(company_name, domain), timeout=60
+            )
             if li_result and li_result.get("linkedin_url"):
                 linkedin_url = li_result["linkedin_url"]
                 first_name = li_result.get("first_name", "")
                 last_name = li_result.get("last_name", "")
+            elif li_result and li_result.get("first_name"):
+                first_name = li_result.get("first_name", "")
+                last_name = li_result.get("last_name", "")
+        except asyncio.TimeoutError:
+            logger.info(f"[Lead Sourcing] LinkedIn lookup timed out for {domain}")
         except Exception as li_err:
             logger.info(f"[Lead Sourcing] LinkedIn search failed for {company_name}: {li_err}")
 
@@ -2285,7 +2492,8 @@ async def _try_query(query: str, current_count: int) -> int:
         garbage_name_patterns = ['interimrecruiter', 'admin', 'info', 'sales', 'contact', 'noreply', 'test',
                                  'secretariaat', 'klantendienst', 'archief', 'afspraak', 'register', 'hallo',
                                  'studio', 'home', 'welcome', 'search', 'login', 'menu', 'blog', 'news',
-                                 'commission', 'payments', 'support', 'office', 'team', 'service']
+                                 'commission', 'payments', 'support', 'office', 'team', 'service',
+                                 'naam', 'name', 'voorbeeld', 'example', 'bij', 'de', 'het']
         # Also reject if name matches company name or is just the domain
         company_words = set(company_name.lower().split())
         name_words_set = set(full_name.lower().split())
@@ -2323,9 +2531,27 @@ async def _try_query(query: str, current_count: int) -> int:
         if not linkedin_url and not contact_email:
             return 0
 
-        # If we still have no email, generate a placeholder
+        # NEVER invent info@ placeholders — they bounce and poison the rate.
+        # Require a real email; LinkedIn-only leads stay out until email is found.
         if not contact_email:
-            contact_email = f"info@{domain}"
+            logger.info(f"[Lead Sourcing] No verified email for {full_name} ({domain}) — skipping")
+            return 0
+
+        # Shared quality gate: privacy@/info@/dpo@/free mail/page-title names/business TLD
+        if _is_garbage_company_name(company_name):
+            company_name = domain.split(".")[0].replace("-", " ").replace("_", " ").title() or domain
+        _ok, _qreason = _validate_lead_quality(
+            email=contact_email,
+            first_name=first_name or "",
+            last_name=last_name or "",
+            company_name=company_name or "",
+            domain=domain,
+            require_business_tld=True,
+            require_good_company=False,
+        )
+        if not _ok:
+            logger.info(f"[Lead Sourcing] Quality gate ({_qreason}): {contact_email} '{full_name}' ({domain}) — skipping")
+            return 0
 
         async with _DB_LOCK:
             conn3 = sqlite3.connect(DB_PATH, timeout=60.0)
@@ -2550,12 +2776,27 @@ async def auto_approve_loop():
                 await asyncio.sleep(30)
                 continue
 
-            # Find PENDING_APPROVAL leads with non-placeholder emails
+            # Don't burn attempts when watchdog is red (bounce/limits)
+            try:
+                from clawbuildr_watchdog import can_send as _wd_can_send
+                if not _wd_can_send():
+                    logger.warning("[Auto Approve] watchdog blocked — skipping cycle")
+                    await asyncio.sleep(60)
+                    continue
+            except Exception as _wd_err:
+                logger.error(f"[Auto Approve] watchdog unavailable (fail closed): {_wd_err}")
+                await asyncio.sleep(60)
+                continue
+
+            # Find PENDING_APPROVAL leads that already have a draft + real email
+            # Skip thin research (quality gate already checks, but dashboard path may bypass it)
             conn = sqlite3.connect(DB_PATH, timeout=10.0)
+            conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute("""
-                SELECT contact_id, email FROM contacts
+                SELECT contact_id, email, research_result FROM contacts
                 WHERE current_stage = 'PENDING_APPROVAL'
+                  AND outreach_draft IS NOT NULL AND outreach_draft != ''
                 ORDER BY created_at ASC
             """)
             rows = cur.fetchall()
@@ -2565,16 +2806,27 @@ async def auto_approve_loop():
                 await asyncio.sleep(30)
                 continue
 
-            # Skip obviously fake/placeholder emails
+            # Skip obviously fake/placeholder emails + thin research
+            try:
+                sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "clawbuildr"))
+                from clawbuildr_quality_gate import is_research_thin
+            except Exception:
+                def is_research_thin(_r):  # type: ignore
+                    return False
+
             placeholder_patterns = [
                 "@email.nl", "@example.com", "@test.com", "@domain.com",
                 "jouw@", "name@", "info@example", "contact@example", "test@"
             ]
             lead_id = None
-            for rid, remail in rows:
+            for row in rows:
+                rid, remail = row["contact_id"], row["email"]
                 email_lower = (remail or "").lower()
                 if any(p in email_lower for p in placeholder_patterns):
                     logger.warning(f"[Auto Approve] Skipping placeholder email for {rid}: {remail}")
+                    continue
+                if is_research_thin(row["research_result"]):
+                    logger.warning(f"[Auto Approve] Skipping thin research for {rid}")
                     continue
                 lead_id = rid
                 break
@@ -2773,27 +3025,205 @@ def _active_tenant_id() -> str:
     return _get_active_tenant().get("tenant_id", "default")
 
 
-def _is_onboarding_complete() -> bool:
+def _request_user(request: Optional[Request]) -> Optional[dict]:
+    """Session cookie -> users row (fresh role + tenant) or None when logged out."""
+    if request is None:
+        return None
+    token = request.cookies.get("clb_token")
+    if not token:
+        return None
+    try:
+        from clawbuildr_auth import decode_token
+        payload = decode_token(token)
+    except Exception:
+        return None
+    if not payload:
+        return None
+    uid = payload.get("user_id") or payload.get("sub")
+    if uid is None:
+        return None
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10.0)
+        try:
+            row = conn.execute(
+                "SELECT role, tenant_id FROM users WHERE user_id = ?", (uid,)
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    if not row:
+        return None
+    return {"user_id": uid, "role": (row[0] or "client"), "tenant_id": (row[1] or "")}
+
+
+def _request_tenant_id(request: Optional[Request]) -> str:
+    """Tenant for this request.
+
+    Logged-in non-admins always get their OWN tenant (structural isolation —
+    they can never see another tenant's inbox/leads, even when the global
+    active tenant has been switched by someone else). Admins and anonymous
+    callers keep the legacy active-tenant behaviour.
+    """
+    user = _request_user(request)
+    if not user or user["role"] == "admin":
+        return _active_tenant_id()
+    return user["tenant_id"] or _active_tenant_id()
+
+
+def _require_tenant_access(request: Request, tenant_id: str) -> None:
+    """401 when logged out; 403 when a non-admin targets a foreign tenant."""
+    user = _request_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not logged in")
+    if user["role"] == "admin":
+        return
+    if not user["tenant_id"] or user["tenant_id"] != tenant_id:
+        raise HTTPException(status_code=403, detail="Geen toegang tot deze tenant")
+
+
+def _require_login(request: Request) -> dict:
+    """401 when not logged in; returns the session user."""
+    user = _request_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not logged in")
+    return user
+
+
+def _require_account_access(request: Request, account_id: str) -> None:
+    """Login required; non-admins may only touch their OWN tenant's accounts."""
+    user = _require_login(request)
+    if user["role"] == "admin":
+        return
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    try:
+        row = conn.execute(
+            "SELECT tenant_id FROM email_accounts WHERE account_id = ?", (account_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if (row[0] or "") != (user["tenant_id"] or ""):
+        raise HTTPException(status_code=403, detail="Geen toegang tot dit e-mailaccount")
+
+
+def _require_variation_access(request: Request, variation_id: str) -> None:
+    """Login required; non-admins may only touch variations of their own accounts."""
+    user = _require_login(request)
+    if user["role"] == "admin":
+        return
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    try:
+        row = conn.execute(
+            """SELECT ea.tenant_id FROM email_variations ev
+               JOIN email_accounts ea ON ea.account_id = ev.account_id
+               WHERE ev.variation_id = ?""",
+            (variation_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Variation not found")
+    if (row[0] or "") != (user["tenant_id"] or ""):
+        raise HTTPException(status_code=403, detail="Geen toegang tot deze variatie")
+
+
+def _get_tenant_config(tenant_id: str) -> dict:
+    """Tenant config by id with JSON fields parsed; falls back to active tenant."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM tenant_config WHERE tenant_id = ?", (tenant_id,)
+        ).fetchone()
+        conn.close()
+        if row:
+            t = dict(row)
+            for field in ('icp_industries', 'icp_roles', 'search_queries', 'lead_sources', 'campaign_channels', 'icp_regions', 'pain_points'):
+                try:
+                    t[field] = json.loads(t.get(field) or '[]')
+                except Exception:
+                    t[field] = []
+            return t
+    except Exception as e:
+        logger.warning(f"[Tenant] Could not load tenant config '{tenant_id}': {e}")
+    return _get_active_tenant()
+
+
+def _is_onboarding_complete(request: Optional[Request] = None) -> bool:
     if is_onboarding_complete is None:
         return True
     try:
-        return is_onboarding_complete(_active_tenant_id())
+        return is_onboarding_complete(_request_tenant_id(request))
     except Exception as e:
         logger.warning(f"[Onboarding] status check failed: {e}")
         return True
 
 
-def _create_simple_campaign(name: str, activation_message: str, contact_ids: List[str]):
-    """Create a campaign and enroll contacts for the email pipeline."""
+def _default_simple_sequence_steps(activation_message: str, include_linkedin: bool = True) -> List[Dict[str, Any]]:
+    """Server-side default sequence for dashboard-created campaigns."""
+    first_msg = activation_message or (
+        "Hoi {{first_name}}, ik zag dat je bij {{company}} werkt. Interessant!"
+    )
+    first = {
+        "kind": "message",
+        "title": "E-mail message",
+        "delay_days": 0,
+        "delay_hours": 0,
+        "tone": "gentle",
+        "subject_prefix": "Re: ",
+        "message": first_msg,
+    }
+    if include_linkedin:
+        return [
+            first,
+            {"kind": "wait", "title": "Wacht 2 dagen", "delay_days": 2, "delay_hours": 0},
+            {"kind": "linkedin_connect", "title": "LinkedIn connectieverzoek", "delay_days": 0, "delay_hours": 0, "note": ""},
+            {"kind": "condition", "title": "If replied", "delay_days": 0, "delay_hours": 0, "condition": "email_replied"},
+            {"kind": "message", "title": "Follow-up 1", "delay_days": 3, "delay_hours": 0, "tone": "value_add", "subject_prefix": "Re: ", "message": "", "branch": "no"},
+            {"kind": "message", "title": "Breakup", "delay_days": 7, "delay_hours": 0, "tone": "breakup", "subject_prefix": "Re: ", "message": "", "branch": "no"},
+        ]
+    return [
+        first,
+        {"kind": "message", "title": "Follow-up 1", "delay_days": 3, "delay_hours": 0, "tone": "value_add", "subject_prefix": "Re: ", "message": ""},
+        {"kind": "message", "title": "Breakup", "delay_days": 7, "delay_hours": 0, "tone": "breakup", "subject_prefix": "Re: ", "message": ""},
+    ]
+
+
+def _create_simple_campaign(name: str, activation_message: str, contact_ids: List[str], sequence: Any = None, sequence_graph: Any = None, tenant_id: Optional[str] = None):
+    """Create a campaign, enroll contacts, and attach a sequence graph when none was pre-saved."""
     campaign_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
+    sequence_graph_id_out: Optional[str] = None
+    graph_error: Optional[str] = None
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     try:
+        # Ensure sequence_graph_json + tenant_id columns exist
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(campaigns)").fetchall()}
+        if "sequence_graph_json" not in cols:
+            conn.execute("ALTER TABLE campaigns ADD COLUMN sequence_graph_json TEXT")
+        if "tenant_id" not in cols:
+            conn.execute("ALTER TABLE campaigns ADD COLUMN tenant_id TEXT DEFAULT ''")
+        campaign_tenant = tenant_id or _active_tenant_id() or ""
+        graph_blob = None
+        if sequence_graph is not None:
+            graph_blob = sequence_graph if isinstance(sequence_graph, str) else json.dumps(sequence_graph)
+        elif sequence is not None and isinstance(sequence, dict) and sequence.get("nodes"):
+            graph_blob = json.dumps(sequence)
         conn.execute(
             """INSERT INTO campaigns
-               (campaign_id, name, manual_control, text_variants, ai_confidence_threshold, status, created_at, updated_at)
-               VALUES (?, ?, 0, 1, 80, 'active', ?, ?)""",
-            (campaign_id, name, now, now),
+               (campaign_id, name, manual_control, text_variants, ai_confidence_threshold, status, created_at, updated_at, sequence_json, sequence_graph_json, tenant_id)
+               VALUES (?, ?, 0, 1, 80, 'active', ?, ?, ?, ?, ?)""",
+            (
+                campaign_id,
+                name,
+                now,
+                now,
+                json.dumps(sequence) if (sequence is not None and not isinstance(sequence, str)) else (sequence if isinstance(sequence, str) else None),
+                graph_blob,
+                campaign_tenant,
+            ),
         )
         # Default flows (kept for compatibility with /campaigns page)
         flow_types = ['activation', 'more_info', 'not_interested', 'appointment', 'referral', 'contact_later', 'confirm']
@@ -2814,7 +3244,11 @@ def _create_simple_campaign(name: str, activation_message: str, contact_ids: Lis
 
         enrolled = 0
         for cid in contact_ids:
-            row = conn.execute("SELECT current_stage FROM contacts WHERE contact_id = ?", (cid,)).fetchone()
+            # Tenant filter: never enroll (or touch) another tenant's contact
+            row = conn.execute(
+                "SELECT current_stage FROM contacts WHERE contact_id = ? AND (IFNULL(tenant_id,'') = '' OR tenant_id = ?)",
+                (cid, campaign_tenant),
+            ).fetchone()
             if not row:
                 continue
             conn.execute(
@@ -2824,14 +3258,74 @@ def _create_simple_campaign(name: str, activation_message: str, contact_ids: Lis
                 (campaign_id, cid, now, now),
             )
             # Move early-stage leads into the outreach pipeline
-            if row["current_stage"] in ('INGESTED', 'RESEARCHED', 'DELIVERABILITY_VERIFIED', 'OPPORTUNITY_MAPPED', 'PRE_QUALIFIED'):
+            stage = row[0] if not isinstance(row, sqlite3.Row) else row["current_stage"]
+            if stage in ('INGESTED', 'RESEARCHED', 'DELIVERABILITY_VERIFIED', 'OPPORTUNITY_MAPPED', 'PRE_QUALIFIED'):
                 conn.execute(
                     "UPDATE contacts SET current_stage = 'ACTIVE_OUTREACH', updated_at = ? WHERE contact_id = ?",
                     (now, cid),
                 )
             enrolled += 1
+
+        # Commit campaign + leads first: graph save/enroll open separate SQLite
+        # connections and would hit SQLITE_BUSY against this open transaction.
         conn.commit()
-        return {"campaign_id": campaign_id, "enrolled": enrolled}
+
+        # Dashboard path: no pre-saved graph → build one so the loop can send.
+        # Onboarding passes sequence_graph already saved + enrolls outside this helper.
+        if sequence_graph is None:
+            try:
+                sys_path_cb = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "clawbuildr")
+                if sys_path_cb not in sys.path:
+                    sys.path.insert(0, sys_path_cb)
+                from clawbuildr_sequence_graph import (
+                    ensure_tables as _sg_ensure,
+                    save_graph as _sg_save,
+                    steps_to_graph as _sg_steps_to_graph,
+                    enroll_contact as _sg_enroll,
+                )
+                _sg_ensure()
+                tenant_id = campaign_tenant
+                _ch_row = conn.execute(
+                    "SELECT campaign_channels FROM tenant_config WHERE tenant_id = ?",
+                    (campaign_tenant,),
+                ).fetchone()
+                raw_channels = (_ch_row[0] if _ch_row else None) or ["email", "linkedin"]
+                if isinstance(raw_channels, str):
+                    try:
+                        raw_channels = json.loads(raw_channels)
+                    except Exception:
+                        raw_channels = ["email", "linkedin"]
+                include_li = "linkedin" in raw_channels
+                graph = _sg_steps_to_graph(_default_simple_sequence_steps(activation_message, include_linkedin=include_li))
+                sequence_graph_id_out = _sg_save(
+                    graph,
+                    tenant_id=tenant_id,
+                    campaign_id=campaign_id,
+                    name=name,
+                )
+                # Graph owns outreach → clear legacy linear follow-ups
+                conn.execute(
+                    "UPDATE tenant_config SET followup_custom_json = NULL WHERE tenant_id = ?",
+                    (tenant_id,),
+                )
+                # Commit before _sg_enroll (separate connection writes)
+                conn.commit()
+                for cid in contact_ids:
+                    _sg_enroll(str(cid), graph_id=sequence_graph_id_out, campaign_id=campaign_id, tenant_id=tenant_id)
+            except Exception as _sg_err:
+                logger.error(f"[SimpleCampaign] sequence graph attach failed: {_sg_err}")
+                sequence_graph_id_out = None
+                graph_error = str(_sg_err)
+            finally:
+                conn.commit()
+        else:
+            conn.commit()
+        result = {"campaign_id": campaign_id, "enrolled": enrolled}
+        if sequence_graph_id_out:
+            result["sequence_graph_id"] = sequence_graph_id_out
+        if graph_error:
+            result["graph_error"] = graph_error
+        return result
     finally:
         conn.close()
 
@@ -2839,18 +3333,22 @@ def _create_simple_campaign(name: str, activation_message: str, contact_ids: Lis
 # --- API ENDPOINTS ---
 
 @app.get("/api/leads")
-def get_leads():
+def get_leads(request: Request):
     """Fetches all leads in the system with their embedded agent results."""
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
     cursor.execute("""
-    SELECT c.*, co.name as company_name, co.domain as company_domain, co.industry as company_industry, co.estimated_size as company_size
+    SELECT c.*, co.name as company_name, co.domain as company_domain, co.industry as company_industry,
+           co.estimated_size as company_size, co.headquarters as company_headquarters,
+           co.hiring_count as company_hiring_count, co.founded as company_founded,
+           co.specialties as company_specialties
     FROM contacts c
     LEFT JOIN companies co ON c.company_id = co.company_id
+    WHERE (IFNULL(c.tenant_id,'') = '' OR c.tenant_id = ?)
     ORDER BY c.created_at DESC;
-    """)
+    """, (_request_tenant_id(request),))
     rows = cursor.fetchall()
     conn.close()
     
@@ -2970,7 +3468,17 @@ async def replay_lead(lead_id: str, background_tasks: BackgroundTasks):
 @app.post("/api/leads/{lead_id}/approve")
 async def approve_outreach(lead_id: str):
     """Approves outreach, sends email via SMTP primary, Gmail API fallback, and moves state to ACTIVE_OUTREACH."""
-    
+    # Same watchdog as pipeline/API — manual approve must not bypass bounce/limit gates
+    try:
+        from clawbuildr_watchdog import can_send as _wd_can_send
+        if not _wd_can_send():
+            raise HTTPException(status_code=429, detail="Send blocked by watchdog (daily/hourly limit or bounce rate)")
+    except HTTPException:
+        raise
+    except Exception as _wd_err:
+        logger.error(f"[Outreach Approval] watchdog check failed (fail closed): {_wd_err}")
+        raise HTTPException(status_code=429, detail="Send blocked: watchdog unavailable")
+
     # Phase 1: Read lead data (short DB hold)
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     cursor = conn.cursor()
@@ -3016,11 +3524,24 @@ async def approve_outreach(lead_id: str):
     # PRIMARY: SMTP app password (we know this works)
     try:
         logger.info(f"[Outreach Approval] Trying SMTP app-password to: {email}")
-        html_body = "<html><body><pre style='font-family:inherit;white-space:pre-wrap'>" + body_text.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;") + "</pre></html>"
+        html_body = "<html><body><pre style='font-family:inherit;white-space:pre-wrap'>" + body_text.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;") + "</pre></body></html>"
         html_body_tracked = _inject_tracking(email_id_pre, html_body)
-        smtp_res = await gmail_send(to=email, subject=subject, body=body_text, html_body=html_body_tracked)
+        approve_acc = _get_send_account(contact_id=lead_id)
+        smtp_res = await gmail_send(
+            to=email,
+            subject=subject,
+            body=body_text,
+            html_body=html_body_tracked,
+            from_addr=(approve_acc or {}).get("email_address"),
+            smtp_host=(approve_acc or {}).get("smtp_host"),
+            smtp_port=(approve_acc or {}).get("smtp_port"),
+            smtp_user=(approve_acc or {}).get("smtp_user"),
+            smtp_password=(approve_acc or {}).get("smtp_password"),
+        )
         if smtp_res.get("status") in ("sent", "SENT", "OK", "success"):
             sent_successfully = True
+            if approve_acc and approve_acc.get("account_id"):
+                _record_send(approve_acc["account_id"])
             message_id = smtp_res.get("message_id", f"smtp_{random.randint(100000, 999999)}")
             thread_id = f"thr_{random.randint(100000, 999999)}"
             logger.info(f"[Outreach Approval] SMTP send OK: {email}")
@@ -3113,6 +3634,251 @@ async def approve_outreach(lead_id: str):
     return {"status": "SUCCESS", "message_id": message_id}
 
 
+_KNOWN_STAGES = {
+    "INGESTED", "DISCOVERED", "ENRICHING", "VERIFYING", "READY", "CONTACTED",
+    "RESEARCHED", "DELIVERABILITY_VERIFIED", "OPPORTUNITY_MAPPED", "PRE_QUALIFIED",
+    "OUTREACH_DRAFTED", "PENDING_APPROVAL", "ACTIVE_OUTREACH", "EMAIL_SENT",
+    "REPLIED", "INTERESTED", "OBJECTION", "MEETING_BOOKED", "MEETING_SCHEDULED",
+    "CLOSED_WON", "CLOSED_LOST", "BOUNCED", "BLOCKED", "OPT_OUT", "NURTURE",
+}
+
+
+@app.patch("/api/leads/{lead_id}")
+async def update_lead_stage(lead_id: str, request: Request):
+    """Update a lead's pipeline stage (used by Kanban drag & drop)."""
+    body = await request.json()
+    stage = (body.get("current_stage") or "").strip()
+    if stage not in _KNOWN_STAGES:
+        raise HTTPException(status_code=400, detail=f"Unknown stage: {stage!r}")
+    now = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    cursor = conn.cursor()
+    cursor.execute("SELECT current_stage, first_name, last_name FROM contacts WHERE contact_id = ?", (lead_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Lead not found")
+    prev_stage = row[0]
+    if prev_stage == stage:
+        conn.close()
+        return {"status": "UNCHANGED", "current_stage": stage}
+    cursor.execute(
+        "UPDATE contacts SET current_stage = ?, updated_at = ? WHERE contact_id = ?",
+        (stage, now, lead_id),
+    )
+    cursor.execute(
+        "INSERT INTO activity_log (contact_id, actor, activity_type, description, created_at) VALUES (?, ?, ?, ?, ?)",
+        (lead_id, "Dashboard", "STAGE_CHANGE", f"Stage moved from {prev_stage} to {stage}", now),
+    )
+    conn.commit()
+    conn.close()
+    await sse_manager.broadcast("lead_refresh", {"contact_id": lead_id, "current_stage": stage})
+    return {"status": "UPDATED", "current_stage": stage, "previous_stage": prev_stage}
+
+
+@app.get("/api/leads/{lead_id}/timeline")
+def get_lead_timeline(lead_id: str, limit: int = 100):
+    """Merged chronological timeline for one lead (activity + emails + LinkedIn + sequence + meetings)."""
+    limit = max(1, min(int(limit), 500))
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    exists = conn.execute("SELECT 1 FROM contacts WHERE contact_id = ?", (lead_id,)).fetchone()
+    if not exists:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    events = []
+
+    for r in conn.execute(
+        """
+        SELECT id, activity_type, COALESCE(description, action_details, '') AS text,
+               actor, created_at
+        FROM activity_log WHERE contact_id = ?
+        """,
+        (lead_id,),
+    ).fetchall():
+        events.append({
+            "id": f"act_{r['id']}",
+            "kind": "activity",
+            "type": r["activity_type"] or "ACTIVITY",
+            "title": r["activity_type"] or "Activity",
+            "body": r["text"] or "",
+            "actor": r["actor"] or "",
+            "timestamp": r["created_at"],
+        })
+
+    for r in conn.execute(
+        """
+        SELECT email_id, subject, body, direction, status, created_at
+        FROM emails WHERE contact_id = ?
+        """,
+        (lead_id,),
+    ).fetchall():
+        body = (r["body"] or "").strip()
+        if len(body) > 400:
+            body = body[:400] + "…"
+        events.append({
+            "id": f"em_{r['email_id']}",
+            "kind": "email",
+            "type": (r["direction"] or "email").upper(),
+            "title": r["subject"] or "(no subject)",
+            "body": body,
+            "actor": r["direction"] or "",
+            "timestamp": r["created_at"],
+        })
+
+    for r in conn.execute(
+        """
+        SELECT id, note, outcome, timestamp FROM linkedin_outreach WHERE contact_id = ?
+        """,
+        (lead_id,),
+    ).fetchall():
+        events.append({
+            "id": f"li_{r['id']}",
+            "kind": "linkedin",
+            "type": "LINKEDIN",
+            "title": r["outcome"] or "LinkedIn outreach",
+            "body": r["note"] or "",
+            "actor": "linkedin",
+            "timestamp": r["timestamp"],
+        })
+
+    try:
+        for r in conn.execute(
+            """
+            SELECT id, node_type, outcome, detail, created_at
+            FROM sequence_events WHERE contact_id = ?
+            """,
+            (lead_id,),
+        ).fetchall():
+            events.append({
+                "id": f"se_{r['id']}",
+                "kind": "sequence",
+                "type": (r["node_type"] or "SEQUENCE").upper(),
+                "title": r["outcome"] or r["node_type"] or "Sequence event",
+                "body": r["detail"] or "",
+                "actor": "sequence",
+                "timestamp": r["created_at"],
+            })
+    except sqlite3.Error:
+        pass
+
+    try:
+        for r in conn.execute(
+            "SELECT meeting_id, summary, scheduled_time, status FROM meetings WHERE contact_id = ?",
+            (lead_id,),
+        ).fetchall():
+            events.append({
+                "id": f"mt_{r['meeting_id']}",
+                "kind": "meeting",
+                "type": "MEETING",
+                "title": r["summary"] or "Meeting",
+                "body": r["status"] or "",
+                "actor": "calendar",
+                "timestamp": r["scheduled_time"],
+            })
+    except sqlite3.Error:
+        pass
+
+    conn.close()
+    events = [e for e in events if e.get("timestamp")]
+    events.sort(key=lambda e: e["timestamp"] or "", reverse=True)
+    return {"contact_id": lead_id, "events": events[:limit]}
+
+
+@app.get("/api/leads/{lead_id}/notes")
+def get_lead_notes(lead_id: str, include_transcripts: int = 1):
+    """Notes plus optional conversation transcripts (emails + campaign messages)."""
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT id, contact_id, body, created_at FROM lead_notes WHERE contact_id = ? ORDER BY created_at DESC, id DESC",
+        (lead_id,),
+    ).fetchall()
+    notes = [dict(r) for r in rows]
+
+    transcripts = []
+    if include_transcripts:
+        try:
+            for r in conn.execute(
+                """
+                SELECT email_id, subject, body, direction, created_at
+                FROM emails WHERE contact_id = ?
+                ORDER BY created_at DESC, email_id DESC
+                """,
+                (lead_id,),
+            ).fetchall():
+                body = (r["body"] or "").strip()
+                if len(body) > 2000:
+                    body = body[:2000] + "…"
+                transcripts.append({
+                    "id": f"em_{r['email_id']}",
+                    "kind": "email",
+                    "direction": (r["direction"] or "").lower(),
+                    "title": r["subject"] or "(geen onderwerp)",
+                    "body": body,
+                    "created_at": r["created_at"],
+                })
+        except sqlite3.Error:
+            pass
+        try:
+            for r in conn.execute(
+                """
+                SELECT id, direction, message_text, step_number, created_at, sent_at
+                FROM campaign_messages WHERE lead_id = ?
+                ORDER BY COALESCE(created_at, sent_at) DESC, id DESC
+                """,
+                (lead_id,),
+            ).fetchall():
+                body = (r["message_text"] or "").strip()
+                if len(body) > 2000:
+                    body = body[:2000] + "…"
+                transcripts.append({
+                    "id": f"cm_{r['id']}",
+                    "kind": "campaign",
+                    "direction": (r["direction"] or "").lower(),
+                    "title": f"Campagne stap {r['step_number']}" if r["step_number"] else "Campagnebericht",
+                    "body": body,
+                    "created_at": r["created_at"] or r["sent_at"],
+                })
+        except sqlite3.Error:
+            pass
+
+    conn.close()
+    transcripts = [t for t in transcripts if t.get("created_at")]
+    transcripts.sort(key=lambda t: t["created_at"] or "", reverse=True)
+    return {"notes": notes, "transcripts": transcripts[:200]}
+
+
+@app.post("/api/leads/{lead_id}/notes")
+async def create_lead_note(lead_id: str, request: Request):
+    body = await request.json()
+    text = (body.get("body") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Note body is required")
+    if len(text) > 5000:
+        raise HTTPException(status_code=400, detail="Note is too long (max 5000 characters)")
+    now = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM contacts WHERE contact_id = ?", (lead_id,))
+    if not cursor.fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail="Lead not found")
+    cursor.execute(
+        "INSERT INTO lead_notes (contact_id, body, created_at) VALUES (?, ?, ?)",
+        (lead_id, text, now),
+    )
+    note_id = cursor.lastrowid
+    cursor.execute(
+        "INSERT INTO activity_log (contact_id, actor, activity_type, description, created_at) VALUES (?, ?, ?, ?, ?)",
+        (lead_id, "Dashboard", "NOTE_ADDED", text[:200], now),
+    )
+    conn.commit()
+    conn.close()
+    return {"id": note_id, "contact_id": lead_id, "body": text, "created_at": now}
+
+
 @app.put("/api/leads/{lead_id}/draft")
 async def update_draft(lead_id: str, request: Request):
     """Update the email draft for a lead (subject + body)."""
@@ -3148,7 +3914,7 @@ async def delete_lead(lead_id: str):
         conn.close()
         raise HTTPException(status_code=404, detail="Lead not found")
     company_id = row[0]
-    for tbl in ["emails", "meetings", "activity_log"]:
+    for tbl in ["emails", "meetings", "activity_log", "lead_notes"]:
         cursor.execute(f"DELETE FROM {tbl} WHERE contact_id = ?", (lead_id,))
     cursor.execute("DELETE FROM agent_actions WHERE prospect_id = ?", (lead_id,))
     cursor.execute("DELETE FROM contacts WHERE contact_id = ?", (lead_id,))
@@ -3393,7 +4159,19 @@ async def api_agent_zero_ingest(lead: AgentZeroLead, background_tasks: Backgroun
             if cursor.fetchone():
                 conn.close()
                 return {"status": "skipped", "message": "Contact already exists."}
-                
+
+            _ok, _qreason = _validate_lead_quality(
+                email=lead.email,
+                first_name=lead.first_name or "",
+                last_name=lead.last_name or "",
+                company_name=lead.company_name or "",
+                domain=lead.domain or "",
+                require_business_tld=True,
+            )
+            if not _ok:
+                conn.close()
+                return {"status": "rejected", "message": f"Quality gate: {_qreason}"}
+
             ct_id = f"prsp_{uuid.uuid4().hex[:8]}"
             cursor.execute("""INSERT INTO contacts (contact_id, company_id, first_name, last_name, email, role, linkedin_url, current_stage, lead_score, priority, created_at)
                               VALUES (?, ?, ?, ?, ?, ?, ?, 'INGESTED', 0, 'UNASSIGNED', ?)""",
@@ -3435,15 +4213,75 @@ def linkedin_history(limit: int = Query(100, ge=1, le=500)):
     return get_clawbuildr_linkedin_history(limit)
 
 @app.get("/api/linkedin/status")
-def linkedin_status():
-    """Check if LinkedIn session cookies exist."""
-    return linkedin_login_status()
+def linkedin_status(tenant_id: str = ""):
+    """Check if LinkedIn session cookies exist (optional ?tenant_id=)."""
+    return linkedin_login_status(tenant_id=tenant_id or None)
 
 @app.post("/api/linkedin/login")
 async def linkedin_login_endpoint(background_tasks: BackgroundTasks):
     """Opens a browser for manual LinkedIn login. Cookies are saved after login."""
     background_tasks.add_task(linkedin_login)
     return {"status": "started", "message": "Browser opening. Please log in to LinkedIn."}
+
+# --- Per-tenant QR login (colleague connects THEIR OWN LinkedIn) ---
+@app.post("/api/linkedin/tenant-login")
+async def linkedin_tenant_login(request: Request):
+    """Start the QR login flow for a tenant. Body: {"tenant_id": "..."}.
+    Requires login: non-admins can only start it for their OWN tenant."""
+    from linkedin_engine import linkedin_qr_start
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    tid = (body.get("tenant_id") or "").strip() or _request_tenant_id(request)
+    if not tid or tid == "clawbuildr":
+        return {"status": "error", "message": "tenant_id required (non-legacy tenant)"}
+    _require_tenant_access(request, tid)
+    return linkedin_qr_start(tid)
+
+@app.post("/api/linkedin/tenant-qr-stop")
+async def linkedin_tenant_qr_stop(request: Request):
+    """Cancel a running QR login flow. Body: {"tenant_id": "..."}."""
+    from linkedin_engine import linkedin_qr_stop
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    tid = (body.get("tenant_id") or "").strip() or _request_tenant_id(request)
+    if not tid:
+        return {"status": "error", "message": "tenant_id required"}
+    _require_tenant_access(request, tid)
+    return linkedin_qr_stop(tid)
+
+@app.get("/api/linkedin/tenant-qr")
+def linkedin_tenant_qr(request: Request, tenant_id: str = Query(None)):
+    """Return the current QR code PNG for a tenant's login flow."""
+    tenant_id = (tenant_id or "").strip() or _request_tenant_id(request)
+    _require_tenant_access(request, tenant_id)
+    from linkedin_engine import linkedin_qr_image_path
+    path = linkedin_qr_image_path(tenant_id)
+    if not path:
+        raise HTTPException(status_code=404, detail="No QR image yet")
+    import hashlib
+    with open(path, "rb") as f:
+        data = f.read()
+    etag = hashlib.md5(str(len(data)).encode() + data[:64]).hexdigest()
+    from fastapi.responses import Response as _Resp
+    return _Resp(
+        content=data,
+        media_type="image/png",
+        headers={"Cache-Control": "no-store, max-age=0", "ETag": etag},
+    )
+
+@app.get("/api/linkedin/tenant-status")
+def linkedin_tenant_status(request: Request, tenant_id: str = Query(None)):
+    """QR login status + session state for a tenant."""
+    tenant_id = (tenant_id or "").strip() or _request_tenant_id(request)
+    _require_tenant_access(request, tenant_id)
+    from linkedin_engine import linkedin_qr_status, linkedin_login_status
+    st = linkedin_qr_status(tenant_id)
+    session = linkedin_login_status(tenant_id)
+    return {**st, "logged_in": session.get("logged_in", False), "session_message": session.get("message", "")}
 
 @app.post("/api/linkedin/extract-cookies")
 def linkedin_extract():
@@ -3686,46 +4524,55 @@ def generate_founderflow_post_endpoint():
 # =========================================================================
 
 @app.get("/api/linkedin/safety-status")
-def safety_status_endpoint():
+def safety_status_endpoint(tenant_id: str = ""):
     """Get comprehensive safety status: warming, flags, daily counts."""
     from linkedin_engine import get_safety_status
-    return get_safety_status()
+    return get_safety_status(tenant_id=tenant_id or None)
 
 @app.post("/api/linkedin/manual-resume")
-def manual_resume_endpoint():
+def manual_resume_endpoint(tenant_id: str = ""):
     """Resume account after 7-day cooldown. Re-warms at 10% capacity."""
     from linkedin_engine import _manual_resume, _check_cooldown_elapsed, _is_flagged
-    flagged, reason = _is_flagged()
+    tid = tenant_id or None
+    flagged, reason = _is_flagged(tenant_id=tid)
     if not flagged:
         return {"success": False, "error": "Account is not flagged"}
-    if not _check_cooldown_elapsed():
+    if not _check_cooldown_elapsed(tenant_id=tid):
         return {"success": False, "error": "7-day cooldown has not elapsed yet"}
-    result = _manual_resume()
+    result = _manual_resume(tenant_id=tid)
     if result:
         return {"success": True, "message": "Account resumed. Re-warming at 10% capacity."}
     return {"success": False, "error": "Failed to resume account"}
 
 @app.post("/api/linkedin/set-warming-start")
-def set_warming_start_endpoint():
+async def set_warming_start_endpoint(request: Request):
     """Set the account creation date for warming calculation."""
     from linkedin_engine import _get_clawbuildr_db
-    import json as _json
     try:
-        body = _json.loads(b"" if not request.body else request.body)
+        body = await request.json()
     except Exception:
         body = {}
     created_at = body.get("account_created_at")
     if not created_at:
         from datetime import datetime as _dt
         created_at = _dt.now().isoformat()
+    tid = (body.get("tenant_id") or "").strip()
     db = _get_clawbuildr_db()
-    db.execute("""
-        INSERT INTO warming_state (id, account_created_at) VALUES (1, ?)
-        ON CONFLICT(id) DO UPDATE SET account_created_at = ?
-    """, (created_at, created_at))
-    db.commit()
-    db.close()
-    return {"success": True, "account_created_at": created_at}
+    try:
+        if not tid or tid == "clawbuildr":
+            db.execute("""
+                INSERT INTO warming_state (id, account_created_at) VALUES (1, ?)
+                ON CONFLICT(id) DO UPDATE SET account_created_at = ?
+            """, (created_at, created_at))
+        else:
+            db.execute("""
+                INSERT INTO warming_state_tenant (tenant_id, account_created_at) VALUES (?, ?)
+                ON CONFLICT(tenant_id) DO UPDATE SET account_created_at = ?
+            """, (tid, created_at, created_at))
+        db.commit()
+    finally:
+        db.close()
+    return {"success": True, "account_created_at": created_at, "tenant_id": tid}
 
 
 @app.get("/api/linkedin/ai-usage")
@@ -3754,12 +4601,11 @@ def ai_usage_endpoint():
 
 
 @app.post("/api/linkedin/scrape-engagement")
-def scrape_engagement_endpoint():
+async def scrape_engagement_endpoint(request: Request):
     """Scrape engagement (likes/comments) from a LinkedIn post."""
     from linkedin_engine import scrape_post_engagement
     try:
-        import json as _json
-        body = _json.loads(b"" if not request.body else request.body)
+        body = await request.json()
     except Exception:
         body = {}
     post_url = body.get("post_url", "")
@@ -3769,10 +4615,9 @@ def scrape_engagement_endpoint():
     return scrape_post_engagement(post_url, max_engagers)
 
 @app.get("/api/linkedin/warm-leads")
-def warm_leads_endpoint():
+def warm_leads_endpoint(limit: int = Query(50, ge=1, le=500)):
     """Get warm leads scraped from post engagement."""
     from linkedin_engine import get_warm_leads
-    limit = request.args.get("limit", 50, type=int)
     return get_warm_leads(limit)
 
 @app.get("/api/linkedin/funnel-stats")
@@ -4030,17 +4875,29 @@ def tracking_summary():
 # =========================================================================
 
 @app.get("/api/config/tenants")
-def get_all_tenants():
-    """Returns all tenant profiles."""
+def get_all_tenants(request: Request):
+    """Tenant profiles for the switcher. Non-admins only ever see their own tenant."""
+    user = _request_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="Not logged in")
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
     conn.row_factory = sqlite3.Row
-    rows = conn.execute("SELECT * FROM tenant_config ORDER BY display_name").fetchall()
+    if user["role"] == "admin":
+        rows = conn.execute("SELECT * FROM tenant_config ORDER BY display_name").fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM tenant_config WHERE tenant_id = ? ORDER BY display_name",
+            (user["tenant_id"],),
+        ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 @app.get("/api/config/tenant")
-def get_active_tenant_api():
-    """Returns the currently active tenant config."""
+def get_active_tenant_api(request: Request):
+    """Returns the caller's tenant config (own tenant for clients, active for admin/anon)."""
+    user = _request_user(request)
+    if user and user["role"] != "admin" and user["tenant_id"]:
+        return _get_tenant_config(user["tenant_id"])
     return _get_active_tenant()
 
 @app.put("/api/config/tenant")
@@ -4050,6 +4907,7 @@ async def save_tenant_config(request: Request):
     tenant_id = body.get("tenant_id")
     if not tenant_id:
         raise HTTPException(status_code=400, detail="tenant_id required")
+    _require_tenant_access(request, tenant_id)
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
     try:
         conn.execute("""
@@ -4057,8 +4915,9 @@ async def save_tenant_config(request: Request):
                 (tenant_id, display_name, sending_email, sending_domain, calendar_link,
                  signature_block, value_doctrine, brand_voice, icp_industries,
                  icp_roles, icp_company_size, search_queries, active,
-                 lead_sources, campaign_channels, sequence_template, icp_regions, pain_points)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+                 lead_sources, campaign_channels, sequence_template, icp_regions, pain_points,
+                 send_days, send_hour_from, send_hour_to)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(tenant_id) DO UPDATE SET
                 display_name   = excluded.display_name,
                 sending_email  = excluded.sending_email,
@@ -4076,7 +4935,10 @@ async def save_tenant_config(request: Request):
                 campaign_channels = excluded.campaign_channels,
                 sequence_template = excluded.sequence_template,
                 icp_regions    = excluded.icp_regions,
-                pain_points    = excluded.pain_points
+                pain_points    = excluded.pain_points,
+                send_days      = excluded.send_days,
+                send_hour_from = excluded.send_hour_from,
+                send_hour_to   = excluded.send_hour_to
         """, (
             tenant_id,
             body.get("display_name", ""),
@@ -4094,7 +4956,10 @@ async def save_tenant_config(request: Request):
             json.dumps(body.get("campaign_channels", ["email", "linkedin"])),
             body.get("sequence_template", "gentle"),
             json.dumps(body.get("icp_regions", ["nl"])),
-            json.dumps(body.get("pain_points", []))
+            json.dumps(body.get("pain_points", [])),
+            json.dumps(body.get("send_days", ["mon", "tue", "wed", "thu", "fri"])),
+            int(body.get("send_hour_from", 9)),
+            int(body.get("send_hour_to", 17)),
         ))
         # Deactivate all other tenants
         conn.execute("UPDATE tenant_config SET active = 0 WHERE tenant_id != ?", (tenant_id,))
@@ -4105,8 +4970,9 @@ async def save_tenant_config(request: Request):
     return {"status": "saved", "tenant_id": tenant_id}
 
 @app.post("/api/config/tenant/switch/{tenant_id}")
-async def switch_tenant(tenant_id: str):
-    """Switches the active tenant."""
+async def switch_tenant(request: Request, tenant_id: str):
+    """Switches the active tenant. Admins: any tenant. Clients: own tenant only."""
+    _require_tenant_access(request, tenant_id)
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
     row = conn.execute("SELECT tenant_id FROM tenant_config WHERE tenant_id = ?", (tenant_id,)).fetchone()
     if not row:
@@ -4121,19 +4987,27 @@ async def switch_tenant(tenant_id: str):
 
 
 @app.post("/api/config/tenant/{tenant_id}/connect-gmail")
-def connect_gmail_tenant(tenant_id: str, background_tasks: BackgroundTasks):
+def connect_gmail_tenant(request: Request, tenant_id: str, background_tasks: BackgroundTasks):
     """Triggers the Google OAuth flow on the local machine for this tenant."""
+    _require_tenant_access(request, tenant_id)
+    creds_path = os.path.join(DATA_DIR, "client_secret.json")
+    if not os.path.exists(creds_path):
+        return {
+            "status": "error",
+            "message": "Google OAuth niet geconfigureerd: client_secret.json ontbreekt. "
+                       "Gebruik het app-wachtwoord of voeg client_secret.json toe.",
+        }
+
     def _run_oauth():
         try:
             from clawbuildr_gmail import ClawBuildrGmailConnector
-            creds_path = os.path.join(DATA_DIR, "client_secret.json")
             # Multi-tenant token path
             token_path = os.path.join(DATA_DIR, f"token_gmail_{tenant_id}.json")
-            
+
             # Delete old token if exists to force re-auth
             if os.path.exists(token_path):
                 os.remove(token_path)
-                
+
             connector = ClawBuildrGmailConnector(credentials_path=creds_path, token_path=token_path)
             success = connector.authenticate(run_local_server=True)
             if success:
@@ -4142,7 +5016,7 @@ def connect_gmail_tenant(tenant_id: str, background_tasks: BackgroundTasks):
                 logger.error(f"[Gmail] Failed to connect Gmail for tenant {tenant_id}")
         except Exception as e:
             logger.error(f"[Gmail] Error during OAuth: {e}")
-            
+
     background_tasks.add_task(_run_oauth)
     return {"status": "started", "message": "Check your browser to complete Google Authentication"}
 
@@ -4153,11 +5027,14 @@ def connect_gmail_tenant(tenant_id: str, background_tasks: BackgroundTasks):
 import uuid as _campaign_uuid
 
 @app.get("/api/campaigns")
-def list_campaigns():
+def list_campaigns(request: Request):
     """List all campaigns with stats."""
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
-    rows = conn.execute("SELECT * FROM campaigns ORDER BY created_at DESC").fetchall()
+    rows = conn.execute(
+        "SELECT * FROM campaigns WHERE (IFNULL(tenant_id,'') = '' OR tenant_id = ?) ORDER BY created_at DESC",
+        (_request_tenant_id(request),),
+    ).fetchall()
     result = []
     for r in rows:
         c = dict(r)
@@ -4251,21 +5128,91 @@ def get_campaign(campaign_id: str):
 
 @app.put("/api/campaigns/{campaign_id}")
 def update_campaign(campaign_id: str, data: dict):
-    """Update campaign settings."""
+    """Update campaign settings. Pausing also pauses enrollments and deactivates the graph."""
+    ALLOWED_STATUS = {"active", "paused", "draft", "completed", "archived"}
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    if not conn.execute("SELECT 1 FROM campaigns WHERE campaign_id = ?", (campaign_id,)).fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail="Campaign not found")
     now = datetime.now(timezone.utc).isoformat()
     fields = []
     values = []
     for key in ["name", "manual_control", "text_variants", "ai_confidence_threshold", "status", "account_id"]:
-        if key in data:
-            fields.append(f"{key} = ?")
-            values.append(data[key])
+        if key not in data:
+            continue
+        val = data[key]
+        if key == "status":
+            val = str(val or "").lower()
+            if val not in ALLOWED_STATUS:
+                conn.close()
+                raise HTTPException(status_code=400, detail=f"status must be one of {sorted(ALLOWED_STATUS)}")
+        fields.append(f"{key} = ?")
+        values.append(val)
     if fields:
         fields.append("updated_at = ?")
         values.append(now)
         values.append(campaign_id)
         conn.execute(f"UPDATE campaigns SET {', '.join(fields)} WHERE campaign_id = ?", values)
         conn.commit()
+    # Keep graph enrollments + graph active flag in sync with campaign status
+    if "status" in data:
+        status = str(data.get("status") or "").lower()
+        try:
+            if status == "paused":
+                conn.execute(
+                    """UPDATE sequence_enrollments
+                       SET status = 'PAUSED', pause_reason = 'campaign_paused'
+                       WHERE status = 'ACTIVE'
+                         AND (
+                           campaign_id = ?
+                           OR graph_id IN (SELECT graph_id FROM sequence_graphs WHERE campaign_id = ?)
+                         )""",
+                    (campaign_id, campaign_id),
+                )
+                # Deactivate graph so enroll_eligible_leads cannot add new ACTIVE leads
+                conn.execute(
+                    "UPDATE sequence_graphs SET active = 0 WHERE campaign_id = ?",
+                    (campaign_id,),
+                )
+            elif status == "active":
+                import random as _rnd
+                rows = conn.execute(
+                    """SELECT id, next_action_at FROM sequence_enrollments
+                       WHERE status = 'PAUSED' AND pause_reason = 'campaign_paused'
+                         AND (
+                           campaign_id = ?
+                           OR graph_id IN (SELECT graph_id FROM sequence_graphs WHERE campaign_id = ?)
+                         )""",
+                    (campaign_id, campaign_id),
+                ).fetchall()
+                now_dt = datetime.now(timezone.utc)
+                for r in rows:
+                    nxt = r[1]
+                    try:
+                        overdue = (not nxt) or nxt <= now_dt.isoformat()
+                    except Exception:
+                        overdue = True
+                    if overdue:
+                        nxt = (now_dt + timedelta(seconds=_rnd.randint(60, 3600))).isoformat()
+                    conn.execute(
+                        "UPDATE sequence_enrollments SET status='ACTIVE', pause_reason=NULL, next_action_at=? WHERE id=?",
+                        (nxt, r[0]),
+                    )
+                # Only reactivate a graph if we actually resumed enrollments for it
+                # (avoids re-activating a graph that save_graph replaced while paused).
+                if rows:
+                    conn.execute(
+                        """UPDATE sequence_graphs SET active = 1
+                           WHERE campaign_id = ?
+                             AND graph_id IN (
+                               SELECT DISTINCT graph_id FROM sequence_enrollments
+                               WHERE status = 'ACTIVE'
+                             )""",
+                        (campaign_id,),
+                    )
+            conn.commit()
+        except Exception as _pz_err:
+            logger.warning(f"[Campaign] enrollment sync failed: {_pz_err}")
     conn.close()
     return {"status": "updated"}
 
@@ -4275,6 +5222,27 @@ def delete_campaign(campaign_id: str):
     """Delete campaign and all related data."""
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     cursor = conn.cursor()
+    # Stop graph enrollments first so deleted campaigns cannot keep sending.
+    # Fail closed: if stop fails, abort delete (do not orphan an active graph).
+    try:
+        cursor.execute(
+            """UPDATE sequence_enrollments
+               SET status = 'STOPPED', pause_reason = 'campaign_deleted'
+               WHERE status IN ('ACTIVE', 'PAUSED')
+                 AND (
+                   campaign_id = ?
+                   OR graph_id IN (SELECT graph_id FROM sequence_graphs WHERE campaign_id = ?)
+                 )""",
+            (campaign_id, campaign_id),
+        )
+        cursor.execute(
+            "UPDATE sequence_graphs SET active = 0 WHERE campaign_id = ?",
+            (campaign_id,),
+        )
+    except Exception as _stop_err:
+        conn.close()
+        logger.error(f"[Campaign] could not stop sequence before delete: {_stop_err}")
+        raise HTTPException(status_code=500, detail="Could not stop sequence before delete — campaign not removed")
     # Delete in order
     cursor.execute("DELETE FROM campaign_messages WHERE campaign_id = ?", (campaign_id,))
     cursor.execute("DELETE FROM campaign_message_queue WHERE campaign_id = ?", (campaign_id,))
@@ -4667,54 +5635,85 @@ async def deep_research_lead(lead_id: str):
 # ===========================================================
 
 @app.get("/api/email-accounts")
-def list_email_accounts():
-    """List all email accounts."""
+def list_email_accounts(request: Request):
+    """List email accounts. Login required. Admin: all. Others: own tenant + legacy shared rows."""
+    _require_login(request)
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT account_id, display_name, email_address, provider, is_active, is_default, daily_send_limit, sends_today, last_send_at, warmup_days, signature, reply_to, created_at FROM email_accounts ORDER BY is_default DESC, created_at DESC"
-    ).fetchall()
+    user = _request_user(request)
+    if user and user["role"] == "admin":
+        rows = conn.execute(
+            "SELECT account_id, display_name, email_address, provider, is_active, is_default, daily_send_limit, sends_today, last_send_at, warmup_days, signature, reply_to, created_at FROM email_accounts ORDER BY is_default DESC, created_at DESC"
+        ).fetchall()
+    else:
+        tid = _request_tenant_id(request)
+        rows = conn.execute(
+            """SELECT account_id, display_name, email_address, provider, is_active, is_default,
+                      daily_send_limit, sends_today, last_send_at, warmup_days, signature, reply_to, created_at
+               FROM email_accounts
+               WHERE IFNULL(tenant_id, '') = ? OR IFNULL(tenant_id, '') = ''
+               ORDER BY is_default DESC, created_at DESC""",
+            (tid,),
+        ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
 @app.post("/api/email-accounts")
-def create_email_account(data: dict):
-    """Create a new email account."""
+def create_email_account(request: Request, data: dict):
+    """Create a new email account for the caller's tenant (admin: body tenant allowed)."""
+    user = _require_login(request)
     import uuid as _uuid
     now = datetime.now(timezone.utc).isoformat()
     account_id = str(_uuid.uuid4())
-    
+
+    tenant_id = _request_tenant_id(request)
+    body_tenant = (data.get("tenant_id") or "").strip()
+    if body_tenant:
+        _require_tenant_access(request, body_tenant)
+        tenant_id = body_tenant
+
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
-    
-    # If this is the first account or marked default, unset other defaults
-    if data.get("is_default", 0):
-        conn.execute("UPDATE email_accounts SET is_default = 0")
-    
-    conn.execute(
-        """INSERT INTO email_accounts 
-           (account_id, display_name, email_address, provider, smtp_host, smtp_port, smtp_user, smtp_password, 
-            is_active, is_default, daily_send_limit, signature, reply_to, created_at, updated_at) 
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (account_id, data["display_name"], data["email_address"], data.get("provider", "gmail"),
-         data.get("smtp_host", "smtp.gmail.com"), data.get("smtp_port", 587),
-         data.get("smtp_user", data["email_address"]), data.get("smtp_password", ""),
-         data.get("is_active", 1), data.get("is_default", 0), data.get("daily_send_limit", 50),
-         data.get("signature", ""), data.get("reply_to", ""), now, now)
-    )
-    conn.commit()
-    conn.close()
+    conn.row_factory = sqlite3.Row
+    try:
+        # If this is the first account or marked default, unset other defaults (same tenant)
+        if data.get("is_default", 0):
+            conn.execute(
+                "UPDATE email_accounts SET is_default = 0 WHERE tenant_id = ? OR tenant_id IS NULL OR tenant_id = ''",
+                (tenant_id,),
+            )
+
+        conn.execute(
+            """INSERT INTO email_accounts 
+               (account_id, display_name, email_address, provider, smtp_host, smtp_port, smtp_user, smtp_password, 
+                is_active, is_default, daily_send_limit, signature, reply_to, tenant_id, created_at, updated_at) 
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (account_id, data["display_name"], data["email_address"], data.get("provider", "gmail"),
+             data.get("smtp_host", "smtp.gmail.com"), data.get("smtp_port", 587),
+             data.get("smtp_user", data["email_address"]), data.get("smtp_password", ""),
+             data.get("is_active", 1), data.get("is_default", 0), data.get("daily_send_limit", 50),
+             data.get("signature", ""), data.get("reply_to", ""), tenant_id, now, now)
+        )
+        conn.commit()
+    finally:
+        conn.close()
     return {"account_id": account_id, "status": "created"}
 
 
 @app.put("/api/email-accounts/{account_id}")
-def update_email_account(account_id: str, data: dict):
-    """Update an email account."""
+def update_email_account(request: Request, account_id: str, data: dict):
+    """Update an email account (own tenant only, admin exempt)."""
+    _require_account_access(request, account_id)
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     
-    # If setting as default, unset others
+    # If setting as default, unset other defaults in the same tenant
     if data.get("is_default"):
-        conn.execute("UPDATE email_accounts SET is_default = 0")
+        conn.execute(
+            """UPDATE email_accounts SET is_default = 0
+               WHERE tenant_id = (SELECT tenant_id FROM email_accounts WHERE account_id = ?)
+                  OR tenant_id IS NULL OR tenant_id = ''""",
+            (account_id,),
+        )
     
     allowed_fields = ["display_name", "email_address", "provider", "smtp_host", "smtp_port", 
                       "smtp_user", "smtp_password", "is_active", "is_default", "daily_send_limit", 
@@ -4738,8 +5737,9 @@ def update_email_account(account_id: str, data: dict):
 
 
 @app.delete("/api/email-accounts/{account_id}")
-def delete_email_account(account_id: str):
-    """Delete an email account."""
+def delete_email_account(request: Request, account_id: str):
+    """Delete an email account (own tenant only, admin exempt)."""
+    _require_account_access(request, account_id)
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.execute("DELETE FROM email_accounts WHERE account_id = ?", (account_id,))
     conn.execute("DELETE FROM email_variations WHERE account_id = ?", (account_id,))
@@ -4749,8 +5749,9 @@ def delete_email_account(account_id: str):
 
 
 @app.post("/api/email-accounts/{account_id}/reset-daily")
-def reset_daily_sends(account_id: str):
-    """Reset daily send count for an account."""
+def reset_daily_sends(request: Request, account_id: str):
+    """Reset daily send count for an account (own tenant only, admin exempt)."""
+    _require_account_access(request, account_id)
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.execute("UPDATE email_accounts SET sends_today = 0 WHERE account_id = ?", (account_id,))
     conn.commit()
@@ -4759,8 +5760,9 @@ def reset_daily_sends(account_id: str):
 
 
 @app.get("/api/email-accounts/{account_id}/variations")
-def list_email_variations(account_id: str, campaign_id: str = None):
-    """List email variations for an account."""
+def list_email_variations(request: Request, account_id: str, campaign_id: str = None):
+    """List email variations for an account (own tenant only, admin exempt)."""
+    _require_account_access(request, account_id)
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     if campaign_id:
@@ -4778,8 +5780,9 @@ def list_email_variations(account_id: str, campaign_id: str = None):
 
 
 @app.post("/api/email-accounts/{account_id}/variations")
-def create_email_variation(account_id: str, data: dict):
-    """Create an email variation for an account."""
+def create_email_variation(request: Request, account_id: str, data: dict):
+    """Create an email variation for an account (own tenant only, admin exempt)."""
+    _require_account_access(request, account_id)
     import uuid as _uuid
     now = datetime.now(timezone.utc).isoformat()
     variation_id = str(_uuid.uuid4())
@@ -4799,8 +5802,9 @@ def create_email_variation(account_id: str, data: dict):
 
 
 @app.put("/api/email-variations/{variation_id}")
-def update_email_variation(variation_id: str, data: dict):
-    """Update an email variation."""
+def update_email_variation(request: Request, variation_id: str, data: dict):
+    """Update an email variation (own tenant only, admin exempt)."""
+    _require_variation_access(request, variation_id)
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     allowed_fields = ["subject", "body", "tone", "language", "is_active", "flow_type", "step_number"]
     updates = []
@@ -4822,8 +5826,9 @@ def update_email_variation(variation_id: str, data: dict):
 
 
 @app.delete("/api/email-variations/{variation_id}")
-def delete_email_variation(variation_id: str):
-    """Delete an email variation."""
+def delete_email_variation(request: Request, variation_id: str):
+    """Delete an email variation (own tenant only, admin exempt)."""
+    _require_variation_access(request, variation_id)
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.execute("DELETE FROM email_variations WHERE variation_id = ?", (variation_id,))
     conn.commit()
@@ -5147,51 +6152,79 @@ async def engagement_scoring_loop():
 
 def _get_send_account(contact_id: str = None, campaign_id: str = None) -> dict:
     """Select the best email account to send from.
-    
+
     Logic:
-    1. If campaign has a linked account, use that
-    2. Otherwise, round-robin among active accounts under their daily limit
+    1. Resolve campaign from contact when only contact_id is given
+    2. If campaign has a linked account, use that (under daily limit)
+    3. Otherwise, round-robin among active accounts under their daily limit
     """
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
-    
-    # Check if campaign has a specific account linked
-    if campaign_id:
-        row = conn.execute(
-            "SELECT account_id FROM campaigns WHERE campaign_id = ?", (campaign_id,)
-        ).fetchone()
-        if row and row["account_id"]:
-            account = conn.execute(
-                "SELECT * FROM email_accounts WHERE account_id = ? AND is_active = 1",
-                (row["account_id"],)
+    try:
+        if not campaign_id and contact_id:
+            crow = conn.execute(
+                """SELECT cl.campaign_id FROM campaign_leads cl
+                   JOIN campaigns c ON c.campaign_id = cl.campaign_id
+                   WHERE cl.contact_id = ? AND c.status = 'active'
+                   ORDER BY cl.updated_at DESC LIMIT 1""",
+                (contact_id,),
             ).fetchone()
-            if account:
-                conn.close()
-                return dict(account)
-    
-    # Round-robin: pick account with most remaining sends
-    accounts = conn.execute(
-        """SELECT * FROM email_accounts WHERE is_active = 1 
-           AND sends_today < daily_send_limit 
-           ORDER BY sends_today ASC, is_default DESC"""
-    ).fetchall()
-    conn.close()
-    
-    if accounts:
-        return dict(accounts[0])
-    return None
+            if crow and crow["campaign_id"]:
+                campaign_id = crow["campaign_id"]
+
+        if campaign_id:
+            row = conn.execute(
+                "SELECT account_id FROM campaigns WHERE campaign_id = ?", (campaign_id,)
+            ).fetchone()
+            if row and row["account_id"]:
+                account = conn.execute(
+                    "SELECT * FROM email_accounts WHERE account_id = ? AND is_active = 1",
+                    (row["account_id"],),
+                ).fetchone()
+                if account:
+                    acc = dict(account)
+                    limit = acc.get("daily_send_limit")
+                    if limit is None or int(acc.get("sends_today") or 0) < int(limit):
+                        return acc
+
+        tenant_sql = ""
+        tenant_params: tuple = ()
+        try:
+            trow = conn.execute("SELECT tenant_id FROM tenant_config WHERE active = 1 LIMIT 1").fetchone()
+            if trow and trow["tenant_id"]:
+                tenant_sql = " AND (tenant_id = ? OR tenant_id IS NULL OR tenant_id = '')"
+                tenant_params = (trow["tenant_id"],)
+        except Exception:
+            pass
+
+        accounts = conn.execute(
+            """SELECT * FROM email_accounts WHERE is_active = 1
+               AND (daily_send_limit IS NULL OR sends_today < daily_send_limit)
+               """ + tenant_sql + """
+               ORDER BY sends_today ASC, is_default DESC""",
+            tenant_params,
+        ).fetchall()
+        if accounts:
+            return dict(accounts[0])
+        return None
+    finally:
+        conn.close()
 
 
 def _record_send(account_id: str):
     """Increment send count for an account."""
+    if not account_id:
+        return
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
-    now = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        "UPDATE email_accounts SET sends_today = sends_today + 1, last_send_at = ? WHERE account_id = ?",
-        (now, account_id)
-    )
-    conn.commit()
-    conn.close()
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE email_accounts SET sends_today = sends_today + 1, last_send_at = ? WHERE account_id = ?",
+            (now, account_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ===========================================================
@@ -5199,7 +6232,7 @@ def _record_send(account_id: str):
 # ===========================================================
 
 @app.get("/api/inbox")
-def get_global_inbox(intent: str = None, campaign_id: str = None, status: str = None, limit: int = 50):
+def get_global_inbox(request: Request, intent: str = None, campaign_id: str = None, status: str = None, limit: int = 50):
     """Global inbox: all replies and conversations across all campaigns.
     
     Filters:
@@ -5233,12 +6266,13 @@ def get_global_inbox(intent: str = None, campaign_id: str = None, status: str = 
         LEFT JOIN companies comp ON c.company_id = comp.company_id
         LEFT JOIN campaign_conversations cm ON c.contact_id = cm.lead_id
         LEFT JOIN campaigns camp ON cm.campaign_id = camp.campaign_id
-        WHERE c.current_stage IN ('REPLIED', 'MEETING_BOOKED', 'INTERESTED', 'OBJECTION')
+        WHERE (c.current_stage IN ('REPLIED', 'MEETING_BOOKED', 'INTERESTED', 'OBJECTION')
         OR cm.last_sender = 'them'
         OR cm.last_message_text IS NOT NULL
-        OR c.current_stage IN ('EMAIL_SENT', 'MEETING_BOOKED')
+        OR c.current_stage IN ('EMAIL_SENT', 'MEETING_BOOKED'))
+        AND (IFNULL(c.tenant_id,'') = '' OR c.tenant_id = ?)
     """
-    params = []
+    params = [_request_tenant_id(request)]
     
     if campaign_id:
         query += " AND cm.campaign_id = ?"
@@ -5290,11 +6324,21 @@ def get_global_inbox(intent: str = None, campaign_id: str = None, status: str = 
 
 
 @app.get("/api/inbox/{contact_id}/messages")
-def get_conversation_messages(contact_id: str):
+def get_conversation_messages(request: Request, contact_id: str):
     """Get all messages for a specific contact (email + LinkedIn)."""
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
-    
+
+    # Tenant guard: never expose another tenant's conversation
+    _crow = conn.execute(
+        "SELECT tenant_id FROM contacts WHERE CAST(contact_id AS TEXT) = ?", (str(contact_id),)
+    ).fetchone()
+    if _crow is not None:
+        _ct = _crow["tenant_id"] or ""
+        if _ct and _ct != _request_tenant_id(request):
+            conn.close()
+            raise HTTPException(status_code=404, detail="Contact niet gevonden")
+
     messages = []
     
     # Get email messages
@@ -5362,7 +6406,7 @@ def get_conversation_messages(contact_id: str):
 
 
 @app.post("/api/inbox/{contact_id}/reply")
-def send_reply_to_contact(contact_id: str, data: dict):
+def send_reply_to_contact(request: Request, contact_id: str, data: dict):
     """Send a reply to a contact via their preferred channel."""
     message_text = data.get("message_text", "")
     channel = data.get("channel", "email")
@@ -5373,6 +6417,16 @@ def send_reply_to_contact(contact_id: str, data: dict):
         return {"error": "message_text required"}
     
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    # Tenant guard: never reply from/into another tenant's conversation
+    conn.row_factory = sqlite3.Row
+    _crow = conn.execute(
+        "SELECT tenant_id FROM contacts WHERE CAST(contact_id AS TEXT) = ?", (str(contact_id),)
+    ).fetchone()
+    if _crow is not None:
+        _ct = _crow["tenant_id"] or ""
+        if _ct and _ct != _request_tenant_id(request):
+            conn.close()
+            raise HTTPException(status_code=404, detail="Contact niet gevonden")
     conn.row_factory = sqlite3.Row
     
     # Get contact info
@@ -5387,8 +6441,16 @@ def send_reply_to_contact(contact_id: str, data: dict):
     if channel == "email":
         # Get account to use
         if not account_id:
-            # Use default account
-            acc_row = conn.execute("SELECT account_id FROM email_accounts WHERE is_default = 1").fetchone()
+            # Default account of the REQUESTER's tenant only — never a foreign mailbox
+            acc_row = None
+            try:
+                acc_row = conn.execute(
+                    """SELECT account_id FROM email_accounts WHERE is_default = 1
+                       AND is_active = 1 AND tenant_id = ?""",
+                    (_request_tenant_id(request),),
+                ).fetchone()
+            except Exception:
+                pass
             account_id = acc_row["account_id"] if acc_row else None
         
         if not account_id:
@@ -5402,6 +6464,10 @@ def send_reply_to_contact(contact_id: str, data: dict):
         # Get account details for sending
         account = conn.execute("SELECT * FROM email_accounts WHERE account_id = ?", (account_id,)).fetchone()
         if not account:
+            conn.close()
+            return {"error": "Email account not found"}
+        # Caller-supplied account_id must belong to the requester's tenant
+        if (account["tenant_id"] or "") != _request_tenant_id(request):
             conn.close()
             return {"error": "Email account not found"}
         
@@ -5706,7 +6772,19 @@ async def campaign_email_send_loop():
                 html_body = f"<html><body>{body.replace(chr(10), '<br>')}<br>{tracking_pixel}</body></html>"
 
                 logger.info(f"[Email Send] Sending to {email_addr}...")
-                result = await gmail_send(to=email_addr, subject=subject, body=body)
+                queue_acc = _get_send_account(campaign_id=r["campaign_id"])
+                result = await gmail_send(
+                    to=email_addr,
+                    subject=subject,
+                    body=body,
+                    from_addr=(queue_acc or {}).get("email_address"),
+                    smtp_host=(queue_acc or {}).get("smtp_host"),
+                    smtp_port=(queue_acc or {}).get("smtp_port"),
+                    smtp_user=(queue_acc or {}).get("smtp_user"),
+                    smtp_password=(queue_acc or {}).get("smtp_password"),
+                )
+                if result.get("status") == "sent" and queue_acc and queue_acc.get("account_id"):
+                    _record_send(queue_acc["account_id"])
 
                 conn2 = sqlite3.connect(DB_PATH, timeout=10.0)
                 now = datetime.now(timezone.utc).isoformat()
@@ -5718,7 +6796,7 @@ async def campaign_email_send_loop():
                     # Log to emails table
                     conn2.execute(
                         """INSERT INTO emails (email_id, contact_id, direction, status, subject, body, sent_at, created_at)
-                           VALUES (?, ?, 'outbound', 'sent', ?, ?, ?, ?)""",
+                           VALUES (?, ?, 'outbound', 'SENT', ?, ?, ?, ?)""",
                         (email_id, r["lead_id"], subject, body, now, now)
                     )
                     # Log to campaign_messages
@@ -6583,6 +7661,12 @@ def get_tracking_events(email_id: str = None, limit: int = 50):
     return [dict(r) for r in rows]
 
 
+@app.get("/pipeline")
+def pipeline_redirect():
+    """Dead link from campaigns sidebar → dashboard leads board."""
+    return RedirectResponse(url="/dashboard", status_code=302)
+
+
 @app.get("/campaigns", response_class=HTMLResponse)
 def campaigns_page():
     return HTMLResponse(content="""<!DOCTYPE html>
@@ -7145,7 +8229,7 @@ async def run_deliverability_audit(request: Request):
 
 
 @app.get("/api/leads/top")
-def get_top_leads(limit: int = 20):
+def get_top_leads(request: Request, limit: int = 20):
     """Returns top-scored leads for the leaderboard."""
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
     conn.row_factory = sqlite3.Row
@@ -7156,43 +8240,83 @@ def get_top_leads(limit: int = 20):
         FROM contacts c
         LEFT JOIN companies co ON c.company_id = co.company_id
         WHERE c.lead_score > 0
+          AND (IFNULL(c.tenant_id,'') = '' OR c.tenant_id = ?)
         ORDER BY c.lead_score DESC
         LIMIT ?
-    """, (limit,)).fetchall()
+    """, (_request_tenant_id(request), limit)).fetchall()
     conn.close()
     return {"leads": [dict(r) for r in rows]}
 
 
 @app.post("/api/leads/import-csv")
-async def import_leads_csv():
-    """Imports leads from a CSV upload."""
+async def import_leads_csv(request: Request):
+    """Imports leads from a CSV upload into the caller's tenant."""
+    _require_login(request)
     form = await request.form()
     file = form.get("file")
     if not file:
         return JSONResponse({"detail": "No file provided"}, status_code=400)
     content = await file.read()
-    text = content.decode("utf-8", errors="replace")
+    text = content.decode("utf-8-sig", errors="replace")
     import csv, io as _io
     reader = csv.DictReader(_io.StringIO(text))
+    if not reader.fieldnames:
+        return JSONResponse({"detail": "Empty CSV file"}, status_code=400)
+    tenant_id = _request_tenant_id(request)
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
     now = datetime.now(timezone.utc).isoformat()
     count = 0
+    skipped = 0
     for row in reader:
-        email = (row.get("email") or "").strip()
+        norm = {
+            (k or "").strip().lower().replace(" ", "_"): (v or "").strip()
+            for k, v in row.items()
+        }
+        email = norm.get("email") or norm.get("e_mail") or norm.get("e-mail") or ""
         if not email or "@" not in email:
+            skipped += 1
             continue
+        first = norm.get("first_name") or norm.get("voornaam") or ""
+        last = norm.get("last_name") or norm.get("achternaam") or ""
+        role = norm.get("role") or norm.get("job_title") or norm.get("position") or ""
+        linkedin = norm.get("linkedin_url") or norm.get("linkedin") or ""
+        company_name = norm.get("company") or norm.get("company_name") or norm.get("bedrijf") or ""
+        company_id = None
+        if company_name:
+            try:
+                crow = conn.execute(
+                    "SELECT company_id FROM companies WHERE name = ? COLLATE NOCASE LIMIT 1",
+                    (company_name,),
+                ).fetchone()
+                if crow:
+                    company_id = crow[0]
+                else:
+                    company_id = str(uuid.uuid4())
+                    conn.execute(
+                        "INSERT INTO companies (company_id, name, created_at) VALUES (?, ?, ?)",
+                        (company_id, company_name, now),
+                    )
+            except Exception:
+                company_id = None
         cid = str(uuid.uuid4())
         try:
             conn.execute("""
-                INSERT OR IGNORE INTO contacts (contact_id, first_name, last_name, email, role, company_name, current_stage, lead_score, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'INGESTED', 10, ?)
-            """, (cid, row.get("first_name", ""), row.get("last_name", ""), email, row.get("role", ""), row.get("company_name", ""), now))
+                INSERT OR IGNORE INTO contacts
+                    (contact_id, company_id, first_name, last_name, email, role,
+                     linkedin_url, tenant_id, current_stage, lead_score, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'INGESTED', 10, ?, ?)
+            """, (cid, company_id, first, last, email, role, linkedin, tenant_id, now, now))
             count += 1
         except Exception:
-            pass
+            skipped += 1
     conn.commit()
     conn.close()
-    return {"message": f"Successfully imported {count} leads."}
+    return {
+        "message": f"Successfully imported {count} leads.",
+        "imported": count,
+        "skipped": skipped,
+        "tenant_id": tenant_id,
+    }
 
 
 @app.get("/api/search/queries")
@@ -7336,7 +8460,26 @@ def get_sequences():
             s["steps"] = []
             for st in steps:
                 sd = dict(st)
-                sd["delay_days"] = (sd.get("delay_hours") or 0) / 24
+                # Preserve integer day/hour fields. Older rows only stored total delay_hours;
+                # never overwrite a real delay_days with a fractional hours/24 value.
+                try:
+                    hours = int(sd.get("delay_hours") or 0)
+                except (TypeError, ValueError):
+                    hours = 0
+                raw_days = sd.get("delay_days")
+                if raw_days is None or raw_days == "":
+                    days = hours // 24
+                    hours = hours % 24
+                else:
+                    try:
+                        days = int(float(raw_days))
+                    except (TypeError, ValueError):
+                        days = 0
+                    if hours >= 24:
+                        days += hours // 24
+                        hours = hours % 24
+                sd["delay_days"] = days
+                sd["delay_hours"] = hours
                 s["steps"].append(sd)
             sequences.append(s)
     except Exception:
@@ -7357,10 +8500,23 @@ async def create_sequence(request: Request):
     """, (seq_id, body.get("name", "New Sequence"), body.get("description", ""), now))
     for i, step in enumerate(body.get("steps", []), 1):
         step_id = str(uuid.uuid4())
+        try:
+            delay_days = int(step.get("delay_days") or 0)
+        except (TypeError, ValueError):
+            delay_days = 0
+        try:
+            delay_hours = int(step.get("delay_hours") or 0)
+        except (TypeError, ValueError):
+            delay_hours = 0
+        if delay_days < 0:
+            delay_days = 0
+        if delay_hours < 0:
+            delay_hours = 0
+        total_hours = delay_days * 24 + delay_hours
         conn.execute("""
             INSERT INTO sequence_steps (step_id, sequence_id, step_number, step_type, delay_hours, subject, body, connection_note)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (step_id, seq_id, i, step.get("step_type", "email"), step.get("delay_hours", 0),
+        """, (step_id, seq_id, i, step.get("step_type", "email"), total_hours,
               step.get("subject", ""), step.get("body", ""), step.get("connection_note", "")))
     conn.commit()
     conn.close()
@@ -7442,11 +8598,11 @@ async def run_workflow(workflow_id: str):
 # ===========================================================
 
 @app.get("/api/onboarding/status")
-def api_onboarding_status():
+def api_onboarding_status(request: Request):
     """Returns the onboarding state for the active tenant."""
     if get_onboarding_state is None:
         return {"completed": True, "steps": []}
-    return get_onboarding_state(_active_tenant_id())
+    return get_onboarding_state(_request_tenant_id(request))
 
 
 @app.post("/api/onboarding/step")
@@ -7457,24 +8613,83 @@ async def api_onboarding_step(request: Request):
     body = await request.json()
     step = body.get("step")
     data = body.get("data", {})
-    if step not in ["welcome", "channels", "gmail", "profile", "icp", "message", "sequence", "sources", "search", "review", "running"]:
+    if step not in ["campaign_info", "settings", "sequence", "review", "running", "welcome", "channels", "gmail", "profile", "icp", "message", "sources", "search", "goal", "company"]:
         raise HTTPException(status_code=400, detail="Invalid step")
-    return save_onboarding_step(_active_tenant_id(), step, data)
+    try:
+        return save_onboarding_step(_request_tenant_id(request), step, data)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/api/onboarding/connect-gmail")
-def api_onboarding_connect_gmail(background_tasks: BackgroundTasks):
+def api_onboarding_connect_gmail(request: Request, background_tasks: BackgroundTasks):
     """Trigger Gmail OAuth for the active tenant during onboarding."""
-    tenant_id = _active_tenant_id()
-    return connect_gmail_tenant(tenant_id, background_tasks)
+    tenant_id = _request_tenant_id(request)
+    return connect_gmail_tenant(request, tenant_id, background_tasks)
+
+
+@app.post("/api/onboarding/connect-email")
+async def api_onboarding_connect_email(request: Request):
+    """Connect a sending mailbox (email + Gmail app password) for the active tenant."""
+    body = await request.json()
+    email = (body.get("email") or "").strip()
+    password = body.get("password") or ""
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="Ongeldig e-mailadres.")
+    if not password:
+        raise HTTPException(status_code=400, detail="App-wachtwoord ontbreekt.")
+    try:
+        from clawbuildr_onboarding import connect_email_account
+        result = connect_email_account(_request_tenant_id(request), email, password, verify=True)
+    except Exception as e:
+        logger.error(f"[Onboarding] connect-email failed: {e}")
+        raise HTTPException(status_code=500, detail="Koppeling mislukt door een interne fout.")
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Koppeling mislukt."))
+    return result
+
+
+@app.get("/api/onboarding/connect-status")
+def api_onboarding_connect_status(request: Request):
+    """Connection status for the active tenant: SMTP account + Gmail OAuth."""
+    tenant_id = _request_tenant_id(request)
+    out = {
+        "tenant_id": tenant_id,
+        "smtp": None,
+        "oauth": {"connected": False, "client_secret": False},
+    }
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                """SELECT account_id, email_address, provider, is_active, is_default,
+                          sends_today, daily_send_limit, tenant_id, created_at
+                   FROM email_accounts
+                   WHERE is_active = 1 AND (tenant_id = ? OR tenant_id IS NULL OR tenant_id = '')
+                   ORDER BY is_default DESC, created_at ASC LIMIT 1""",
+                (tenant_id,),
+            ).fetchone()
+            if row:
+                out["smtp"] = dict(row)
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning(f"[Onboarding] connect-status query failed: {e}")
+
+    token_path = os.path.join(DATA_DIR, f"token_gmail_{tenant_id}.json")
+    token_fallback = os.path.join(DATA_DIR, "token_gmail.json")
+    out["oauth"]["connected"] = os.path.exists(token_path) or os.path.exists(token_fallback)
+    out["oauth"]["client_secret"] = os.path.exists(os.path.join(DATA_DIR, "client_secret.json"))
+    return out
 
 
 @app.post("/api/onboarding/launch")
 async def api_onboarding_launch(request: Request):
     """Finalize onboarding: save tenant config, create first campaign, mark complete."""
     body = await request.json()
-    tenant_id = _active_tenant_id()
-    tenant = _get_active_tenant()
+    tenant_id = _request_tenant_id(request)
+    tenant = _get_tenant_config(tenant_id)
 
     # Merge launch payload into tenant config
     save_payload = {
@@ -7495,7 +8710,16 @@ async def api_onboarding_launch(request: Request):
         "sequence_template": body.get("sequence_template", tenant.get("sequence_template", "gentle")),
         "icp_regions": body.get("icp_regions", tenant.get("icp_regions", ["nl"])),
         "pain_points": body.get("pain_points", tenant.get("pain_points", [])),
+        "send_days": body.get("send_days", tenant.get("send_days", ["mon", "tue", "wed", "thu", "fri"])),
+        "send_hour_from": body.get("send_hour_from", tenant.get("send_hour_from", 9)),
+        "send_hour_to": body.get("send_hour_to", tenant.get("send_hour_to", 17)),
+        "campaign_goal": body.get("campaign_goal", tenant.get("campaign_goal", "")),
     }
+    sequence_json = body.get("sequence")
+    # Legacy linear follow-ups only when NO multi-channel graph is saved (avoids double-send)
+    followup_custom = body.get("followup_steps") or (
+        sequence_json if isinstance(sequence_json, list) else None
+    )
     # Re-use existing tenant save logic
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
     try:
@@ -7504,8 +8728,9 @@ async def api_onboarding_launch(request: Request):
                 (tenant_id, display_name, sending_email, sending_domain, calendar_link,
                  signature_block, value_doctrine, brand_voice, icp_industries,
                  icp_roles, icp_company_size, search_queries, active,
-                 lead_sources, campaign_channels, sequence_template, icp_regions, pain_points)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+                 lead_sources, campaign_channels, sequence_template, icp_regions, pain_points,
+                 send_days, send_hour_from, send_hour_to, campaign_goal, followup_custom_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(tenant_id) DO UPDATE SET
                 display_name   = excluded.display_name,
                 sending_email  = excluded.sending_email,
@@ -7523,7 +8748,12 @@ async def api_onboarding_launch(request: Request):
                 campaign_channels = excluded.campaign_channels,
                 sequence_template = excluded.sequence_template,
                 icp_regions    = excluded.icp_regions,
-                pain_points    = excluded.pain_points
+                pain_points    = excluded.pain_points,
+                send_days      = excluded.send_days,
+                send_hour_from = excluded.send_hour_from,
+                send_hour_to   = excluded.send_hour_to,
+                campaign_goal  = excluded.campaign_goal,
+                followup_custom_json = excluded.followup_custom_json
         """, (
             tenant_id,
             save_payload["display_name"],
@@ -7542,6 +8772,11 @@ async def api_onboarding_launch(request: Request):
             save_payload["sequence_template"],
             json.dumps(save_payload["icp_regions"]),
             json.dumps(save_payload["pain_points"]),
+            json.dumps(save_payload["send_days"]),
+            save_payload["send_hour_from"],
+            save_payload["send_hour_to"],
+            save_payload["campaign_goal"],
+            json.dumps(followup_custom) if followup_custom else None,
         ))
         conn.execute("UPDATE tenant_config SET active = 0 WHERE tenant_id != ?", (tenant_id,))
         conn.commit()
@@ -7551,9 +8786,53 @@ async def api_onboarding_launch(request: Request):
     # Create first campaign if requested
     campaign = None
     contact_ids = body.get("contact_ids", [])
+    sequence_graph_json = None
+    sequence_graph_id = None
+    graph_save_error = None
+    enrolled_count = 0
+    enroll_error = None
+    # Prefer real multi-channel graph when UI sent sequence_steps / sequence
+    ui_steps = body.get("sequence_steps") or body.get("sequence") or body.get("sequence_graph_steps")
+    if ui_steps:
+        try:
+            sys_path_cb = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "clawbuildr")
+            if sys_path_cb not in sys.path:
+                sys.path.insert(0, sys_path_cb)
+            from clawbuildr_sequence_graph import ensure_tables as _sg_ensure, save_graph as _sg_save, steps_to_graph as _sg_steps_to_graph
+            _sg_ensure()
+            graph = _sg_steps_to_graph(ui_steps)
+            sequence_graph_json = graph
+            sequence_graph_id = _sg_save(
+                graph,
+                tenant_id=tenant_id,
+                campaign_id=None,
+                name=body.get("campaign_name") or "Onboarding sequence",
+            )
+            logger.info("[Onboarding] Saved sequence graph %s (%d nodes)", sequence_graph_id, len(graph["nodes"]))
+        except Exception as _sg_err:
+            logger.error(f"[Onboarding] sequence graph save failed: {_sg_err}")
+            sequence_graph_json = None
+            graph_save_error = str(_sg_err)
+
+    # Graph owns outreach → disable legacy linear follow-ups to prevent double-send
+    if sequence_graph_id:
+        followup_custom = None
+        try:
+            _c = sqlite3.connect(DB_PATH, timeout=10.0)
+            try:
+                _c.execute(
+                    "UPDATE tenant_config SET followup_custom_json = NULL WHERE tenant_id = ?",
+                    (tenant_id,),
+                )
+                _c.commit()
+            finally:
+                _c.close()
+        except Exception as _fu_err:
+            logger.warning(f"[Onboarding] could not clear legacy followup_custom_json: {_fu_err}")
+
     if body.get("create_campaign", True):
         if not contact_ids:
-            # Auto-select early-stage leads not yet in a campaign
+            # Auto-select early-stage leads not yet in a campaign (this tenant only)
             conn = sqlite3.connect(DB_PATH, timeout=10.0)
             conn.row_factory = sqlite3.Row
             try:
@@ -7561,10 +8840,11 @@ async def api_onboarding_launch(request: Request):
                     SELECT c.contact_id FROM contacts c
                     LEFT JOIN campaign_leads cl ON c.contact_id = cl.contact_id
                     WHERE c.current_stage IN ('INGESTED', 'RESEARCHED', 'DELIVERABILITY_VERIFIED', 'OPPORTUNITY_MAPPED', 'PRE_QUALIFIED')
+                      AND (IFNULL(c.tenant_id,'') = '' OR c.tenant_id = ?)
                       AND cl.contact_id IS NULL
                     ORDER BY c.lead_score DESC
                     LIMIT 50
-                """).fetchall()
+                """, (tenant_id,)).fetchall()
                 contact_ids = [r["contact_id"] for r in rows]
             finally:
                 conn.close()
@@ -7572,12 +8852,183 @@ async def api_onboarding_launch(request: Request):
             name=body.get("campaign_name", f"{save_payload['display_name'] or 'Eerste'} campagne"),
             activation_message=body.get("value_doctrine", ""),
             contact_ids=contact_ids,
+            sequence=sequence_graph_json if sequence_graph_json is not None else sequence_json,
+            sequence_graph=sequence_graph_json,
+            tenant_id=tenant_id,
         )
+        # Enroll campaign contacts into the graph
+        if sequence_graph_id and campaign:
+            try:
+                # Link graph → campaign so enroll_eligible_leads uses the
+                # campaign-scoped branch instead of the global lead pool.
+                _gconn = sqlite3.connect(DB_PATH, timeout=10.0)
+                try:
+                    _gconn.execute(
+                        "UPDATE sequence_graphs SET campaign_id = ? WHERE graph_id = ?",
+                        (str(campaign.get("campaign_id", "")), sequence_graph_id),
+                    )
+                    _gconn.commit()
+                finally:
+                    _gconn.close()
+            except Exception as _link_err:
+                logger.warning(f"[Onboarding] graph→campaign link failed: {_link_err}")
+            try:
+                from clawbuildr_sequence_graph import enroll_contact as _sg_enroll
+                for cid in contact_ids:
+                    if _sg_enroll(str(cid), graph_id=sequence_graph_id, campaign_id=str(campaign.get("campaign_id", "")), tenant_id=tenant_id):
+                        enrolled_count += 1
+            except Exception as _en_err:
+                logger.error(f"[Onboarding] graph enroll failed: {_en_err}")
+                enroll_error = str(_en_err)
+    elif sequence_graph_id and not contact_ids:
+        # Still enroll any early-stage leads even without campaign flag (this tenant only)
+        try:
+            from clawbuildr_sequence_graph import enroll_contact as _sg_enroll
+            conn = sqlite3.connect(DB_PATH, timeout=10.0)
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute("""
+                    SELECT c.contact_id FROM contacts c
+                    LEFT JOIN campaign_leads cl ON c.contact_id = cl.contact_id
+                    WHERE c.current_stage IN ('INGESTED', 'RESEARCHED', 'DELIVERABILITY_VERIFIED', 'OPPORTUNITY_MAPPED', 'PRE_QUALIFIED')
+                      AND (IFNULL(c.tenant_id,'') = '' OR c.tenant_id = ?)
+                      AND cl.contact_id IS NULL
+                    ORDER BY c.lead_score DESC LIMIT 50
+                """, (tenant_id,)).fetchall()
+                for r in rows:
+                    if _sg_enroll(str(r["contact_id"]), graph_id=sequence_graph_id, tenant_id=tenant_id):
+                        enrolled_count += 1
+            finally:
+                conn.close()
+        except Exception as _en_err:
+            logger.error(f"[Onboarding] graph enroll failed: {_en_err}")
+            enroll_error = str(_en_err)
+
+    # Immediate first tick so the campaign fires on its own without waiting for the loop
+    first_tick_stats = None
+    first_tick_error = None
+    if sequence_graph_id:
+        try:
+            from clawbuildr_sequence_graph import process_due as _sg_process, enroll_eligible_leads as _sg_enroll_eligible
+            auto_enrolled = _sg_enroll_eligible(25, tenant_id=tenant_id)
+            enrolled_count += auto_enrolled
+            first_tick_stats = await asyncio.to_thread(_sg_process, 25)
+            logger.info(f"[Onboarding] first graph tick: {first_tick_stats}")
+        except Exception as _tick_err:
+            logger.error(f"[Onboarding] first graph tick failed: {_tick_err}")
+            first_tick_error = str(_tick_err)
 
     if complete_onboarding is not None:
         complete_onboarding(tenant_id)
 
-    return {"status": "launched", "tenant_id": tenant_id, "campaign": campaign}
+    return {
+        "status": "launched",
+        "tenant_id": tenant_id,
+        "campaign": campaign,
+        "sequence_graph_id": sequence_graph_id,
+        "graph_save_error": graph_save_error,
+        "enrolled": enrolled_count,
+        "enroll_error": enroll_error,
+        "first_tick": first_tick_stats,
+        "first_tick_error": first_tick_error,
+    }
+
+
+@app.get("/api/sequence-graph/active")
+def api_active_sequence_graph(request: Request):
+    """Active sequence graph for the caller's tenant, mapped back to UI steps."""
+    tenant_id = _request_tenant_id(request)
+    _require_tenant_access(request, tenant_id)
+    sys_path_cb = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "clawbuildr")
+    if sys_path_cb not in sys.path:
+        sys.path.insert(0, sys_path_cb)
+    from clawbuildr_sequence_graph import ensure_tables as _sg_ensure, get_active_graph as _sg_get, graph_to_steps as _sg_to_steps
+    _sg_ensure()
+    active = _sg_get(tenant_id)
+    if not active:
+        return {"graph_id": None, "steps": []}
+    gid, graph = active
+    return {"graph_id": gid, "steps": _sg_to_steps(graph)}
+
+
+@app.post("/api/sequence-graph/update")
+async def api_update_active_sequence_graph(request: Request):
+    """Replace the active graph's content IN PLACE.
+
+    Unlike save_graph (new row + stop old enrollments), this keeps the same
+    graph_id so in-flight enrollments keep their position: leads continue at
+    their current node under the new content, and a removed node stops that
+    lead cleanly (process_due handles missing nodes).
+    """
+    body = await request.json()
+    steps = body.get("sequence_steps") or []
+    if not steps:
+        raise HTTPException(status_code=400, detail="sequence_steps required")
+    tenant_id = _request_tenant_id(request)
+    _require_tenant_access(request, tenant_id)
+    sys_path_cb = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "clawbuildr")
+    if sys_path_cb not in sys.path:
+        sys.path.insert(0, sys_path_cb)
+    from clawbuildr_sequence_graph import (
+        ensure_tables as _sg_ensure,
+        get_active_graph as _sg_get,
+        steps_to_graph as _sg_steps_to_graph,
+    )
+    _sg_ensure()
+    active = _sg_get(tenant_id)
+    if not active:
+        raise HTTPException(status_code=404, detail="No active sequence yet — launch first")
+    gid, _old = active
+    try:
+        graph = _sg_steps_to_graph(steps)
+    except Exception as _conv_err:
+        raise HTTPException(status_code=400, detail=f"Invalid sequence: {_conv_err}")
+    graph_json = json.dumps(graph)
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    try:
+        conn.execute(
+            "UPDATE sequence_graphs SET graph_json = ? WHERE graph_id = ? AND tenant_id = ?",
+            (graph_json, gid, tenant_id),
+        )
+        row = conn.execute(
+            "SELECT campaign_id FROM sequence_graphs WHERE graph_id = ?", (gid,)
+        ).fetchone()
+        campaign_id = row[0] if row else None
+        if campaign_id:
+            conn.execute(
+                "UPDATE campaigns SET sequence_graph_json = ? WHERE campaign_id = ? OR CAST(campaign_id AS TEXT) = ?",
+                (graph_json, campaign_id, str(campaign_id)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    logger.info("[SeqGraph] Updated graph %s in place (%d nodes)", gid, len(graph["nodes"]))
+    return {"status": "updated", "graph_id": gid, "nodes": len(graph["nodes"])}
+
+
+@app.get("/health")
+def health():
+    """Liveness probe — cheap DB ping + process uptime."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=5.0)
+        conn.execute("SELECT 1").fetchone()
+        conn.close()
+        db_ok = True
+    except Exception as e:
+        db_ok = False
+        db_error = str(e)
+    else:
+        db_error = None
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "db": "ok" if db_ok else "error",
+        **({"db_error": db_error} if db_error else {}),
+    }
+
+
+@app.get("/api/health")
+def api_health_alias():
+    return health()
 
 
 @app.get("/api/simple/stats")
@@ -7590,10 +9041,10 @@ def api_simple_stats():
             "SELECT COUNT(*) FROM contacts WHERE current_stage NOT IN ('CLOSED_LOST', 'BOUNCED')"
         ).fetchone()[0]
         sent = conn.execute(
-            "SELECT COUNT(*) FROM emails WHERE direction = 'outbound' AND status = 'SENT'"
+            "SELECT COUNT(*) FROM emails WHERE UPPER(direction) = 'OUTBOUND' AND UPPER(status) = 'SENT'"
         ).fetchone()[0]
         replies = conn.execute(
-            "SELECT COUNT(*) FROM emails WHERE direction = 'inbound'"
+            "SELECT COUNT(*) FROM emails WHERE UPPER(direction) = 'INBOUND'"
         ).fetchone()[0]
         meetings = conn.execute(
             "SELECT COUNT(*) FROM contacts WHERE current_stage = 'MEETING_BOOKED'"
@@ -7601,25 +9052,56 @@ def api_simple_stats():
         queued = conn.execute(
             "SELECT COUNT(*) FROM followup_queue WHERE status IN ('pending', 'ready')"
         ).fetchone()[0]
+        # Honest "really sending" signal: due/active graph work OR recent real sends
+        try:
+            # next_action_at is ISO-8601 with 'T'; datetime('now') uses space — normalize both
+            due_now = conn.execute(
+                """SELECT COUNT(*) FROM sequence_enrollments e
+                   JOIN sequence_graphs g ON g.graph_id = e.graph_id
+                   WHERE e.status = 'ACTIVE' AND e.next_action_at IS NOT NULL
+                     AND replace(substr(e.next_action_at, 1, 19), 'T', ' ') <= datetime('now')
+                     AND g.active = 1"""
+            ).fetchone()[0]
+            active_enrollments = conn.execute(
+                """SELECT COUNT(*) FROM sequence_enrollments e
+                   JOIN sequence_graphs g ON g.graph_id = e.graph_id
+                   WHERE e.status = 'ACTIVE' AND g.active = 1"""
+            ).fetchone()[0]
+            sends_24h = conn.execute(
+                """SELECT COUNT(*) FROM emails
+                   WHERE UPPER(direction) = 'OUTBOUND' AND UPPER(status) = 'SENT'
+                     AND replace(substr(sent_at, 1, 19), 'T', ' ') >= datetime('now', '-24 hours')"""
+            ).fetchone()[0]
+        except Exception:
+            due_now, active_enrollments, sends_24h = 0, 0, 0
     finally:
         conn.close()
+    really_sending = bool(sends_24h > 0 or due_now > 0)
     return {
         "active_leads": active_leads,
         "emails_sent": sent,
         "replies": replies,
         "meetings": meetings,
         "followups_queued": queued,
-        "healthy": sent > 0 or active_leads > 0,
+        "due_now": due_now,
+        "active_enrollments": active_enrollments,
+        "sends_24h": sends_24h,
+        "really_sending": really_sending,
+        # kept for older clients; prefer really_sending
+        "healthy": really_sending,
     }
 
 
 @app.get("/api/simple/campaigns")
-def api_simple_campaigns():
+def api_simple_campaigns(request: Request):
     """Campaign list with simplified stats."""
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
     conn.row_factory = sqlite3.Row
     try:
-        rows = conn.execute("SELECT * FROM campaigns ORDER BY created_at DESC").fetchall()
+        rows = conn.execute(
+            "SELECT * FROM campaigns WHERE (IFNULL(tenant_id,'') = '' OR tenant_id = ?) ORDER BY created_at DESC",
+            (_request_tenant_id(request),),
+        ).fetchall()
         campaigns = []
         for r in rows:
             c = dict(r)
@@ -7662,7 +9144,42 @@ async def api_create_simple_campaign(request: Request):
         name=body.get("name", "New Campaign"),
         activation_message=body.get("activation_message", ""),
         contact_ids=contact_ids,
+        tenant_id=_request_tenant_id(request),
     )
+    # Optional multi-account: pin campaign to a chosen sending account
+    account_id = body.get("account_id")
+    if account_id and result.get("campaign_id"):
+        conn = None
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=10.0)
+            # Only the requester's own mailbox may be pinned (no cross-tenant sends)
+            _acc = conn.execute(
+                "SELECT tenant_id FROM email_accounts WHERE account_id = ?", (account_id,)
+            ).fetchone()
+            if _acc is None or (_acc[0] or "") != _request_tenant_id(request):
+                raise ValueError("account not allowed for this tenant")
+            conn.execute(
+                "UPDATE campaigns SET account_id = ?, updated_at = ? WHERE campaign_id = ?",
+                (account_id, datetime.now(timezone.utc).isoformat(), result["campaign_id"]),
+            )
+            conn.commit()
+            result["account_id"] = account_id
+        except Exception as _acc_err:
+            logger.warning(f"[SimpleCampaign] account_id attach failed: {_acc_err}")
+        finally:
+            if conn is not None:
+                conn.close()
+    # Immediate first tick so the campaign fires without waiting for the 60s loop
+    if result.get("sequence_graph_id"):
+        try:
+            sys_path_cb = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "clawbuildr")
+            if sys_path_cb not in sys.path:
+                sys.path.insert(0, sys_path_cb)
+            from clawbuildr_sequence_graph import process_due as _sg_process
+            result["first_tick"] = await asyncio.to_thread(_sg_process, 25)
+        except Exception as _tick_err:
+            logger.error(f"[SimpleCampaign] first graph tick failed: {_tick_err}")
+            result["first_tick_error"] = str(_tick_err)
     return result
 
 
@@ -7771,16 +9288,199 @@ def get_deliverability_audit_placeholder():
 # Simple Skylead-style routes
 _STATIC_DIR = os.path.join(BASE_DIR, "static", "clawbuildr")
 
+def _auth_token_ok(request: Request) -> bool:
+    token = request.cookies.get("clb_token")
+    if not token:
+        return False
+    try:
+        from clawbuildr_auth import decode_token
+        return decode_token(token) is not None
+    except Exception:
+        return False
+
+
 @app.get("/")
-def root_redirect():
-    """Redirect new users to onboarding, everyone else to the simple dashboard."""
-    if _is_onboarding_complete():
+def root_redirect(request: Request):
+    """Gate: no session → /register; session + onboarding done → /dashboard; else /onboarding."""
+    if _auth_token_ok(request):
+        if not _is_onboarding_complete(request):
+            return RedirectResponse(url="/onboarding")
         return RedirectResponse(url="/dashboard")
-    return RedirectResponse(url="/onboarding")
+    return RedirectResponse(url="/register")
+
+
+@app.get("/register")
+def register_page():
+    path = os.path.join(_STATIC_DIR, "register.html")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    return HTMLResponse(content="<h1>Register page missing</h1>", status_code=500)
+
+
+@app.get("/login")
+def login_page():
+    path = os.path.join(_STATIC_DIR, "login.html")
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    return HTMLResponse(content="<h1>Login page missing</h1>", status_code=500)
+
+
+def _activate_tenant(tenant_id: str) -> None:
+    """Make tenant_id the single active tenant."""
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    try:
+        conn.execute("UPDATE tenant_config SET active = 0 WHERE tenant_id != ?", (tenant_id,))
+        conn.execute("UPDATE tenant_config SET active = 1 WHERE tenant_id = ?", (tenant_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _provision_user_tenant(user_id: int, display_name: str) -> str:
+    """Create + activate a fresh, isolated tenant for a newly registered user.
+
+    The new tenant starts empty (own wizard, own leads, own mailbox) and
+    becomes the single active tenant. Existing users keep their home tenant
+    (backfilled to 'clawbuildr'); login re-activates it.
+    """
+    tenant_id = f"t{user_id}"
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    try:
+        conn.execute("""
+            INSERT OR IGNORE INTO tenant_config
+                (tenant_id, display_name, sending_email, sending_domain, calendar_link,
+                 signature_block, value_doctrine, brand_voice, icp_industries,
+                 icp_roles, icp_company_size, search_queries, active,
+                 lead_sources, campaign_channels, sequence_template, icp_regions, pain_points,
+                 send_days, send_hour_from, send_hour_to)
+            VALUES (?, ?, '', '', '', '', '', '', '[]', '[]', '10-200', '[]', 1,
+                    ?, ?, ?, ?, ?, ?, 9, 17)
+        """, (
+            tenant_id,
+            display_name or "",
+            json.dumps(["hunter", "directories", "kvk"]),
+            json.dumps(["email", "linkedin"]),
+            "gentle",
+            json.dumps(["nl"]),
+            json.dumps([]),
+            json.dumps(["mon", "tue", "wed", "thu", "fri"]),
+        ))
+        conn.execute("UPDATE tenant_config SET active = 0 WHERE tenant_id != ?", (tenant_id,))
+        conn.execute(
+            "UPDATE users SET tenant_id = ? WHERE user_id = ?",
+            (tenant_id, user_id),
+        )
+        conn.commit()
+        logger.info(f"[Auth] Provisioned tenant '{tenant_id}' for user {user_id}")
+        return tenant_id
+    finally:
+        conn.close()
+
+
+@app.post("/api/auth/register")
+async def api_auth_register(request: Request):
+    body = await request.json()
+    email = (body.get("email") or "").strip().lower()
+    password = body.get("password") or ""
+    name = (body.get("name") or "").strip()
+    if not email or "@" not in email or len(password) < 6:
+        raise HTTPException(status_code=400, detail="Ongeldig e-mail of wachtwoord (min. 6 tekens).")
+    try:
+        from clawbuildr_auth import create_user, generate_token
+        user = create_user(email, password, name or email.split("@")[0])
+    except Exception as e:
+        msg = str(e)
+        if "UNIQUE" in msg or "exists" in msg.lower() or "duplicate" in msg.lower():
+            raise HTTPException(status_code=409, detail="Dit e-mailadres is al geregistreerd.")
+        raise HTTPException(status_code=400, detail=msg)
+    if not user or (isinstance(user, dict) and "error" in user):
+        err = (user or {}).get("error", "") if isinstance(user, dict) else str(user)
+        if "already exists" in err.lower() or "UNIQUE" in err:
+            raise HTTPException(status_code=409, detail="Dit e-mailadres is al geregistreerd.")
+        raise HTTPException(status_code=400, detail=err or "Registratie mislukt.")
+    if not isinstance(user, dict) or "user_id" not in user:
+        raise HTTPException(status_code=400, detail="Registratie mislukt.")
+    # Fresh isolated tenant — without this a new user would land in the
+    # currently active tenant and see/modify someone else's onboarding + data.
+    try:
+        _provision_user_tenant(user["user_id"], name or email.split("@")[0])
+    except Exception as prov_err:
+        logger.error(f"[Auth] tenant provisioning failed for user {user['user_id']}: {prov_err}")
+        raise HTTPException(status_code=500, detail="Tenant aanmaken mislukt — probeer opnieuw.")
+    token = generate_token({
+        "user_id": user["user_id"],
+        "email": user.get("email", email),
+        "role": user.get("role", "client"),
+    })
+    resp = Response(content=json.dumps({"status": "ok", "user_id": user["user_id"]}), media_type="application/json")
+    resp.set_cookie("clb_token", token, httponly=True, samesite="lax", max_age=60 * 60 * 24 * 7)
+    return resp
+
+
+@app.post("/api/auth/login")
+async def api_auth_login(request: Request):
+    body = await request.json()
+    email = (body.get("email") or "").strip().lower()
+    password = body.get("password") or ""
+    try:
+        from clawbuildr_auth import authenticate_user, generate_token
+        user = authenticate_user(email, password)
+    except Exception:
+        user = None
+    if not user:
+        raise HTTPException(status_code=401, detail="Ongeldig e-mail of wachtwoord.")
+    # Re-activate this user's home tenant so each user gets their own workspace.
+    try:
+        _conn = sqlite3.connect(DB_PATH, timeout=10.0)
+        try:
+            _row = _conn.execute(
+                "SELECT tenant_id FROM users WHERE user_id = ?", (user["user_id"],)
+            ).fetchone()
+            _home = _row[0] if _row else ""
+        finally:
+            _conn.close()
+        if _home:
+            _activate_tenant(_home)
+    except Exception as _ten_err:
+        logger.warning(f"[Auth] tenant activation on login failed: {_ten_err}")
+    token = user.get("token") or generate_token({
+        "user_id": user["user_id"],
+        "email": user.get("email", email),
+        "role": user.get("role", "client"),
+    })
+    resp = Response(content=json.dumps({"status": "ok", "user_id": user["user_id"]}), media_type="application/json")
+    resp.set_cookie("clb_token", token, httponly=True, samesite="lax", max_age=60 * 60 * 24 * 7)
+    return resp
+
+
+@app.post("/api/auth/logout")
+def api_auth_logout():
+    resp = Response(content=json.dumps({"status": "ok"}), media_type="application/json")
+    resp.delete_cookie("clb_token")
+    return resp
+
+
+@app.get("/api/auth/me")
+def api_auth_me(request: Request):
+    token = request.cookies.get("clb_token")
+    if not token:
+        raise HTTPException(status_code=401, detail="Not logged in")
+    try:
+        from clawbuildr_auth import decode_token
+        payload = decode_token(token)
+    except Exception:
+        payload = None
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return {"user_id": payload.get("user_id") or payload.get("sub"), "email": payload.get("email", "")}
 
 
 @app.get("/onboarding")
-def onboarding_page():
+def onboarding_page(request: Request):
+    if not _auth_token_ok(request):
+        return RedirectResponse(url="/register")
     path = os.path.join(_STATIC_DIR, "onboarding.html")
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
@@ -7789,7 +9489,9 @@ def onboarding_page():
 
 
 @app.get("/dashboard")
-def simple_dashboard_page():
+def simple_dashboard_page(request: Request):
+    if not _auth_token_ok(request):
+        return RedirectResponse(url="/login")
     path = os.path.join(_STATIC_DIR, "simple_dashboard.html")
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
@@ -8583,6 +10285,32 @@ def get_classic_dashboard():
  <div class="cb-card p-5">
  <span class="text-xs cb-text-tertiary font-semibold block uppercase tracking-wider">Errors</span>
  <span id="li-stat-error" class="text-3xl font-extrabold text-red-400 mt-2 block">0</span>
+ </div>
+ </div>
+
+ <!-- Per-tenant QR login: a teammate connects THEIR OWN LinkedIn account -->
+ <div class="cb-card p-6">
+ <div class="flex items-center justify-between mb-4">
+ <h3 class="text-sm font-bold cb-text-primary uppercase tracking-wider flex items-center gap-2">
+ <i class="fa-solid fa-qrcode text-blue-400"></i> Connect a Teammate's LinkedIn (QR login)
+ </h3>
+ <span id="qr-status-badge" class="text-[10px] font-bold cb-text-tertiary uppercase tracking-widest">idle</span>
+ </div>
+ <div class="flex flex-wrap items-center gap-3">
+ <input id="qr-tenant-input" type="text" placeholder="tenant_id (blank = my tenant)"
+ class="cb-surface border cb-border rounded-xl px-4 py-2.5 text-sm cb-text-primary w-56 outline-none focus:border-blue-500" />
+ <button onclick="startTenantQr()" id="qr-start-btn"
+ class="bg-blue-600 hover:bg-blue-500 text-white font-bold text-sm px-5 py-2.5 rounded-xl transition flex items-center gap-2">
+ <i class="fa-solid fa-qrcode"></i> Start QR Login
+ </button>
+ <button onclick="stopTenantQr()" id="qr-stop-btn" class="hidden text-xs font-bold text-red-400 hover:text-red-300 uppercase tracking-wider">
+ Cancel
+ </button>
+ <span id="qr-session-badge" class="text-xs font-semibold cb-text-tertiary uppercase tracking-widest"></span>
+ </div>
+ <div id="qr-image-wrap" class="hidden mt-4 flex flex-col items-center gap-2">
+ <img id="qr-image" alt="LinkedIn login QR code" class="bg-white p-3 rounded-xl w-56 h-56" />
+ <span class="text-xs cb-text-tertiary">Scan with the LinkedIn mobile app (profile photo → Sign in with QR code)</span>
  </div>
  </div>
 
@@ -10126,6 +11854,84 @@ def get_classic_dashboard():
  btn.disabled = false;
  btn.innerHTML = '<i class="fa-brands fa-linkedin"></i> Login to LinkedIn';
  }
+ }
+
+ // --- Per-tenant QR login ---
+ let _qrPollTimer = null;
+
+ function setQrBadge(status) {
+ const b = document.getElementById("qr-status-badge");
+ if (!b) return;
+ b.innerText = status || "idle";
+ b.className = "text-[10px] font-bold uppercase tracking-widest " +
+ (status === "success" ? "text-emerald-400" :
+ status === "waiting" ? "text-blue-400 animate-pulse" :
+ status === "error" || status === "expired" ? "text-red-400" : "cb-text-tertiary");
+ }
+
+ async function startTenantQr() {
+ const input = document.getElementById("qr-tenant-input");
+ const tid = (input.value || "").trim();
+ const btn = document.getElementById("qr-start-btn");
+ btn.disabled = true;
+ try {
+ const r = await fetch("/api/linkedin/tenant-login", {
+ method: "POST",
+ headers: { "Content-Type": "application/json" },
+ body: JSON.stringify({ tenant_id: tid })
+ });
+ const res = await r.json().catch(() => ({}));
+ if (!r.ok) { showToast("error", res.detail || res.message || ("QR start failed (HTTP " + r.status + ")")); btn.disabled = false; return; }
+ if (res.status === "error") { showToast("error", res.message || "QR start failed"); btn.disabled = false; return; }
+ showToast("info", "QR login started" + (tid ? " for " + tid : "") + " — scan within 3 minutes.");
+ document.getElementById("qr-stop-btn").classList.remove("hidden");
+ setQrBadge("waiting");
+ if (_qrPollTimer) clearInterval(_qrPollTimer);
+ _qrPollTimer = setInterval(() => pollTenantQr(tid), 2500);
+ } catch (e) {
+ showToast("error", "QR start failed: " + e.message);
+ btn.disabled = false;
+ }
+ }
+
+ async function stopTenantQr() {
+ const tid = (document.getElementById("qr-tenant-input").value || "").trim();
+ try { await fetch("/api/linkedin/tenant-qr-stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tenant_id: tid }) }); } catch (e) {}
+ if (_qrPollTimer) { clearInterval(_qrPollTimer); _qrPollTimer = null; }
+ document.getElementById("qr-image-wrap").classList.add("hidden");
+ document.getElementById("qr-stop-btn").classList.add("hidden");
+ document.getElementById("qr-start-btn").disabled = false;
+ setQrBadge("idle");
+ }
+
+ async function pollTenantQr(tid) {
+ try {
+ const r = await fetch("/api/linkedin/tenant-status?tenant_id=" + encodeURIComponent(tid));
+ if (!r.ok) throw new Error("HTTP " + r.status);
+ const st = await r.json();
+ setQrBadge(st.status || "idle");
+ const badge = document.getElementById("qr-session-badge");
+ if (badge) badge.innerText = st.logged_in ? "SESSION OK" : "";
+ if (st.status === "waiting" || st.status === "started" || st.status === "busy") {
+ const wrap = document.getElementById("qr-image-wrap");
+ const img = document.getElementById("qr-image");
+ wrap.classList.remove("hidden");
+ img.src = "/api/linkedin/tenant-qr?tenant_id=" + encodeURIComponent(tid) + "&t=" + Date.now();
+ }
+ if (["success", "expired", "error", "idle"].includes(st.status)) {
+ if (_qrPollTimer) { clearInterval(_qrPollTimer); _qrPollTimer = null; }
+ document.getElementById("qr-stop-btn").classList.add("hidden");
+ document.getElementById("qr-start-btn").disabled = false;
+ if (st.status === "success") {
+ document.getElementById("qr-image-wrap").classList.add("hidden");
+ showToast("success", "LinkedIn connected" + (tid ? " for tenant " + tid : "") + "!");
+ } else if (st.status === "expired") {
+ showToast("error", "QR expired — start again");
+ } else if (st.status === "error") {
+ showToast("error", "QR login error: " + (st.message || ""));
+ }
+ }
+ } catch (e) { /* transient poll failure — keep trying */ }
  }
 
  async function loadFollowups() {

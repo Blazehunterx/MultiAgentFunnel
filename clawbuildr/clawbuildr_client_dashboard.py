@@ -28,10 +28,10 @@ def get_client_overview(workspace_id: int = None) -> Dict[str, Any]:
     try:
         contacts = db.execute("SELECT COUNT(*) as cnt FROM contacts").fetchone()["cnt"]
         emails_sent = db.execute(
-            "SELECT COUNT(*) as cnt FROM emails WHERE direction = 'outbound'"
+            "SELECT COUNT(*) as cnt FROM emails WHERE UPPER(direction) = 'OUTBOUND'"
         ).fetchone()["cnt"]
         emails_received = db.execute(
-            "SELECT COUNT(*) as cnt FROM emails WHERE direction = 'inbound'"
+            "SELECT COUNT(*) as cnt FROM emails WHERE UPPER(direction) = 'INBOUND'"
         ).fetchone()["cnt"]
         linkedin_sent = db.execute("SELECT COUNT(*) as cnt FROM linkedin_outreach").fetchone()["cnt"]
         meetings = db.execute(

@@ -22,6 +22,32 @@ from threading import Lock
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 COOKIES_PATH = os.path.join(DATA_DIR, "linkedin_cookies.json")
 FIREFOX_PROFILE_SRC = r"C:\Users\marvi\AppData\Roaming\Mozilla\Firefox\Profiles\h1vl3oun.default-release"
+
+# ---------- Per-tenant LinkedIn sessions ----------
+# Legacy tenants (None / "" / "clawbuildr") keep the original machine-wide
+# behavior: real Firefox profile copy + linkedin_cookies.json + warming_state id=1.
+# Any other tenant gets its own cookie file and its own safety state.
+LEGACY_TENANT_IDS = (None, "", "clawbuildr")
+_SAFE_TENANT_RE = re.compile(r"[^A-Za-z0-9_\-]")
+
+
+def _is_legacy_tenant(tenant_id) -> bool:
+    return tenant_id in LEGACY_TENANT_IDS
+
+
+def _normalize_tenant_id(tenant_id) -> str:
+    """Legacy tenants normalize to '' (matches legacy rows after migration)."""
+    if _is_legacy_tenant(tenant_id):
+        return ""
+    return str(tenant_id)
+
+
+def tenant_cookies_path(tenant_id):
+    """Path to the per-tenant cookie file, or COOKIES_PATH for legacy tenants."""
+    if _is_legacy_tenant(tenant_id):
+        return COOKIES_PATH
+    safe = _SAFE_TENANT_RE.sub("_", str(tenant_id))
+    return os.path.join(DATA_DIR, f"linkedin_cookies_{safe}.json")
 # Use timestamped copy to avoid lock conflicts with running Firefox
 import time as time_mod
 FIREFOX_PROFILE_COPY = os.path.join(DATA_DIR, f"firefox_profile_copy_{int(time_mod.time())}")
@@ -171,6 +197,30 @@ _flag_state = {
     "resumed": False,
 }
 
+# Per-tenant in-memory flag state (normalized tenant -> same shape as _flag_state).
+# _flag_state above stays the legacy tenant's store so legacy code is unchanged.
+_flag_states = {}
+_flag_states_lock = Lock()
+
+
+def _flag_state_for(tenant_id):
+    """In-memory flag dict for a tenant (legacy tenants get the global _flag_state)."""
+    if _is_legacy_tenant(tenant_id):
+        return _flag_state
+    key = str(tenant_id)
+    with _flag_states_lock:
+        st = _flag_states.get(key)
+        if st is None:
+            st = {
+                "flagged": False,
+                "flag_type": None,
+                "flagged_at": None,
+                "cooldown_days": 7,
+                "resumed": False,
+            }
+            _flag_states[key] = st
+        return st
+
 _job_state = {
     "running": False,
     "total": 0,
@@ -229,6 +279,11 @@ def _get_clawbuildr_db():
             followup_note TEXT
         )
     """)
+    # Per-tenant scoping migration (legacy rows read as '' via the default)
+    try:
+        db.execute("ALTER TABLE linkedin_outreach ADD COLUMN tenant_id TEXT DEFAULT ''")
+    except Exception:
+        pass
     db.execute("""
         CREATE TABLE IF NOT EXISTS linkedin_followups (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -268,6 +323,20 @@ def _get_clawbuildr_db():
             last_manual_resume TEXT
         )
     """)
+    # Per-tenant warming state (non-legacy tenants). Legacy keeps row id=1 above.
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS warming_state_tenant (
+            tenant_id TEXT PRIMARY KEY,
+            account_created_at TEXT,
+            warmed_at TEXT,
+            paused INTEGER DEFAULT 0,
+            pause_reason TEXT,
+            paused_at TEXT,
+            flag_type TEXT,
+            flag_detected_at TEXT,
+            last_manual_resume TEXT
+        )
+    """)
     # Message send log (separate from connection requests)
     db.execute("""
         CREATE TABLE IF NOT EXISTS linkedin_messages (
@@ -288,24 +357,60 @@ def _get_clawbuildr_db():
             viewed_at TEXT DEFAULT (datetime('now'))
         )
     """)
+    # Per-tenant scoping for message/view logs (after their CREATEs above)
+    for _t in ("linkedin_messages", "linkedin_profile_views"):
+        try:
+            db.execute(f"ALTER TABLE {_t} ADD COLUMN tenant_id TEXT DEFAULT ''")
+        except Exception:
+            pass
     db.commit()
     return db
 
 
 # ---------- Safe-Sending: Warming Logic ----------
 
-def _get_warming_state(db=None):
-    """Get the warming state. Creates a default row if none exists."""
+def _get_warming_state(db=None, tenant_id=None):
+    """Get the warming state. Creates a default row if none exists.
+    Legacy tenants use the original single-row warming_state table (id=1);
+    other tenants get their own row in warming_state_tenant.
+    """
     own_db = db is None
     if own_db:
         db = _get_clawbuildr_db()
+    legacy = _is_legacy_tenant(tenant_id)
     try:
-        row = db.execute("SELECT * FROM warming_state WHERE id = 1").fetchone()
+        if legacy:
+            row = db.execute("SELECT * FROM warming_state WHERE id = 1").fetchone()
+            if not row:
+                now = datetime.now().isoformat()
+                db.execute(
+                    "INSERT INTO warming_state (id, account_created_at) VALUES (1, ?)",
+                    (now,)
+                )
+                db.commit()
+                return {
+                    "account_created_at": now,
+                    "warmed_at": None,
+                    "paused": 0,
+                    "pause_reason": None,
+                    "flag_type": None,
+                }
+            return {
+                "account_created_at": row[1],
+                "warmed_at": row[2],
+                "paused": row[3],
+                "pause_reason": row[4],
+                "flag_type": row[7] if len(row) > 7 else None,
+            }
+        row = db.execute(
+            "SELECT * FROM warming_state_tenant WHERE tenant_id = ?",
+            (str(tenant_id),),
+        ).fetchone()
         if not row:
             now = datetime.now().isoformat()
             db.execute(
-                "INSERT INTO warming_state (id, account_created_at) VALUES (1, ?)",
-                (now,)
+                "INSERT INTO warming_state_tenant (tenant_id, account_created_at) VALUES (?, ?)",
+                (str(tenant_id), now),
             )
             db.commit()
             return {
@@ -314,24 +419,30 @@ def _get_warming_state(db=None):
                 "paused": 0,
                 "pause_reason": None,
                 "flag_type": None,
+                "flag_detected_at": None,
             }
+        # cols: 0 tenant_id, 1 account_created_at, 2 warmed_at, 3 paused,
+        #       4 pause_reason, 5 paused_at, 6 flag_type, 7 flag_detected_at,
+        #       8 last_manual_resume
         return {
             "account_created_at": row[1],
             "warmed_at": row[2],
             "paused": row[3],
             "pause_reason": row[4],
-            "flag_type": row[7] if len(row) > 7 else None,
+            "paused_at": row[5],
+            "flag_type": row[6],
+            "flag_detected_at": row[7],
         }
     finally:
         if own_db:
             db.close()
 
 
-def _get_warming_multiplier():
+def _get_warming_multiplier(tenant_id=None):
     """Calculate the current daily limit multiplier based on account age.
     Returns a value between 0.10 and 1.00.
     """
-    state = _get_warming_state()
+    state = _get_warming_state(tenant_id=tenant_id)
     created = state.get("account_created_at")
     if not created:
         return 1.0  # No warming data = assume mature account
@@ -349,13 +460,13 @@ def _get_warming_multiplier():
     return 1.0
 
 
-def _get_effective_daily_limit():
+def _get_effective_daily_limit(tenant_id=None):
     """Get the effective daily connection limit after warming + recovery multiplier."""
     base = DAILY_LIMIT
-    multiplier = _get_warming_multiplier()
+    multiplier = _get_warming_multiplier(tenant_id=tenant_id)
 
     # Recovery mode: if account was flagged recently, keep limits very low
-    state = _get_warming_state()
+    state = _get_warming_state(tenant_id=tenant_id)
     flag_type = state.get("flag_type")
     flag_at = state.get("flag_detected_at")
     if flag_type and flag_at:
@@ -376,13 +487,14 @@ def _get_effective_daily_limit():
     return effective, multiplier
 
 
-def _is_flagged():
+def _is_flagged(tenant_id=None):
     """Check if the account is currently flagged/paused."""
-    state = _get_warming_state()
+    state = _get_warming_state(tenant_id=tenant_id)
     if state.get("paused"):
         return True, state.get("pause_reason", "unknown")
-    if _flag_state.get("flagged"):
-        return True, _flag_state.get("flag_type", "unknown")
+    mem = _flag_state_for(tenant_id)
+    if mem.get("flagged"):
+        return True, mem.get("flag_type", "unknown")
 
     # Also enforce 24h hard pause after recent flag even if paused=0
     flag_type = state.get("flag_type")
@@ -398,29 +510,37 @@ def _is_flagged():
     return False, None
 
 
-def _set_flagged(flag_type, reason=""):
+def _set_flagged(flag_type, reason="", tenant_id=None):
     """Mark the account as flagged. All outreach stops immediately."""
-    global _flag_state
-    _flag_state["flagged"] = True
-    _flag_state["flag_type"] = flag_type
-    _flag_state["flagged_at"] = datetime.now().isoformat()
+    mem = _flag_state_for(tenant_id)
+    mem["flagged"] = True
+    mem["flag_type"] = flag_type
+    mem["flagged_at"] = datetime.now().isoformat()
 
     db = _get_clawbuildr_db()
     now = datetime.now().isoformat()
-    db.execute("""
-        UPDATE warming_state SET paused = 1, pause_reason = ?, paused_at = ?, flag_type = ?, flag_detected_at = ?
-        WHERE id = 1
-    """, (reason or flag_type, now, flag_type, now))
+    if _is_legacy_tenant(tenant_id):
+        db.execute("""
+            UPDATE warming_state SET paused = 1, pause_reason = ?, paused_at = ?, flag_type = ?, flag_detected_at = ?
+            WHERE id = 1
+        """, (reason or flag_type, now, flag_type, now))
+    else:
+        db.execute("""
+            UPDATE warming_state_tenant
+            SET paused = 1, pause_reason = ?, paused_at = ?, flag_type = ?, flag_detected_at = ?
+            WHERE tenant_id = ?
+        """, (reason or flag_type, now, flag_type, now, str(tenant_id)))
     db.commit()
     db.close()
-    _log({"type": "error", "message": f"ACCOUNT FLAGGED: {flag_type} — {reason}. All outreach paused."})
+    scope = "legacy" if _is_legacy_tenant(tenant_id) else f"tenant {tenant_id}"
+    _log({"type": "error", "message": f"ACCOUNT FLAGGED ({scope}): {flag_type} — {reason}. All outreach paused."})
 
 
-def _check_cooldown_elapsed():
+def _check_cooldown_elapsed(tenant_id=None):
     """Check if the 7-day cooldown has passed since flagging.
     Returns True if cooldown is complete and account is eligible for manual resume.
     """
-    state = _get_warming_state()
+    state = _get_warming_state(tenant_id=tenant_id)
     if not state.get("paused"):
         return False
 
@@ -430,28 +550,34 @@ def _check_cooldown_elapsed():
 
     try:
         paused_dt = datetime.fromisoformat(paused_at)
-        cooldown_end = paused_dt + timedelta(days=_flag_state.get("cooldown_days", 7))
+        cooldown_end = paused_dt + timedelta(days=_flag_state_for(tenant_id).get("cooldown_days", 7))
         return datetime.now() >= cooldown_end
     except (ValueError, TypeError):
         return False
 
 
-def _manual_resume():
+def _manual_resume(tenant_id=None):
     """Manual confirmation to resume after cooldown. Re-warms at 10%."""
-    if not _check_cooldown_elapsed():
+    if not _check_cooldown_elapsed(tenant_id=tenant_id):
         _log({"type": "warning", "message": "Cooldown not yet elapsed. Cannot resume."})
         return False
 
-    global _flag_state
-    _flag_state["flagged"] = False
-    _flag_state["flag_type"] = None
-    _flag_state["resumed"] = True
+    mem = _flag_state_for(tenant_id)
+    mem["flagged"] = False
+    mem["flag_type"] = None
+    mem["resumed"] = True
 
     db = _get_clawbuildr_db()
     now = datetime.now().isoformat()
-    db.execute("""
-        UPDATE warming_state SET paused = 0, pause_reason = NULL, last_manual_resume = ? WHERE id = 1
-    """, (now,))
+    if _is_legacy_tenant(tenant_id):
+        db.execute("""
+            UPDATE warming_state SET paused = 0, pause_reason = NULL, last_manual_resume = ? WHERE id = 1
+        """, (now,))
+    else:
+        db.execute("""
+            UPDATE warming_state_tenant SET paused = 0, pause_reason = NULL, last_manual_resume = ?
+            WHERE tenant_id = ?
+        """, (now, str(tenant_id)))
     db.commit()
     db.close()
 
@@ -515,20 +641,26 @@ def _randomized_delay(base_min=30, base_max=90):
     return base + offset
 
 
-def _get_daily_count():
-    """Count how many connection requests were sent today."""
+def _get_daily_count(tenant_id=None):
+    """Count how many connection requests were sent today (tenant-scoped)."""
     db = _get_clawbuildr_db()
     today = date.today().isoformat()
-    count = db.execute(
-        "SELECT COUNT(*) FROM linkedin_outreach WHERE outcome = 'SUCCESS' AND timestamp LIKE ?",
-        (today + "%",),
-    ).fetchone()[0]
+    if _is_legacy_tenant(tenant_id):
+        count = db.execute(
+            "SELECT COUNT(*) FROM linkedin_outreach WHERE outcome = 'SUCCESS' AND timestamp LIKE ? AND IFNULL(tenant_id,'') = ''",
+            (today + "%",),
+        ).fetchone()[0]
+    else:
+        count = db.execute(
+            "SELECT COUNT(*) FROM linkedin_outreach WHERE outcome = 'SUCCESS' AND timestamp LIKE ? AND IFNULL(tenant_id,'') = ?",
+            (today + "%", str(tenant_id)),
+        ).fetchone()[0]
     db.close()
     return count
 
 
-def _get_period_count():
-    """Count connections sent in the current time period."""
+def _get_period_count(tenant_id=None):
+    """Count connections sent in the current time period (tenant-scoped)."""
     from datetime import datetime
     now = datetime.now()
     hour = now.hour
@@ -550,28 +682,42 @@ def _get_period_count():
     today = date.today().isoformat()
     
     # Count connections in current period
-    count = db.execute(
-        """SELECT COUNT(*) FROM linkedin_outreach 
-           WHERE outcome = 'SUCCESS' 
-           AND timestamp LIKE ? 
-           AND CAST(strftime('%%H', timestamp) AS INTEGER) >= ? 
-           AND CAST(strftime('%%H', timestamp) AS INTEGER) < ?""",
-        (today + "%", 
-         8 if period == "morning" else (12 if period == "afternoon" else 17),
-         12 if period == "morning" else (17 if period == "afternoon" else 21))
-    ).fetchone()[0]
+    if _is_legacy_tenant(tenant_id):
+        count = db.execute(
+            """SELECT COUNT(*) FROM linkedin_outreach 
+               WHERE outcome = 'SUCCESS' 
+               AND timestamp LIKE ? 
+               AND IFNULL(tenant_id,'') = ''
+               AND CAST(strftime('%%H', timestamp) AS INTEGER) >= ? 
+               AND CAST(strftime('%%H', timestamp) AS INTEGER) < ?""",
+            (today + "%", 
+             8 if period == "morning" else (12 if period == "afternoon" else 17),
+             12 if period == "morning" else (17 if period == "afternoon" else 21))
+        ).fetchone()[0]
+    else:
+        count = db.execute(
+            """SELECT COUNT(*) FROM linkedin_outreach 
+               WHERE outcome = 'SUCCESS' 
+               AND timestamp LIKE ? 
+               AND IFNULL(tenant_id,'') = ?
+               AND CAST(strftime('%%H', timestamp) AS INTEGER) >= ? 
+               AND CAST(strftime('%%H', timestamp) AS INTEGER) < ?""",
+            (today + "%", str(tenant_id),
+             8 if period == "morning" else (12 if period == "afternoon" else 17),
+             12 if period == "morning" else (17 if period == "afternoon" else 21))
+        ).fetchone()[0]
     
     db.close()
     return count, limit, period
 
 
-def can_send_connection():
+def can_send_connection(tenant_id=None):
     """Check if we can send a connection in the current time period.
     Applies: flag check, active hours, warming multiplier, period caps,
     and a minimum delay between sends to spread 20 requests over 24h.
     """
     # Check if account is flagged/paused
-    flagged, flag_reason = _is_flagged()
+    flagged, flag_reason = _is_flagged(tenant_id=tenant_id)
     if flagged:
         return False, f"flagged_{flag_reason}"
 
@@ -581,13 +727,13 @@ def can_send_connection():
         return False, reason
 
     # Check effective daily limit (with warming multiplier)
-    effective_limit, multiplier = _get_effective_daily_limit()
-    daily_count = _get_daily_count()
+    effective_limit, multiplier = _get_effective_daily_limit(tenant_id=tenant_id)
+    daily_count = _get_daily_count(tenant_id=tenant_id)
     if daily_count >= effective_limit:
         return False, f"daily_limit_reached ({daily_count}/{effective_limit}, warmup={multiplier:.0%})"
 
     # Check period caps (also scaled by warming)
-    period_count, period_limit, period = _get_period_count()
+    period_count, period_limit, period = _get_period_count(tenant_id=tenant_id)
     effective_period_limit = max(1, int(period_limit * multiplier))
     if period_count >= effective_period_limit:
         return False, f"{period}_limit_reached ({period_count}/{effective_period_limit})"
@@ -632,7 +778,7 @@ def _is_already_contacted(first_name, last_name, company, profile_url=""):
     return False
 
 
-def _save_result(contact_id, first_name, last_name, company, profile_url, note, outcome, proof=None):
+def _save_result(contact_id, first_name, last_name, company, profile_url, note, outcome, proof=None, tenant_id=None):
     db = _get_clawbuildr_db()
     # Add proof column if it doesn't exist (migration)
     try:
@@ -640,8 +786,8 @@ def _save_result(contact_id, first_name, last_name, company, profile_url, note, 
     except Exception:
         pass
     db.execute(
-        "INSERT INTO linkedin_outreach (contact_id, first_name, last_name, company, profile_url, note, outcome, timestamp, proof) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (contact_id, first_name, last_name, company, profile_url, note, outcome, datetime.now().isoformat(), proof),
+        "INSERT INTO linkedin_outreach (contact_id, first_name, last_name, company, profile_url, note, outcome, timestamp, proof, tenant_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (contact_id, first_name, last_name, company, profile_url, note, outcome, datetime.now().isoformat(), proof, _normalize_tenant_id(tenant_id)),
     )
     db.commit()
     db.close()
@@ -706,15 +852,17 @@ def _prepare_firefox_profile():
     return FIREFOX_PROFILE_COPY
 
 
-def _inject_cookies_into_context(context):
+def _inject_cookies_into_context(context, tenant_id=None):
     """Load LinkedIn cookies from the JSON file and inject them into a browser context.
     This is used as a fallback when the Firefox profile copy has stale session data.
+    Non-legacy tenants load their own per-tenant cookie file.
     """
-    if not os.path.exists(COOKIES_PATH):
+    path = tenant_cookies_path(tenant_id)
+    if not os.path.exists(path):
         _log({"type": "info", "message": "No cookies file found, relying on Firefox profile copy."})
         return False
     try:
-        with open(COOKIES_PATH, 'r') as f:
+        with open(path, 'r') as f:
             cookies = json.load(f)
         if not cookies:
             _log({"type": "warning", "message": "Cookies file is empty."})
@@ -733,8 +881,9 @@ def _inject_cookies_into_context(context):
         return False
 
 
-def _save_cookies_from_context(context):
-    """Save cookies from a Playwright browser context for backup."""
+def _save_cookies_from_context(context, tenant_id=None):
+    """Save cookies from a Playwright browser context (per-tenant file)."""
+    path = tenant_cookies_path(tenant_id)
     try:
         cookies = context.cookies("https://www.linkedin.com")
         cookie_list = []
@@ -745,10 +894,108 @@ def _save_cookies_from_context(context):
                 "sameSite": c.get("sameSite", "Lax"), "expires": c.get("expires", -1),
             })
         os.makedirs(DATA_DIR, exist_ok=True)
-        with open(COOKIES_PATH, "w") as f:
+        with open(path, "w") as f:
             json.dump(cookie_list, f, indent=2)
     except Exception:
         pass
+
+
+def _apply_tenant_session_selenium(driver, tenant_id=None):
+    """Ensure the Selenium Firefox uses the TENANT's LinkedIn session.
+
+    The Firefox profile copy carries the machine owner's LinkedIn login, so for
+    non-legacy tenants we swap the .linkedin.com cookies for the tenant's own
+    (captured via QR login) before any outreach navigation happens.
+    Returns True if a tenant session was applied (or legacy/no-op).
+    """
+    if _is_legacy_tenant(tenant_id):
+        return True
+    path = tenant_cookies_path(tenant_id)
+    if not os.path.exists(path):
+        _log({"type": "error", "message": f"No LinkedIn session for tenant {tenant_id}. Run QR login first."})
+        return False
+    try:
+        with open(path) as f:
+            cookies = json.load(f)
+        has_session = any(c.get("name") == "li_at" for c in cookies)
+        if not has_session:
+            _log({"type": "error", "message": f"Tenant {tenant_id} cookie file has no li_at. Re-run QR login."})
+            return False
+    except Exception as e:
+        _log({"type": "error", "message": f"Tenant cookie file unreadable: {str(e)[:80]}"})
+        return False
+
+    try:
+        driver.get("https://www.linkedin.com/")
+    except Exception:
+        pass
+    # Drop whatever session the profile copy carried
+    try:
+        driver.delete_all_cookies()
+    except Exception:
+        pass
+    applied = 0
+    for c in cookies:
+        try:
+            sc = c.get("sameSite", "Lax")
+            if sc not in ("Strict", "Lax", "None"):
+                sc = "Lax"
+            cookie = {
+                "name": c["name"],
+                "value": c["value"],
+                "domain": c.get("domain", ".linkedin.com"),
+                "path": c.get("path", "/"),
+                "secure": bool(c.get("secure", True)),
+                "httpOnly": bool(c.get("httpOnly", False)),
+                "sameSite": sc,
+            }
+            exp = c.get("expires", -1)
+            if isinstance(exp, (int, float)) and exp and exp > 0:
+                cookie["expiry"] = int(exp)
+            driver.add_cookie(cookie)
+            applied += 1
+        except Exception:
+            continue
+    _log({"type": "info", "message": f"Tenant {tenant_id}: injected {applied} cookies into Firefox session."})
+    try:
+        driver.get("https://www.linkedin.com/feed/")
+    except Exception:
+        pass
+    return True
+
+
+# Which tenant's cookies are currently loaded in the persistent Firefox ('' = legacy/profile)
+_session_tenant = {"current": ""}
+_session_tenant_lock = threading.Lock()
+
+
+def _pre_session_switch(tenant_id):
+    """Call BEFORE ensure_ready(): switching back to legacy after a tenant
+    session means the running browser has replaced LinkedIn cookies, so
+    restart it to restore the pristine profile copy."""
+    want = _normalize_tenant_id(tenant_id)
+    with _session_tenant_lock:
+        if want == "" and _session_tenant["current"] != "":
+            try:
+                _persistent_firefox.close()
+            except Exception:
+                pass
+            _session_tenant["current"] = ""
+
+
+def _apply_tenant_session_if_needed(driver, tenant_id):
+    """Call AFTER ensure_ready(): inject the tenant's cookies when the loaded
+    session does not match. Returns False when the tenant has no usable session."""
+    want = _normalize_tenant_id(tenant_id)
+    with _session_tenant_lock:
+        if want == _session_tenant["current"]:
+            return True
+        if want == "":
+            return True  # legacy profile session
+        ok = _apply_tenant_session_selenium(driver, tenant_id)
+        if ok:
+            _session_tenant["current"] = want
+        return ok
 
 
 # ---------- Modal purging (continuous) ----------
@@ -951,22 +1198,22 @@ def _random_sleep(min_s=2, max_s=5):
     time.sleep(random.uniform(min_s, max_s))
 
 
-def _detect_auth_wall(page):
+def _detect_auth_wall(page, tenant_id=None):
     """Check if we hit a login/auth wall, captcha, unusual activity, or rate limit.
     Returns a string describing the issue, or None if OK.
     Also triggers auto-pause via _set_flagged() for critical flags.
     """
     url = page.url
     if "login" in url or "authwall" in url or "signin" in url or "checkpoint" in url:
-        _set_flagged("auth_wall", f"Redirected to auth wall: {url[:100]}")
+        _set_flagged("auth_wall", f"Redirected to auth wall: {url[:100]}", tenant_id=tenant_id)
         return "auth_wall"
     if "captcha" in url or "challenge" in url:
-        _set_flagged("captcha", f"Captcha/challenge page detected: {url[:100]}")
+        _set_flagged("captcha", f"Captcha/challenge page detected: {url[:100]}", tenant_id=tenant_id)
         return "captcha"
     try:
         has_login_form = page.evaluate("""() => !!document.querySelector('input[name="session_key"], .sign-in-form__submit')""")
         if has_login_form:
-            _set_flagged("auth_wall", "Login form detected on page")
+            _set_flagged("auth_wall", "Login form detected on page", tenant_id=tenant_id)
             return "auth_wall"
     except Exception:
         pass
@@ -983,7 +1230,7 @@ def _detect_auth_wall(page):
         ]
         for kw in unusual_keywords:
             if kw in body_text:
-                _set_flagged("unusual_activity", f"Unusual activity warning detected: '{kw}'")
+                _set_flagged("unusual_activity", f"Unusual activity warning detected: '{kw}'", tenant_id=tenant_id)
                 return "unusual_activity"
 
         # Connection limit warning
@@ -1899,34 +2146,49 @@ def _search_and_find_profile(page, first_name, last_name, company):
     return None, "not_found"
 
 
+def _linkedin_search_delay_remaining() -> float:
+    """Seconds until the next LinkedIn search is allowed (no sleep)."""
+    with _search_lock:
+        elapsed = time.time() - _search_last_time
+        return max(0.0, SEARCH_MIN_DELAY_SECONDS - elapsed)
+
+
 def find_decision_maker_on_linkedin(company_name, domain=""):
     """Search LinkedIn for a decision-maker at a specific company.
     Uses the user's real Firefox browser (Selenium) to search LinkedIn.
     Returns dict: {"linkedin_url": str, "first_name": str, "last_name": str, "title": str} or None.
+
+    Never blocks for the multi-hour rate-limit window: if a long delay is
+    required, returns None immediately so callers are not stuck holding Firefox.
     """
     try:
+        if not _can_linkedin_search(domain):
+            _log({"type": "warning", "message": "LinkedIn search budget exhausted. Skipping decision-maker search."})
+            return None
+        delay = _linkedin_search_delay_remaining()
+        if delay > 5:
+            _log({"type": "info", "message": f"LinkedIn search delay {delay:.0f}s remaining — skipping (no long sleep in sourcing)."})
+            return None
+
         with get_firefox_driver() as (driver, page):
             _log({"type": "info", "message": f"Searching LinkedIn for decision-maker at {company_name}"})
 
-            # Search LinkedIn for people at this company with leadership titles
-            search_queries = [
-                f"{company_name} eigenaar",
-                f"{company_name} directeur",
-                f"{company_name} founder",
-                f"{company_name} CEO",
-                f"{company_name} owner",
-                f"{company_name}",
-            ]
+            # One company = one query max during sourcing (rate-limit friendly)
+            search_queries = [f"{company_name} directeur"]
 
             for query in search_queries:
                 try:
                     if not _can_linkedin_search(domain):
                         _log({"type": "warning", "message": "LinkedIn search budget exhausted. Stopping decision-maker search."})
                         return None
+                    delay = _linkedin_search_delay_remaining()
+                    if delay > 5:
+                        _log({"type": "info", "message": f"LinkedIn search delay {delay:.0f}s remaining. Stopping."})
+                        return None
                     _enforce_linkedin_search_delay()
 
                     search_url = f"https://www.linkedin.com/search/results/people/?keywords={query.replace(' ', '%20')}"
-                    page.goto(search_url, wait_until="domcontentloaded", timeout=120000)
+                    page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
                     _random_sleep(4, 7)
                     _human_profile_visit(page)
 
@@ -2350,6 +2612,9 @@ class _PersistentFirefox:
     _instance = None
     _lock = threading.Lock()
     _launch_lock = threading.Lock()
+    # Serializes full Selenium operations (enter → work → exit) across threads.
+    # Prevents concurrent health-check quit/relaunch that orphans Firefox windows.
+    _op_lock = threading.RLock()
 
     def __new__(cls):
         with cls._lock:
@@ -2399,8 +2664,27 @@ class _PersistentFirefox:
                 raise
             return self.driver, self.page
 
+    def __enter__(self):
+        # Hold the op lock for the entire Selenium session so only one
+        # thread drives Firefox at a time (quit/relaunch cannot race).
+        self._op_lock.acquire()
+        try:
+            self.ensure_ready()
+            return self.driver, self.page
+        except Exception:
+            self._op_lock.release()
+            raise
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Do NOT close on context exit — keep alive for reuse
+        try:
+            self._op_lock.release()
+        except RuntimeError:
+            pass
+        return False
+
     def close(self):
-        """Quit the browser if running."""
+        """Quit the browser if running; force-kill leftover profile processes."""
         if self.driver:
             try:
                 self.driver.quit()
@@ -2409,14 +2693,24 @@ class _PersistentFirefox:
             self.driver = None
             self.page = None
             self._ready = False
+            self._kill_orphan_firefox()
 
-    def __enter__(self):
-        self.ensure_ready()
-        return self.driver, self.page
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        # Do NOT close on context exit — keep alive for reuse
-        return False
+    @staticmethod
+    def _kill_orphan_firefox():
+        """Kill Firefox/geckodriver processes still bound to our profile copy."""
+        import subprocess
+        needle = os.path.basename(FIREFOX_PROFILE_COPY)
+        if not needle:
+            return
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{needle}*' }} "
+                 f"| ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}"],
+                capture_output=True, timeout=15
+            )
+        except Exception:
+            pass
 
 
 # Module-level singleton
@@ -2433,14 +2727,14 @@ def get_firefox_driver():
     return _persistent_firefox
 
 
-def search_and_connect(first_name, last_name, company, email_body, contact_id="", profile_url="", research_result=None, opportunity_mapping=None):
+def search_and_connect(first_name, last_name, company, email_body, contact_id="", profile_url="", research_result=None, opportunity_mapping=None, tenant_id=None):
     """Automatic LinkedIn outreach: send connection request with note.
 
     If profile_url is provided, skips search and goes directly to the profile.
     Returns dict: {outcome, profile_url, note, name}
     """
     # Check if account is flagged — STOP immediately
-    flagged, flag_reason = _is_flagged()
+    flagged, flag_reason = _is_flagged(tenant_id=tenant_id)
     if flagged:
         _log({"type": "error", "message": f"Account flagged ({flag_reason}). Cannot send connections."})
         return {"outcome": "FLAGGED", "profile_url": "", "note": "", "name": f"{first_name} {last_name}", "error": flag_reason}
@@ -2452,9 +2746,9 @@ def search_and_connect(first_name, last_name, company, email_body, contact_id=""
         return {"outcome": "TIME_LIMITED", "profile_url": "", "note": "", "name": f"{first_name} {last_name}", "error": reason}
 
     # Check time-based limit (spread connections throughout the day, with warming)
-    can_send, period_info = can_send_connection()
+    can_send, period_info = can_send_connection(tenant_id=tenant_id)
     if not can_send:
-        daily_count = _get_daily_count()
+        daily_count = _get_daily_count(tenant_id=tenant_id)
         _log({"type": "warning", "message": f"Cannot send connection now ({period_info}). Daily: {daily_count}. Skipping."})
         return {"outcome": "TIME_LIMITED", "profile_url": "", "note": "", "name": f"{first_name} {last_name}", "error": period_info}
 
@@ -2477,12 +2771,17 @@ def search_and_connect(first_name, last_name, company, email_body, contact_id=""
 
     # Launch real Firefox with user's profile via Selenium (persistent singleton)
     _log({"type": "info", "message": "Connecting to persistent Firefox instance..."})
+    _pre_session_switch(tenant_id)
     try:
         driver, page = _persistent_firefox.ensure_ready()
         _log({"type": "info", "message": "Firefox ready (persistent singleton)"})
     except Exception as e:
         _log({"type": "error", "message": f"Failed to launch Firefox: {e}"})
         return {"outcome": "ERROR", "profile_url": "", "note": note, "name": f"{first_name} {last_name}", "error": str(e)[:120]}
+
+    # Make sure the browser carries THIS tenant's LinkedIn session
+    if not _apply_tenant_session_if_needed(driver, tenant_id):
+        return {"outcome": "ERROR", "profile_url": "", "note": note, "name": f"{first_name} {last_name}", "error": "no tenant session (run QR login)"}
 
     with _state_lock:
         _job_state["current_name"] = f"{first_name} {last_name}"
@@ -2497,13 +2796,13 @@ def search_and_connect(first_name, last_name, company, email_body, contact_id=""
 
             if error == "auth_wall" or error == "captcha":
                 outcome = error.upper()
-                _save_result(contact_id, first_name, last_name, company, "", note, outcome)
+                _save_result(contact_id, first_name, last_name, company, "", note, outcome, tenant_id=tenant_id)
                 return {"outcome": outcome, "profile_url": "", "note": note, "name": full_name, "error": error}
 
             if not profile_url:
                 outcome = "NOT_FOUND"
                 _log({"type": "warning", "message": f"No profile found for {first_name} {last_name} at {company}"})
-                _save_result(contact_id, first_name, last_name, company, "", note, outcome)
+                _save_result(contact_id, first_name, last_name, company, "", note, outcome, tenant_id=tenant_id)
                 return {"outcome": outcome, "profile_url": "", "note": note, "name": full_name}
         else:
             _log({"type": "info", "message": f"Using pre-stored LinkedIn URL: {profile_url}"})
@@ -2534,10 +2833,10 @@ def search_and_connect(first_name, last_name, company, email_body, contact_id=""
             _random_sleep(3, 5)
 
         # Check for auth wall after navigation
-        auth = _detect_auth_wall(page)
+        auth = _detect_auth_wall(page, tenant_id=tenant_id)
         if auth:
             outcome = auth.upper()
-            _save_result(contact_id, first_name, last_name, company, profile_url, note, outcome)
+            _save_result(contact_id, first_name, last_name, company, profile_url, note, outcome, tenant_id=tenant_id)
             return {"outcome": outcome, "profile_url": profile_url, "note": note, "name": full_name, "error": auth}
 
         # Human-like profile review before connecting: scroll, read, wander
@@ -2589,7 +2888,7 @@ def search_and_connect(first_name, last_name, company, email_body, contact_id=""
 
         # Save result with proof
         proof = _last_send_proof
-        _save_result(contact_id, first_name, last_name, company, profile_url, note, outcome, proof)
+        _save_result(contact_id, first_name, last_name, company, profile_url, note, outcome, proof, tenant_id=tenant_id)
         _log({"type": "info", "message": f"Outreach result for {full_name}: {outcome}"})
         if proof:
             _log({"type": "info", "message": f"Proof: {proof[:100]}"})
@@ -2606,7 +2905,7 @@ def search_and_connect(first_name, last_name, company, email_body, contact_id=""
 
     except Exception as e:
         _log({"type": "error", "message": f"LinkedIn outreach error: {str(e)[:80]}"})
-        _save_result(contact_id, first_name, last_name, company, profile_url, note, "ERROR")
+        _save_result(contact_id, first_name, last_name, company, profile_url, note, "ERROR", tenant_id=tenant_id)
         return {"outcome": "ERROR", "profile_url": profile_url, "note": note, "name": full_name, "error": str(e)[:120]}
 
 def is_valid_linkedin_name(first_name, last_name=""):
@@ -3018,9 +3317,9 @@ def _ts():
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
-def _send_followup_message(profile_url, first_name, company=""):
+def _send_followup_message(profile_url, first_name, company="", custom_body=None, tenant_id=None):
     """Send a follow-up message to someone who accepted the connection.
-    
+
     Strategy (proven working):
     1. Navigate to profile to detect language
     2. Go to /messaging/compose/ (full-page compose, NOT popup modal)
@@ -3037,7 +3336,11 @@ def _send_followup_message(profile_url, first_name, company=""):
         from selenium.webdriver.common.keys import Keys
         from selenium.webdriver.common.action_chains import ActionChains
 
+        _pre_session_switch(tenant_id)
         driver, page = _persistent_firefox.ensure_ready()
+        if not _apply_tenant_session_if_needed(driver, tenant_id):
+            _log({"type": "error", "message": f"No LinkedIn session for tenant {tenant_id}. Run QR login first."})
+            return "NO_SESSION"
 
         # Step 1: Visit profile to detect language
         page.goto(profile_url, wait_until="domcontentloaded", timeout=120000)
@@ -3058,12 +3361,12 @@ def _send_followup_message(profile_url, first_name, company=""):
                 pass
             time.sleep(2)
 
-        auth = _detect_auth_wall(page)
+        auth = _detect_auth_wall(page, tenant_id=tenant_id)
         if auth:
             return "AUTH_WALL"
 
         language = _detect_profile_language(page)
-        followup_note = generate_followup_note(first_name, company, language=language)
+        followup_note = (custom_body or "").strip() or generate_followup_note(first_name, company, language=language)
         _log({"type": "info", "message": f"Message ({language}) for {first_name}: {followup_note[:80]}..."})
 
         # Step 2: Navigate to full-page compose
@@ -3280,7 +3583,38 @@ def generate_followup_note(first_name, company="", language="dutch"):
 
 
 def send_pending_followups():
-    """Send follow-ups to all accepted connections that haven't received one yet."""
+    """Send follow-ups to all accepted connections that haven't received one yet.
+
+    Skipped when an active sequence graph owns outreach (avoids double DMs).
+    """
+    try:
+        import sqlite3 as _sq
+        from pathlib import Path as _P
+        _db_path = _P(__file__).resolve().parent.parent / "data" / "clawbuildr.db"
+        if _db_path.exists():
+            _c = _sq.connect(str(_db_path), timeout=5.0)
+            try:
+                _row = _c.execute("SELECT 1 FROM sequence_graphs WHERE active = 1 LIMIT 1").fetchone()
+                if _row:
+                    _c.close()
+                    return {"sent": 0, "skipped": "active_sequence_graph"}
+            finally:
+                try:
+                    _c.close()
+                except Exception:
+                    pass
+    except Exception as _graph_chk_err:
+        # Fail closed: unreadable graph state must not fall through to sends
+        try:
+            import logging as _lg
+            _lg.getLogger("ClawBuildr.LinkedIn").warning(
+                "[LinkedIn] sequence graph check failed (%s) — skipping follow-ups",
+                _graph_chk_err,
+            )
+        except Exception:
+            pass
+        return {"sent": 0, "skipped": "graph_check_failed"}
+
     db = _get_clawbuildr_db()
     rows = db.execute("""
         SELECT id, profile_url, first_name, last_name, company 
@@ -3867,33 +4201,231 @@ def linkedin_login():
             context.close()
 
 
-def linkedin_login_status():
+def linkedin_login_status(tenant_id=None):
     """Check if valid LinkedIn session exists by checking cookies file.
     No browser launch needed — just reads the cookies file.
+    Legacy tenants check linkedin_cookies.json (+ live Firefox extraction);
+    other tenants only check their own per-tenant cookie file.
     """
-    # Try to extract fresh cookies from running Firefox (non-blocking)
-    try:
-        extract_firefox_cookies()
-    except Exception:
-        pass  # If Firefox isn't running or DB is locked, just check existing cookies
+    if _is_legacy_tenant(tenant_id):
+        # Try to extract fresh cookies from running Firefox (non-blocking)
+        try:
+            extract_firefox_cookies()
+        except Exception:
+            pass  # If Firefox isn't running or DB is locked, just check existing cookies
 
-    if not os.path.exists(COOKIES_PATH):
-        return {"logged_in": False, "message": "No cookies found. Open LinkedIn in Firefox."}
+    path = tenant_cookies_path(tenant_id)
+    if not os.path.exists(path):
+        if _is_legacy_tenant(tenant_id):
+            return {"logged_in": False, "message": "No cookies found. Open LinkedIn in Firefox."}
+        return {"logged_in": False, "message": f"No session for tenant {tenant_id}. Run QR login.", "tenant_id": str(tenant_id)}
 
     try:
-        with open(COOKIES_PATH) as f:
+        with open(path) as f:
             cookies = json.load(f)
         has_li_at = any(c.get("name") == "li_at" for c in cookies)
         has_liap = any(c.get("name") == "liap" for c in cookies)
         has_bscookie = any(c.get("name") == "bscookie" for c in cookies)
-        session_ok = has_li_at and (has_liap or has_bscookie)
+        # Legacy keeps its original strict rule; per-tenant QR sessions accept li_at
+        # (the QR worker only saves after li_at + left-/login both confirm login).
+        session_ok = (
+            (has_li_at and (has_liap or has_bscookie))
+            if _is_legacy_tenant(tenant_id)
+            else has_li_at
+        )
 
         if session_ok:
-            return {"logged_in": True, "message": "Connected to LinkedIn"}
+            return {"logged_in": True, "message": "Connected to LinkedIn", "tenant_id": _normalize_tenant_id(tenant_id)}
         else:
-            return {"logged_in": False, "message": "Session expired. Open LinkedIn in Firefox and refresh this page."}
+            if _is_legacy_tenant(tenant_id):
+                return {"logged_in": False, "message": "Session expired. Open LinkedIn in Firefox and refresh this page."}
+            return {"logged_in": False, "message": f"Session expired for tenant {tenant_id}. Run QR login again.", "tenant_id": str(tenant_id)}
     except Exception:
         return {"logged_in": False, "message": "Could not read cookies."}
+
+
+# ---------- QR login (per-tenant, no local browser window needed) ----------
+# A background headless Playwright task opens linkedin.com/login, screenshots the
+# QR code for the dashboard to display, waits for the scan, then saves the
+# resulting cookies to the tenant's own cookie file.
+
+_QR_WAIT_SECONDS = 180
+_QR_REFRESH_SECONDS = 25
+_qr_tasks = {}          # tenant_id -> True while a QR task is running
+_qr_tasks_lock = Lock()
+
+
+def _qr_paths(tenant_id):
+    safe = _SAFE_TENANT_RE.sub("_", str(tenant_id))
+    return (
+        os.path.join(DATA_DIR, f"linkedin_qr_{safe}.png"),
+        os.path.join(DATA_DIR, f"linkedin_qr_state_{safe}.json"),
+    )
+
+
+def _qr_set_state(tenant_id, status, message=""):
+    _, state_path = _qr_paths(tenant_id)
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(state_path, "w") as f:
+            json.dump({
+                "status": status,
+                "message": message,
+                "updated_at": datetime.now().isoformat(),
+            }, f)
+    except Exception:
+        pass
+
+
+def linkedin_qr_status(tenant_id):
+    """Status of the QR login flow for a tenant: idle/waiting/success/expired/error."""
+    if _is_legacy_tenant(tenant_id):
+        return {"status": "error", "message": "QR login is for non-legacy tenants only"}
+    _, state_path = _qr_paths(tenant_id)
+    if not os.path.exists(state_path):
+        return {"status": "idle", "message": "No QR login started"}
+    try:
+        with open(state_path) as f:
+            st = json.load(f)
+        st.setdefault("status", "idle")
+        # A task that vanished (dashboard restart) is no longer waiting
+        with _qr_tasks_lock:
+            running = _qr_tasks.get(str(tenant_id), False)
+        if st.get("status") == "waiting" and not running:
+            st["status"] = "idle"
+            st["message"] = "QR task not running (restart?) — start again"
+        return st
+    except Exception as e:
+        return {"status": "error", "message": str(e)[:100]}
+
+
+def linkedin_qr_image_path(tenant_id):
+    img_path, _ = _qr_paths(tenant_id)
+    return img_path if os.path.exists(img_path) else None
+
+
+def linkedin_qr_start(tenant_id):
+    """Start the QR login flow for a non-legacy tenant (background thread)."""
+    if _is_legacy_tenant(tenant_id):
+        return {"status": "error", "message": "QR login is for non-legacy tenants only"}
+    tid = str(tenant_id)
+    with _qr_tasks_lock:
+        if _qr_tasks.get(tid):
+            return {"status": "busy", "message": "QR login already running for this tenant"}
+        _qr_tasks[tid] = True
+    t = threading.Thread(target=_qr_worker, args=(tenant_id,), daemon=True)
+    t.start()
+    return {"status": "started", "message": "QR login started — fetch the QR image", "tenant_id": tid}
+
+
+def linkedin_qr_stop(tenant_id):
+    """Mark a QR task as no longer wanted (worker checks the flag)."""
+    tid = str(tenant_id)
+    with _qr_tasks_lock:
+        _qr_tasks[tid] = False
+    return {"status": "stopped"}
+
+
+def _qr_worker(tenant_id):
+    """Headless browser: show QR -> wait for scan -> save tenant cookies."""
+    tid = str(tenant_id)
+    context = None
+    browser = None
+    try:
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            _qr_set_state(tenant_id, "error", "playwright not installed")
+            return
+
+        _qr_set_state(tenant_id, "waiting", "Waiting for QR scan (max 3 min)")
+        img_path, _ = _qr_paths(tenant_id)
+
+        with sync_playwright() as pw:
+            browser = pw.firefox.launch(headless=True)
+            context = browser.new_context(viewport={"width": 1280, "height": 900})
+            page = context.new_page()
+            page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(3000)
+
+            # Make sure the QR tab is active (LinkedIn shows a form by default
+            # on some variants — click the "Sign in with QR code" option).
+            try:
+                qr_tab = page.locator("button, a, div[role='tab']").filter(
+                    has_text=re.compile(r"QR code", re.I)
+                ).first
+                if qr_tab.count() > 0:
+                    qr_tab.click(timeout=5000)
+                    page.wait_for_timeout(1500)
+            except Exception:
+                pass
+
+            def snap_qr():
+                selectors = [
+                    "img[alt*='QR' i]",
+                    "img[src*='data:image']",
+                    ".qr-code-img",
+                    "#qr-code img",
+                    ".qr-code",
+                    "[data-test-id='qr-code']",
+                ]
+                for sel in selectors:
+                    try:
+                        loc = page.locator(sel).first
+                        if loc.count() > 0 and loc.is_visible():
+                            loc.screenshot(path=img_path)
+                            return True
+                    except Exception:
+                        continue
+                # Fallback: full login page (QR still visible on it)
+                try:
+                    page.screenshot(path=img_path)
+                    return True
+                except Exception:
+                    return False
+
+            if not snap_qr():
+                _qr_set_state(tenant_id, "error", "Could not capture QR code")
+                return
+
+            deadline = time_mod.time() + _QR_WAIT_SECONDS
+            last_refresh = time_mod.time()
+            while time_mod.time() < deadline:
+                with _qr_tasks_lock:
+                    if not _qr_tasks.get(tid, False):
+                        _qr_set_state(tenant_id, "idle", "QR login cancelled")
+                        return
+                page.wait_for_timeout(3000)
+                if time_mod.time() - last_refresh >= _QR_REFRESH_SECONDS:
+                    snap_qr()
+                    last_refresh = time_mod.time()
+                # Success = LinkedIn session cookie appeared
+                try:
+                    cookies = context.cookies("https://www.linkedin.com")
+                    if any(c["name"] == "li_at" for c in cookies) and "login" not in page.url:
+                        _save_cookies_from_context(context, tenant_id)
+                        _qr_set_state(tenant_id, "success", "LinkedIn connected")
+                        _log({"type": "info", "message": f"QR login succeeded for tenant {tid}."})
+                        return
+                except Exception:
+                    continue
+
+            _qr_set_state(tenant_id, "expired", "QR expired — start again")
+    except Exception as e:
+        _qr_set_state(tenant_id, "error", str(e)[:150])
+    finally:
+        try:
+            if context is not None:
+                context.close()
+        except Exception:
+            pass
+        try:
+            if browser is not None:
+                browser.close()
+        except Exception:
+            pass
+        with _qr_tasks_lock:
+            _qr_tasks[tid] = False
 
 
 def extract_firefox_cookies():
@@ -4683,39 +5215,51 @@ def generate_founderflow_post():
 
 # ---------- Safe-Sending: Message & Profile-View Tracking ----------
 
-def _get_message_count_today():
-    """Count messages sent today."""
+def _get_message_count_today(tenant_id=None):
+    """Count messages sent today (tenant-scoped)."""
     db = _get_clawbuildr_db()
     today = date.today().isoformat()
-    count = db.execute(
-        "SELECT COUNT(*) FROM linkedin_messages WHERE timestamp LIKE ?",
-        (today + "%",)
-    ).fetchone()[0]
+    if _is_legacy_tenant(tenant_id):
+        count = db.execute(
+            "SELECT COUNT(*) FROM linkedin_messages WHERE timestamp LIKE ? AND IFNULL(tenant_id,'') = ''",
+            (today + "%",)
+        ).fetchone()[0]
+    else:
+        count = db.execute(
+            "SELECT COUNT(*) FROM linkedin_messages WHERE timestamp LIKE ? AND IFNULL(tenant_id,'') = ?",
+            (today + "%", str(tenant_id))
+        ).fetchone()[0]
     db.close()
     return count
 
 
-def _get_profile_view_count_today():
-    """Count profile views today."""
+def _get_profile_view_count_today(tenant_id=None):
+    """Count profile views today (tenant-scoped)."""
     db = _get_clawbuildr_db()
     today = date.today().isoformat()
-    count = db.execute(
-        "SELECT COUNT(*) FROM linkedin_profile_views WHERE viewed_at LIKE ?",
-        (today + "%",)
-    ).fetchone()[0]
+    if _is_legacy_tenant(tenant_id):
+        count = db.execute(
+            "SELECT COUNT(*) FROM linkedin_profile_views WHERE viewed_at LIKE ? AND IFNULL(tenant_id,'') = ''",
+            (today + "%",)
+        ).fetchone()[0]
+    else:
+        count = db.execute(
+            "SELECT COUNT(*) FROM linkedin_profile_views WHERE viewed_at LIKE ? AND IFNULL(tenant_id,'') = ?",
+            (today + "%", str(tenant_id))
+        ).fetchone()[0]
     db.close()
     return count
 
 
-def can_send_message():
+def can_send_message(tenant_id=None):
     """Check if we can send a 1st-degree message today."""
-    flagged, flag_reason = _is_flagged()
+    flagged, flag_reason = _is_flagged(tenant_id=tenant_id)
     if flagged:
         return False, f"flagged_{flag_reason}"
     active, reason = _is_active_hours()
     if not active:
         return False, reason
-    msg_count = _get_message_count_today()
+    msg_count = _get_message_count_today(tenant_id=tenant_id)
     if msg_count >= MESSAGE_DAILY_LIMIT:
         return False, f"message_limit_reached ({msg_count}/{MESSAGE_DAILY_LIMIT})"
     return True, f"ok ({msg_count}/{MESSAGE_DAILY_LIMIT})"
@@ -4735,52 +5279,64 @@ def can_view_profile():
     return True, f"ok ({view_count}/{PROFILE_VIEW_DAILY_LIMIT})"
 
 
-def _log_message_sent(profile_url, first_name, last_name, message_text, outcome):
+def _log_message_sent(profile_url, first_name, last_name, message_text, outcome, tenant_id=None):
     """Record a message send in the database."""
     db = _get_clawbuildr_db()
     db.execute(
-        "INSERT INTO linkedin_messages (profile_url, first_name, last_name, message_text, outcome, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-        (profile_url, first_name, last_name, message_text, outcome, datetime.now().isoformat())
+        "INSERT INTO linkedin_messages (profile_url, first_name, last_name, message_text, outcome, timestamp, tenant_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (profile_url, first_name, last_name, message_text, outcome, datetime.now().isoformat(), _normalize_tenant_id(tenant_id))
     )
     db.commit()
     db.close()
 
 
-def _log_profile_view(profile_url):
+def _log_profile_view(profile_url, tenant_id=None):
     """Record a profile view in the database."""
     db = _get_clawbuildr_db()
     db.execute(
-        "INSERT INTO linkedin_profile_views (profile_url, viewed_at) VALUES (?, ?)",
-        (profile_url, datetime.now().isoformat())
+        "INSERT INTO linkedin_profile_views (profile_url, viewed_at, tenant_id) VALUES (?, ?, ?)",
+        (profile_url, datetime.now().isoformat(), _normalize_tenant_id(tenant_id))
     )
     db.commit()
     db.close()
 
 
-def get_safety_status():
-    """Get comprehensive safety status for dashboard display."""
-    state = _get_warming_state()
-    effective_limit, multiplier = _get_effective_daily_limit()
-    flagged, flag_reason = _is_flagged()
+def get_safety_status(tenant_id=None):
+    """Get comprehensive safety status for dashboard display (tenant-scoped)."""
+    state = _get_warming_state(tenant_id=tenant_id)
+    effective_limit, multiplier = _get_effective_daily_limit(tenant_id=tenant_id)
+    flagged, flag_reason = _is_flagged(tenant_id=tenant_id)
     active, active_reason = _is_active_hours()
 
     db = _get_clawbuildr_db()
     today = date.today().isoformat()
 
-    connections_today = db.execute(
-        "SELECT COUNT(*) FROM linkedin_outreach WHERE outcome = 'SUCCESS' AND timestamp LIKE ?",
-        (today + "%",)
-    ).fetchone()[0]
-
-    messages_today = db.execute(
-        "SELECT COUNT(*) FROM linkedin_messages WHERE timestamp LIKE ?",
-        (today + "%",)
-    ).fetchone()[0]
-
-    views_today = db.execute(
-        "SELECT COUNT(*) FROM linkedin_profile_views WHERE viewed_at LIKE ?",
-        (today + "%",)
-    ).fetchone()[0]
+    if _is_legacy_tenant(tenant_id):
+        connections_today = db.execute(
+            "SELECT COUNT(*) FROM linkedin_outreach WHERE outcome = 'SUCCESS' AND timestamp LIKE ? AND IFNULL(tenant_id,'') = ''",
+            (today + "%",)
+        ).fetchone()[0]
+        messages_today = db.execute(
+            "SELECT COUNT(*) FROM linkedin_messages WHERE timestamp LIKE ? AND IFNULL(tenant_id,'') = ''",
+            (today + "%",)
+        ).fetchone()[0]
+        views_today = db.execute(
+            "SELECT COUNT(*) FROM linkedin_profile_views WHERE viewed_at LIKE ? AND IFNULL(tenant_id,'') = ''",
+            (today + "%",)
+        ).fetchone()[0]
+    else:
+        connections_today = db.execute(
+            "SELECT COUNT(*) FROM linkedin_outreach WHERE outcome = 'SUCCESS' AND timestamp LIKE ? AND IFNULL(tenant_id,'') = ?",
+            (today + "%", str(tenant_id))
+        ).fetchone()[0]
+        messages_today = db.execute(
+            "SELECT COUNT(*) FROM linkedin_messages WHERE timestamp LIKE ? AND IFNULL(tenant_id,'') = ?",
+            (today + "%", str(tenant_id))
+        ).fetchone()[0]
+        views_today = db.execute(
+            "SELECT COUNT(*) FROM linkedin_profile_views WHERE viewed_at LIKE ? AND IFNULL(tenant_id,'') = ?",
+            (today + "%", str(tenant_id))
+        ).fetchone()[0]
 
     db.close()
 
@@ -4798,7 +5354,8 @@ def get_safety_status():
         "messages_limit": MESSAGE_DAILY_LIMIT,
         "profile_views_today": views_today,
         "profile_views_limit": PROFILE_VIEW_DAILY_LIMIT,
-        "cooldown_elapsed": _check_cooldown_elapsed() if flagged else False,
+        "cooldown_elapsed": _check_cooldown_elapsed(tenant_id=tenant_id) if flagged else False,
+        "tenant_id": _normalize_tenant_id(tenant_id),
     }
 
 
